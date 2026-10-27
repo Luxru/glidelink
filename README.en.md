@@ -10,20 +10,18 @@ GlideLink is a software KVM built with Rust and Tauri. It lets one mouse move se
 
 - One physical mouse controlling two computers.
 - Mouse movement, left/right/middle buttons, X1/X2, and wheel.
-- Four screen-edge directions: the peer can be on the left, right, top, or bottom.
+- Four screen-edge directions with an adjustable offset along the shared edge; drag the peer screen to arrange it like a second display.
 - Low-latency LAN UDP transport with encryption, heartbeats, and automatic reconnection.
 - Chinese / English UI.
 - Windows and macOS support.
 
 ## How it works
 
-The controller captures local mouse events. When the pointer crosses the configured screen edge, it sends the events over the local network to the controlled computer, which injects them into its own input system. Crossing the same edge in the opposite direction returns control to the local computer.
-
-Input traffic never goes through a cloud service or the internet. GlideLink does not require kernel drivers and does not change network configuration.
+The controller captures the mouse and, after the pointer crosses a screen edge, sends encrypted input over the LAN to the peer, which injects it. Crossing the same edge in the opposite direction returns control. No cloud service or kernel driver is involved.
 
 ## Requirements
 
-- Rust 1.77 or newer.
+- Rust 1.90 or newer.
 - Windows 10/11 with WebView2.
 - macOS 12 or newer with Xcode Command Line Tools.
 - Both computers on the same LAN, able to reach each other over UDP.
@@ -67,10 +65,10 @@ cargo run --config 'source.crates-io.replace-with="ustc"' \
 1. Select **Controller**.
 2. Enter the peer address, for example `192.168.1.42:45890`.
 3. Enter exactly the same pairing code.
-4. Choose which side the peer is on under **Display layout**.
+4. Open **Display layout** and drag the peer screen to the side of this device; slide it along the edge to set the offset.
 5. Click **Start controlling**.
 
-Once connected, move the mouse across the chosen screen edge to control the peer. Cross the same edge in the opposite direction to return.
+Once connected, move the mouse across the shared edge to control the peer. Cross the same edge in the opposite direction to return.
 
 ### 3. Change the language
 
@@ -83,7 +81,7 @@ macOS requires:
 - System Settings → Privacy & Security → Accessibility
 - System Settings → Privacy & Security → Input Monitoring
 
-Relaunch the app after granting permissions. On Windows, GlideLink must also run as administrator if you need to control elevated windows.
+Click **Open System Settings** in the app to show the system prompt and open the pane for the permission that is still missing. Relaunch the app after granting permissions. macOS associates these grants with the built executable, so an unsigned development build may need to be granted again after it is rebuilt. On Windows, GlideLink must also run as administrator if you need to control elevated windows.
 
 ## Configuration
 
@@ -94,27 +92,18 @@ Configuration file locations:
 
 The file contains the pairing code. Keep it readable only by your user account.
 
-## Security
+## Security and latency
 
-- The pairing code is used with PBKDF2-HMAC-SHA256 to derive session keys.
-- Input traffic is encrypted with ChaCha20-Poly1305.
-- Each direction has its own key, packet sequence numbers, and a replay window.
-- No cloud, no accounts, and no internet dependency.
-- The pairing code is the only authentication secret. Use a generated high-entropy code, and never expose the UDP port to the internet.
-- The protocol has not yet undergone an independent security audit.
-
-## Latency
-
-The target is 3–8ms of input feedback on a healthy LAN. Actual latency depends on the mouse polling rate, Wi-Fi quality, OS scheduling, and power settings. The RTT shown in the app is the network round-trip time, not full end-to-end latency.
-
-Bluetooth is not suitable for a real-time mouse channel, so GlideLink uses UDP over the LAN.
+- PBKDF2-HMAC-SHA256 derives keys; ChaCha20-Poly1305 encrypts traffic with directional keys and a replay window.
+- The pairing code is the only authentication secret. Use it only on a trusted LAN and never expose the UDP port to the internet.
+- No cloud or accounts. The target is 3–8ms of input feedback on a healthy LAN; the in-app RTT is network round-trip time only.
+- The protocol has not had an independent security audit. See the architecture document for details.
 
 ## Status and limitations
 
-- The Windows input backend is built and smoke-tested locally.
-- The macOS input backend has been type-checked for a macOS target but has not yet been run on macOS hardware.
+- The Windows backend type-checks for `x86_64-pc-windows-msvc`; macOS capture and injection pass `--self-test` on macOS 13.6 (Intel). A real Windows ↔ macOS pair, Apple Silicon, signing, and notarization are still unverified.
 - Mouse only; keyboard forwarding is not implemented.
-- One peer and four edge directions only.
+- One peer; the peer snaps to one of four edges with an offset along that edge. Arbitrary 2D placement, gaps, and overlap are not implemented.
 - Display placement is configured manually; there is no automatic discovery yet.
 - Applications running with elevated privileges may not receive injected events.
 - Signed installers, tray support, and launch-at-login are not included yet.
@@ -128,6 +117,14 @@ cargo build
 ```
 
 Tests cover the protocol, encryption, replay protection, coordinate mapping, and a real UDP loopback handshake and input-forwarding path.
+
+On macOS, after granting permissions, verify the input backend without starting the UI:
+
+```bash
+cargo run -- --self-test
+```
+
+It reports displays and TCC permissions, exercises a synthetic edge crossing (capture), moves the cursor to a known point (injection), and restores the cursor. Run it from the terminal or app that holds the permissions.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) / [ARCHITECTURE.en.md](ARCHITECTURE.en.md) for more details.
 

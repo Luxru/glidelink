@@ -1,5 +1,6 @@
 use super::{
     CaptureHandle, CaptureShared, InjectMsg, RemoteInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT,
+    BUTTON_X1, BUTTON_X2,
 };
 use crate::error;
 use crate::layout::{
@@ -22,6 +23,7 @@ type CFRunLoopRef = *mut c_void;
 type CFRunLoopSourceRef = *mut c_void;
 type CFStringRef = *const c_void;
 type CFAllocatorRef = *const c_void;
+type CFDictionaryRef = *const c_void;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -91,6 +93,8 @@ const CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
 const CG_MOUSE_BUTTON_LEFT: u32 = 0;
 const CG_MOUSE_BUTTON_RIGHT: u32 = 1;
 const CG_MOUSE_BUTTON_CENTER: u32 = 2;
+const CG_MOUSE_BUTTON_X1: u32 = 3;
+const CG_MOUSE_BUTTON_X2: u32 = 4;
 
 const CG_EVENT_MASK: u64 = (1 << CG_EVENT_LEFT_MOUSE_DOWN)
     | (1 << CG_EVENT_LEFT_MOUSE_UP)
@@ -118,8 +122,10 @@ unsafe extern "C" {
         user_info: *mut c_void,
     ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: u8);
+    fn CGEventCreate(source: *mut c_void) -> CGEventRef;
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
     fn CGEventPost(tap: u32, event: CGEventRef);
     fn CGEventCreateMouseEvent(
         source: *mut c_void,
@@ -159,14 +165,27 @@ unsafe extern "C" {
     fn CFRunLoopRemoveSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
     fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source_handled: u8) -> i32;
     fn CFRelease(cf: *const c_void);
+    fn CFDictionaryCreate(
+        allocator: CFAllocatorRef,
+        keys: *const *const c_void,
+        values: *const *const c_void,
+        num_values: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> CFDictionaryRef;
     static kCFRunLoopDefaultMode: CFStringRef;
+    static kCFBooleanTrue: *const c_void;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> u8;
+    fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
     fn CGPreflightListenEventAccess() -> u8;
     fn CGPreflightPostEventAccess() -> u8;
+    fn CGRequestListenEventAccess() -> u8;
+    fn CGRequestPostEventAccess() -> u8;
+    static kAXTrustedCheckOptionPrompt: CFStringRef;
 }
 
 fn virtual_bounds() -> Option<CGRect> {
@@ -211,26 +230,132 @@ pub fn screen_info() -> Option<ScreenInfo> {
     ))
 }
 
+fn accessibility_trusted() -> bool {
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
+fn listen_event_access() -> bool {
+    unsafe { CGPreflightListenEventAccess() != 0 }
+}
+
+fn post_event_access() -> bool {
+    unsafe { CGPreflightPostEventAccess() != 0 }
+}
+
 pub fn permissions_ok() -> bool {
+    accessibility_trusted() && listen_event_access() && post_event_access()
+}
+
+/// Ask macOS to show its permission prompt. Returns the current accessibility
+/// status; the user's answer is asynchronous and usually requires a relaunch.
+fn request_accessibility_prompt() -> bool {
     unsafe {
-        AXIsProcessTrusted() != 0
-            && CGPreflightListenEventAccess() != 0
-            && CGPreflightPostEventAccess() != 0
+        let key = kAXTrustedCheckOptionPrompt as *const c_void;
+        let value = kCFBooleanTrue;
+        let options = CFDictionaryCreate(null(), &key, &value, 1, null(), null());
+        if options.is_null() {
+            return accessibility_trusted();
+        }
+        let trusted = AXIsProcessTrustedWithOptions(options);
+        CFRelease(options as *const c_void);
+        trusted != 0
     }
 }
 
 pub fn open_permissions() -> Result<(), String> {
+    // Trigger the system prompt for whichever permission is missing, then open
+    // the matching pane. Input Monitoring is a separate pane from Accessibility.
+    let pane = if !accessibility_trusted() {
+        let _ = request_accessibility_prompt();
+        "Privacy_Accessibility"
+    } else if !listen_event_access() {
+        unsafe {
+            CGRequestListenEventAccess();
+        }
+        "Privacy_ListenEvent"
+    } else {
+        if !post_event_access() {
+            unsafe {
+                CGRequestPostEventAccess();
+            }
+        }
+        "Privacy_Accessibility"
+    };
+
+    log::info!("opening macOS privacy pane: {pane}");
     std::process::Command::new("open")
-        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        .arg(format!(
+            "x-apple.systempreferences:com.apple.preference.security?{pane}"
+        ))
         .spawn()
         .map(|_| ())
         .map_err(|e| error::detail("E_OPEN_SETTINGS", e))
+}
+
+fn active_displays() -> ([u32; 16], usize) {
+    let mut displays = [0u32; 16];
+    let mut count = 0u32;
+    let result =
+        unsafe { CGGetActiveDisplayList(displays.len() as u32, displays.as_mut_ptr(), &mut count) };
+    if result != 0 {
+        return (displays, 0);
+    }
+    (displays, count as usize)
+}
+
+fn hide_cursor() {
+    let (displays, count) = active_displays();
+    if count == 0 {
+        unsafe {
+            CGDisplayHideCursor(CGMainDisplayID());
+        }
+        return;
+    }
+    for display in displays.iter().take(count) {
+        unsafe {
+            CGDisplayHideCursor(*display);
+        }
+    }
+}
+
+fn show_cursor() {
+    let (displays, count) = active_displays();
+    if count == 0 {
+        unsafe {
+            CGDisplayShowCursor(CGMainDisplayID());
+        }
+        return;
+    }
+    for display in displays.iter().take(count) {
+        unsafe {
+            CGDisplayShowCursor(*display);
+        }
+    }
+}
+
+fn cursor_location() -> CGPoint {
+    unsafe {
+        let event = CGEventCreate(null_mut());
+        if event.is_null() {
+            return CGPoint::default();
+        }
+        let location = CGEventGetLocation(event);
+        CFRelease(event as *const c_void);
+        location
+    }
+}
+
+fn warp_cursor(point: CGPoint) {
+    unsafe {
+        CGWarpMouseCursorPosition(point);
+    }
 }
 
 struct CaptureState {
     shared: Arc<CaptureShared>,
     tx: Sender<RemoteInput>,
     edge: Edge,
+    offset: f32,
     bounds: CGRect,
     tap: CFMachPortRef,
     active: bool,
@@ -269,16 +394,12 @@ impl CaptureState {
             CG_EVENT_OTHER_MOUSE_DOWN => {
                 let number =
                     unsafe { CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_BUTTON_NUMBER) };
-                if number == CG_MOUSE_BUTTON_CENTER as i64 {
-                    self.buttons |= BUTTON_MIDDLE;
-                }
+                self.buttons |= other_button_bit(number);
             }
             CG_EVENT_OTHER_MOUSE_UP => {
                 let number =
                     unsafe { CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_BUTTON_NUMBER) };
-                if number == CG_MOUSE_BUTTON_CENTER as i64 {
-                    self.buttons &= !BUTTON_MIDDLE;
-                }
+                self.buttons &= !other_button_bit(number);
             }
             _ => {}
         }
@@ -382,30 +503,27 @@ impl CaptureState {
             self.bounds.size.width.round() as i32,
             self.bounds.size.height.round() as i32,
         );
-        self.point = entry_point(self.edge, host);
+        self.point = entry_point(self.edge, host, self.offset);
         self.buttons = unsafe {
             let mut buttons = 0u8;
-            if CGEventSourceButtonState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, CG_MOUSE_BUTTON_LEFT) != 0
-            {
-                buttons |= BUTTON_LEFT;
-            }
-            if CGEventSourceButtonState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, CG_MOUSE_BUTTON_RIGHT)
-                != 0
-            {
-                buttons |= BUTTON_RIGHT;
-            }
-            if CGEventSourceButtonState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, CG_MOUSE_BUTTON_CENTER)
-                != 0
-            {
-                buttons |= BUTTON_MIDDLE;
+            for (button, bit) in [
+                (CG_MOUSE_BUTTON_LEFT, BUTTON_LEFT),
+                (CG_MOUSE_BUTTON_RIGHT, BUTTON_RIGHT),
+                (CG_MOUSE_BUTTON_CENTER, BUTTON_MIDDLE),
+                (CG_MOUSE_BUTTON_X1, BUTTON_X1),
+                (CG_MOUSE_BUTTON_X2, BUTTON_X2),
+            ] {
+                if CGEventSourceButtonState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, button) != 0 {
+                    buttons |= bit;
+                }
             }
             buttons
         };
         self.active = true;
         self.shared.set_active(true);
         if !self.hidden {
+            hide_cursor();
             unsafe {
-                CGDisplayHideCursor(CGMainDisplayID());
                 CGAssociateMouseAndMouseCursorPosition(0);
             }
             self.hidden = true;
@@ -413,13 +531,13 @@ impl CaptureState {
         self.send(0);
     }
 
-    fn deactivate(&mut self, warp_cursor: bool) {
+    fn deactivate(&mut self, warp_back: bool) {
         if !self.active {
             if self.hidden {
                 unsafe {
                     CGAssociateMouseAndMouseCursorPosition(1);
-                    CGDisplayShowCursor(CGMainDisplayID());
                 }
+                show_cursor();
                 self.hidden = false;
             }
             return;
@@ -437,19 +555,14 @@ impl CaptureState {
             self.hidden = false;
         }
 
-        if warp_cursor {
-            let host = host_return_point(self.edge, self.point);
-            let point = CGPoint {
+        if warp_back {
+            let host = host_return_point(self.edge, self.point, self.offset);
+            warp_cursor(CGPoint {
                 x: self.bounds.min_x() + host.x as f64 * (self.bounds.size.width - 1.0).max(1.0),
                 y: self.bounds.min_y() + host.y as f64 * (self.bounds.size.height - 1.0).max(1.0),
-            };
-            unsafe {
-                CGWarpMouseCursorPosition(point);
-            }
+            });
         }
-        unsafe {
-            CGDisplayShowCursor(CGMainDisplayID());
-        }
+        show_cursor();
         self.cooldown_until = Instant::now() + Duration::from_millis(REENTRY_COOLDOWN_MS);
     }
 }
@@ -471,6 +584,7 @@ pub fn start_capture(
     shared: Arc<CaptureShared>,
     tx: Sender<RemoteInput>,
     edge: Edge,
+    offset: f32,
 ) -> Result<CaptureHandle, String> {
     unsafe {
         if AXIsProcessTrusted() == 0 || CGPreflightListenEventAccess() == 0 {
@@ -483,7 +597,7 @@ pub fn start_capture(
     let thread_shared = Arc::clone(&shared);
     let join = thread::Builder::new()
         .name("glidelink-input-capture".into())
-        .spawn(move || run_capture_thread(thread_shared, tx, edge, bounds, ready_tx))
+        .spawn(move || run_capture_thread(thread_shared, tx, edge, offset, bounds, ready_tx))
         .map_err(|e| error::detail("E_CAPTURE_THREAD", e))?;
 
     match ready_rx.recv_timeout(Duration::from_secs(3)) {
@@ -495,6 +609,7 @@ pub fn start_capture(
         }
         Err(_) => {
             shared.stop.store(true, Ordering::Release);
+            let _ = join.join();
             Err(error::code("E_CAPTURE_TIMEOUT"))
         }
     }
@@ -504,6 +619,7 @@ fn run_capture_thread(
     shared: Arc<CaptureShared>,
     tx: Sender<RemoteInput>,
     edge: Edge,
+    offset: f32,
     bounds: CGRect,
     ready_tx: mpsc::Sender<Result<(), String>>,
 ) {
@@ -511,6 +627,7 @@ fn run_capture_thread(
         shared,
         tx,
         edge,
+        offset,
         bounds,
         tap: null_mut(),
         active: false,
@@ -576,8 +693,8 @@ fn run_capture_thread(
     if state.hidden {
         unsafe {
             CGAssociateMouseAndMouseCursorPosition(1);
-            CGDisplayShowCursor(CGMainDisplayID());
         }
+        show_cursor();
         state.hidden = false;
     }
 
@@ -587,7 +704,8 @@ fn run_capture_thread(
         CFRelease(source as *const c_void);
         CFRelease(tap as *const c_void);
     }
-    drop(unsafe { Box::from_raw(state_ptr) });
+    // `state` is dropped here. The tap has been disabled and released above,
+    // so no callback can reach its raw pointer afterwards.
 }
 
 pub fn start_injector(
@@ -603,15 +721,23 @@ pub fn start_injector(
     let bounds = virtual_bounds().ok_or_else(|| error::code("E_MAC_DISPLAYS"))?;
 
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+    let thread_stop = Arc::clone(&stop);
     let join = thread::Builder::new()
         .name("glidelink-input-injector".into())
-        .spawn(move || injector_loop(rx, stop, bounds, ready_tx))
+        .spawn(move || injector_loop(rx, thread_stop, bounds, ready_tx))
         .map_err(|e| error::detail("E_INJECTOR_THREAD", e))?;
 
     match ready_rx.recv_timeout(Duration::from_secs(2)) {
         Ok(Ok(())) => Ok(join),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(error::code("E_INJECTOR_TIMEOUT")),
+        Ok(Err(error)) => {
+            let _ = join.join();
+            Err(error)
+        }
+        Err(_) => {
+            stop.store(true, Ordering::Release);
+            let _ = join.join();
+            Err(error::code("E_INJECTOR_TIMEOUT"))
+        }
     }
 }
 
@@ -636,15 +762,8 @@ fn injector_loop(
                 };
 
                 if previous_position != Some((x, y)) {
-                    let (event_type, button) = if previous_buttons & BUTTON_LEFT != 0 {
-                        (CG_EVENT_LEFT_MOUSE_DRAGGED, CG_MOUSE_BUTTON_LEFT)
-                    } else if previous_buttons & BUTTON_RIGHT != 0 {
-                        (CG_EVENT_RIGHT_MOUSE_DRAGGED, CG_MOUSE_BUTTON_RIGHT)
-                    } else if previous_buttons & BUTTON_MIDDLE != 0 {
-                        (CG_EVENT_OTHER_MOUSE_DRAGGED, CG_MOUSE_BUTTON_CENTER)
-                    } else {
-                        (CG_EVENT_MOUSE_MOVED, CG_MOUSE_BUTTON_LEFT)
-                    };
+                    let (event_type, button) = drag_event(previous_buttons)
+                        .unwrap_or((CG_EVENT_MOUSE_MOVED, CG_MOUSE_BUTTON_LEFT));
                     post_mouse_event(event_type, point, button);
                     previous_position = Some((x, y));
                 }
@@ -711,30 +830,296 @@ fn post_mouse_event(event_type: u32, point: CGPoint, button: u32) {
     }
 }
 
+/// Map a CoreGraphics "other mouse button" number to the button bit used by
+/// the wire protocol. macOS reports the side buttons as 3 and 4.
+fn other_button_bit(number: i64) -> u8 {
+    match number as u32 {
+        CG_MOUSE_BUTTON_CENTER => BUTTON_MIDDLE,
+        CG_MOUSE_BUTTON_X1 => BUTTON_X1,
+        CG_MOUSE_BUTTON_X2 => BUTTON_X2,
+        _ => 0,
+    }
+}
+
+fn drag_event(buttons: u8) -> Option<(u32, u32)> {
+    if buttons & BUTTON_LEFT != 0 {
+        Some((CG_EVENT_LEFT_MOUSE_DRAGGED, CG_MOUSE_BUTTON_LEFT))
+    } else if buttons & BUTTON_RIGHT != 0 {
+        Some((CG_EVENT_RIGHT_MOUSE_DRAGGED, CG_MOUSE_BUTTON_RIGHT))
+    } else if buttons & BUTTON_MIDDLE != 0 {
+        Some((CG_EVENT_OTHER_MOUSE_DRAGGED, CG_MOUSE_BUTTON_CENTER))
+    } else if buttons & BUTTON_X1 != 0 {
+        Some((CG_EVENT_OTHER_MOUSE_DRAGGED, CG_MOUSE_BUTTON_X1))
+    } else if buttons & BUTTON_X2 != 0 {
+        Some((CG_EVENT_OTHER_MOUSE_DRAGGED, CG_MOUSE_BUTTON_X2))
+    } else {
+        None
+    }
+}
+
 fn apply_button_transitions(previous: u8, current: u8, point: CGPoint) {
     let changed = previous ^ current;
-    if changed & BUTTON_LEFT != 0 {
-        let event_type = if current & BUTTON_LEFT != 0 {
-            CG_EVENT_LEFT_MOUSE_DOWN
-        } else {
-            CG_EVENT_LEFT_MOUSE_UP
-        };
-        post_mouse_event(event_type, point, CG_MOUSE_BUTTON_LEFT);
+    post_transition(
+        changed,
+        current,
+        BUTTON_LEFT,
+        CG_EVENT_LEFT_MOUSE_DOWN,
+        CG_EVENT_LEFT_MOUSE_UP,
+        CG_MOUSE_BUTTON_LEFT,
+        point,
+    );
+    post_transition(
+        changed,
+        current,
+        BUTTON_RIGHT,
+        CG_EVENT_RIGHT_MOUSE_DOWN,
+        CG_EVENT_RIGHT_MOUSE_UP,
+        CG_MOUSE_BUTTON_RIGHT,
+        point,
+    );
+    post_transition(
+        changed,
+        current,
+        BUTTON_MIDDLE,
+        CG_EVENT_OTHER_MOUSE_DOWN,
+        CG_EVENT_OTHER_MOUSE_UP,
+        CG_MOUSE_BUTTON_CENTER,
+        point,
+    );
+    post_transition(
+        changed,
+        current,
+        BUTTON_X1,
+        CG_EVENT_OTHER_MOUSE_DOWN,
+        CG_EVENT_OTHER_MOUSE_UP,
+        CG_MOUSE_BUTTON_X1,
+        point,
+    );
+    post_transition(
+        changed,
+        current,
+        BUTTON_X2,
+        CG_EVENT_OTHER_MOUSE_DOWN,
+        CG_EVENT_OTHER_MOUSE_UP,
+        CG_MOUSE_BUTTON_X2,
+        point,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_transition(
+    changed: u8,
+    current: u8,
+    bit: u8,
+    down: u32,
+    up: u32,
+    button: u32,
+    point: CGPoint,
+) {
+    if changed & bit == 0 {
+        return;
     }
-    if changed & BUTTON_RIGHT != 0 {
-        let event_type = if current & BUTTON_RIGHT != 0 {
-            CG_EVENT_RIGHT_MOUSE_DOWN
-        } else {
-            CG_EVENT_RIGHT_MOUSE_UP
-        };
-        post_mouse_event(event_type, point, CG_MOUSE_BUTTON_RIGHT);
+    let event_type = if current & bit != 0 { down } else { up };
+    post_mouse_event(event_type, point, button);
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "granted"
+    } else {
+        "missing"
     }
-    if changed & BUTTON_MIDDLE != 0 {
-        let event_type = if current & BUTTON_MIDDLE != 0 {
-            CG_EVENT_OTHER_MOUSE_DOWN
-        } else {
-            CG_EVENT_OTHER_MOUSE_UP
-        };
-        post_mouse_event(event_type, point, CG_MOUSE_BUTTON_CENTER);
+}
+
+/// Local smoke test for the macOS input backend.
+///
+/// Capture is exercised with a synthetic edge crossing; injection is checked by
+/// moving the cursor to a known point and reading its position back. Both tests
+/// require the calling process to hold the relevant TCC permissions, so run this
+/// from the terminal/app that will actually be granted access. The user's cursor
+/// is restored afterwards.
+pub fn self_test() -> bool {
+    println!("GlideLink macOS input self-test");
+    println!("Permissions are granted per executable. Grant them to the");
+    println!("application you run this from, then rerun with --self-test.");
+    println!();
+
+    let ax = accessibility_trusted();
+    let listen = listen_event_access();
+    let post = post_event_access();
+    println!("accessibility:          {}", yes_no(ax));
+    println!("input monitoring:       {}", yes_no(listen));
+    println!("event posting:          {}", yes_no(post));
+
+    let Some(bounds) = virtual_bounds() else {
+        println!("displays:               FAILED to enumerate");
+        println!();
+        println!("result: FAIL");
+        return false;
+    };
+    println!(
+        "virtual desktop:        {:.0}x{:.0} at ({:.0}, {:.0})",
+        bounds.size.width, bounds.size.height, bounds.origin.x, bounds.origin.y
+    );
+    println!();
+
+    let mut ok = true;
+    if ax && listen {
+        match test_capture(bounds) {
+            Ok(()) => println!("capture:                PASS"),
+            Err(e) => {
+                println!("capture:                FAIL ({e})");
+                ok = false;
+            }
+        }
+    } else {
+        println!("capture:                SKIP (needs Accessibility + Input Monitoring)");
+        ok = false;
+    }
+
+    if ax && post {
+        match test_injection(bounds) {
+            Ok(()) => println!("injection:              PASS"),
+            Err(e) => {
+                println!("injection:              FAIL ({e})");
+                ok = false;
+            }
+        }
+    } else {
+        println!("injection:              SKIP (needs Accessibility + event posting)");
+        ok = false;
+    }
+
+    println!();
+    if ok {
+        println!("result: PASS");
+    } else {
+        println!("result: FAIL");
+        println!();
+        println!("Open System Settings -> Privacy & Security and grant GlideLink the");
+        println!("permissions reported above, then relaunch and rerun this test.");
+    }
+    ok
+}
+
+fn test_capture(bounds: CGRect) -> Result<(), String> {
+    let status = Status::new(screen_info());
+    let shared = CaptureShared::new(status);
+    // Pretend a peer is connected so edge crossing activates immediately.
+    shared.set_peer(1920, 1080);
+    let (tx, rx) = crossbeam_channel::unbounded::<RemoteInput>();
+    let handle = start_capture(Arc::clone(&shared), tx, Edge::Right, 0.0)?;
+    let saved = cursor_location();
+
+    let point = CGPoint {
+        x: bounds.max_x() - 1.0,
+        y: bounds.min_y() + bounds.size.height / 2.0,
+    };
+    warp_cursor(point);
+    unsafe {
+        let event = CGEventCreateMouseEvent(
+            null_mut(),
+            CG_EVENT_MOUSE_MOVED,
+            point,
+            CG_MOUSE_BUTTON_LEFT,
+        );
+        if event.is_null() {
+            handle.stop_and_join();
+            warp_cursor(saved);
+            return Err("could not create a synthetic mouse event".into());
+        }
+        CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_X, 8);
+        CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_Y, 0);
+        CGEventPost(CG_TAP_LOCATION_HID, event);
+        CFRelease(event as *const c_void);
+    }
+
+    let result = rx
+        .recv_timeout(Duration::from_secs(1))
+        .map(|_| ())
+        .map_err(|_| "no input was captured after a synthetic edge crossing".to_string());
+
+    handle.stop_and_join();
+    unsafe {
+        CGAssociateMouseAndMouseCursorPosition(1);
+    }
+    warp_cursor(saved);
+    result
+}
+
+fn test_injection(bounds: CGRect) -> Result<(), String> {
+    let status = Status::new(screen_info());
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = crossbeam_channel::unbounded::<InjectMsg>();
+    let handle = start_injector(rx, Arc::clone(&stop), status)?;
+    let saved = cursor_location();
+
+    // Target the center of the main display rather than the center of the
+    // virtual desktop, which can fall in a gap between displays.
+    let main = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+    let target = CGPoint {
+        x: main.min_x() + main.size.width * 0.5,
+        y: main.min_y() + main.size.height * 0.5,
+    };
+    let norm_x = (target.x - bounds.min_x()) / (bounds.size.width - 1.0).max(1.0);
+    let norm_y = (target.y - bounds.min_y()) / (bounds.size.height - 1.0).max(1.0);
+    tx.send(InjectMsg::State(RemoteInput {
+        x: norm_x as f32,
+        y: norm_y as f32,
+        buttons: 0,
+        wheel: 0,
+    }))
+    .map_err(|_| "injector thread stopped".to_string())?;
+
+    let mut actual = cursor_location();
+    for _ in 0..40 {
+        if (actual.x - target.x).abs() < 8.0 && (actual.y - target.y).abs() < 8.0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+        actual = cursor_location();
+    }
+
+    let _ = tx.send(InjectMsg::Reset);
+    stop.store(true, Ordering::Release);
+    let _ = handle.join();
+    warp_cursor(saved);
+
+    if (actual.x - target.x).abs() < 8.0 && (actual.y - target.y).abs() < 8.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "cursor is at ({:.0}, {:.0}), expected ({:.0}, {:.0})",
+            actual.x, actual.y, target.x, target.y
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_other_mouse_buttons() {
+        assert_eq!(
+            other_button_bit(CG_MOUSE_BUTTON_CENTER as i64),
+            BUTTON_MIDDLE
+        );
+        assert_eq!(other_button_bit(CG_MOUSE_BUTTON_X1 as i64), BUTTON_X1);
+        assert_eq!(other_button_bit(CG_MOUSE_BUTTON_X2 as i64), BUTTON_X2);
+        assert_eq!(other_button_bit(9), 0);
+    }
+
+    #[test]
+    fn drag_event_prefers_primary_buttons() {
+        assert_eq!(drag_event(0), None);
+        assert_eq!(
+            drag_event(BUTTON_X1).map(|(_, button)| button),
+            Some(CG_MOUSE_BUTTON_X1)
+        );
+        assert_eq!(
+            drag_event(BUTTON_LEFT | BUTTON_X1).map(|(_, button)| button),
+            Some(CG_MOUSE_BUTTON_LEFT)
+        );
     }
 }

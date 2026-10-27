@@ -94,6 +94,7 @@ struct CaptureState {
     shared: Arc<CaptureShared>,
     tx: Sender<RemoteInput>,
     edge: Edge,
+    offset: f32,
     vx: i32,
     vy: i32,
     vw: i32,
@@ -258,7 +259,7 @@ impl CaptureState {
             self.vw,
             self.vh,
         );
-        self.point = entry_point(self.edge, host);
+        self.point = entry_point(self.edge, host, self.offset);
         self.buttons = unsafe { query_buttons() };
         self.active = true;
         self.armed = false;
@@ -289,7 +290,7 @@ impl CaptureState {
         self.shared.set_active(false);
 
         if warp_cursor {
-            let host = host_return_point(self.edge, self.point);
+            let host = host_return_point(self.edge, self.point, self.offset);
             let x = self.vx + (host.x * (self.vw - 1) as f32).round() as i32;
             let y = self.vy + (host.y * (self.vh - 1) as f32).round() as i32;
             unsafe {
@@ -426,12 +427,13 @@ pub fn start_capture(
     shared: Arc<CaptureShared>,
     tx: Sender<RemoteInput>,
     edge: Edge,
+    offset: f32,
 ) -> Result<CaptureHandle, String> {
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let thread_shared = Arc::clone(&shared);
     let join = thread::Builder::new()
         .name("glidelink-input-capture".into())
-        .spawn(move || run_capture_thread(thread_shared, tx, edge, ready_tx))
+        .spawn(move || run_capture_thread(thread_shared, tx, edge, offset, ready_tx))
         .map_err(|e| error::detail("E_CAPTURE_THREAD", e))?;
 
     match ready_rx.recv_timeout(Duration::from_secs(3)) {
@@ -443,6 +445,7 @@ pub fn start_capture(
         }
         Err(_) => {
             shared.stop.store(true, Ordering::Release);
+            let _ = join.join();
             Err(error::code("E_CAPTURE_TIMEOUT"))
         }
     }
@@ -452,6 +455,7 @@ fn run_capture_thread(
     shared: Arc<CaptureShared>,
     tx: Sender<RemoteInput>,
     edge: Edge,
+    offset: f32,
     ready_tx: mpsc::Sender<Result<(), String>>,
 ) {
     let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
@@ -553,6 +557,7 @@ fn run_capture_thread(
         shared,
         tx,
         edge,
+        offset,
         vx,
         vy,
         vw,
@@ -655,13 +660,7 @@ fn injector_loop(
 
                 if input.wheel != 0 {
                     unsafe {
-                        mouse_event(
-                            MOUSEEVENTF_WHEEL,
-                            0,
-                            0,
-                            input.wheel as i32 * WHEEL_DELTA,
-                            0,
-                        );
+                        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, input.wheel as i32 * WHEEL_DELTA, 0);
                     }
                 }
             }

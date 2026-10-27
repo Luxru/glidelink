@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -29,13 +30,27 @@ pub struct RuntimeStatus {
     pub peer: Option<String>,
     pub local_screen: Option<ScreenInfo>,
     pub remote_screen: Option<ScreenInfo>,
+    pub started_at_ms: Option<u64>,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
 }
 
-/// Shared UI-facing status. Never touched from the per-event hot path except on
-/// state transitions.
+#[derive(Default)]
+struct Traffic {
+    packets_sent: AtomicU64,
+    packets_received: AtomicU64,
+    bytes_sent: AtomicU64,
+    bytes_received: AtomicU64,
+}
+
+/// Shared UI-facing status. State transitions still take the mutex; high-rate
+/// traffic counters live in atomics so the network loops never contend on it.
 #[derive(Clone, Default)]
 pub struct Status {
     inner: Arc<Mutex<RuntimeStatus>>,
+    traffic: Arc<Traffic>,
 }
 
 impl Status {
@@ -46,7 +61,35 @@ impl Status {
     }
 
     pub fn snapshot(&self) -> RuntimeStatus {
-        self.inner.lock().map(|s| s.clone()).unwrap_or_default()
+        let mut status = self.inner.lock().map(|s| s.clone()).unwrap_or_default();
+        status.packets_sent = self.traffic.packets_sent.load(Ordering::Relaxed);
+        status.packets_received = self.traffic.packets_received.load(Ordering::Relaxed);
+        status.bytes_sent = self.traffic.bytes_sent.load(Ordering::Relaxed);
+        status.bytes_received = self.traffic.bytes_received.load(Ordering::Relaxed);
+        status
+    }
+
+    pub fn add_sent(&self, bytes: usize) {
+        self.traffic.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.traffic
+            .bytes_sent
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn add_received(&self, bytes: usize) {
+        self.traffic
+            .packets_received
+            .fetch_add(1, Ordering::Relaxed);
+        self.traffic
+            .bytes_received
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn reset_traffic(&self) {
+        self.traffic.packets_sent.store(0, Ordering::Relaxed);
+        self.traffic.packets_received.store(0, Ordering::Relaxed);
+        self.traffic.bytes_sent.store(0, Ordering::Relaxed);
+        self.traffic.bytes_received.store(0, Ordering::Relaxed);
     }
 
     pub fn update<F>(&self, f: F)

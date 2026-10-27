@@ -60,14 +60,12 @@ impl Engine {
     }
 
     pub fn start(&self, config: &AppConfig) -> Result<(), String> {
-        let mut slot = self
-            .inner
-            .lock()
-            .map_err(|_| error::code("E_INTERNAL"))?;
+        let mut slot = self.inner.lock().map_err(|_| error::code("E_INTERNAL"))?;
         if slot.is_some() {
             return Err(error::code("E_SESSION_RUNNING"));
         }
 
+        self.status.reset_traffic();
         let stop = Arc::new(AtomicBool::new(false));
         let status = self.status.clone();
 
@@ -88,15 +86,16 @@ impl Engine {
                         return Err(e);
                     }
                 };
-                let capture = match input::start_capture(shared, tx, config.edge) {
-                    Ok(handle) => handle,
-                    Err(e) => {
-                        stop.store(true, Ordering::Release);
-                        let _ = net_handle.join();
-                        status.reset();
-                        return Err(e);
-                    }
-                };
+                let capture =
+                    match input::start_capture(shared, tx, config.edge, config.peer_offset) {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            stop.store(true, Ordering::Release);
+                            let _ = net_handle.join();
+                            status.reset();
+                            return Err(e);
+                        }
+                    };
                 *slot = Some(Running {
                     stop,
                     capture: Some(capture),
