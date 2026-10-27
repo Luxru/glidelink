@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GlideLink</title>
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <img class="app-icon" src="app-icon.png" alt="" />
+        <div class="brand-copy">
+          <strong>GlideLink</strong>
+          <span data-i18n="app.taglineShort">Software KVM</span>
+        </div>
+      </div>
+
+      <div class="sidebar-label" data-i18n="sidebar.settings">Settings</div>
+      <nav class="sidebar-nav" aria-label="Settings" data-i18n-aria-label="sidebar.settings">
+        <button class="nav-item active" type="button" data-page-target="session">
+          <span class="nav-icon nav-blue" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none"><path d="M4 3.2l11.2 7.1-4.8.9-1.6 4.8L4 3.2z" fill="currentColor"/></svg>
+          </span>
+          <span data-i18n="nav.session">Session</span>
+        </button>
+        <button class="nav-item" type="button" data-page-target="layout">
+          <span class="nav-icon nav-purple" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none"><rect x="2.2" y="3" width="10" height="7.2" rx="1.4" stroke="currentColor" stroke-width="1.5"/><rect x="9.2" y="9.2" width="8.6" height="6.4" rx="1.3" fill="currentColor" opacity=".95"/><path d="M5.5 13.7h4M7.5 10.2v3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          </span>
+          <span data-i18n="nav.layout">Display Layout</span>
+        </button>
+        <button class="nav-item" type="button" data-page-target="security">
+          <span class="nav-icon nav-green" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none"><path d="M10 2.6l5.4 2.2v4.1c0 3.4-2.2 6.2-5.4 7.7-3.2-1.5-5.4-4.3-5.4-7.7V4.8L10 2.6z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M7.5 10l1.7 1.7 3.4-3.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+          <span data-i18n="nav.security">Security</span>
+        </button>
+        <button class="nav-item" type="button" data-page-target="about">
+          <span class="nav-icon nav-gray" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7.1" stroke="currentColor" stroke-width="1.5"/><path d="M10 9v4.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="10" cy="6.6" r="1.05" fill="currentColor"/></svg>
+          </span>
+          <span data-i18n="nav.about">About</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <label class="language-control">
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="5.7" stroke="currentColor" stroke-width="1.2"/><path d="M2.5 8h11M8 2.3c1.5 1.6 2.2 3.5 2.2 5.7S9.5 13.7 8 13.7C6.5 12.1 5.8 10.2 5.8 8S6.5 3.9 8 2.3z" stroke="currentColor" stroke-width="1.05"/></svg>
+          <select id="languageSelect" data-i18n-aria-label="language.label" aria-label="Language">
+            <option value="zh" data-i18n="language.zh">Chinese</option>
+            <option value="en" data-i18n="language.en">English</option>
+          </select>
+        </label>
+        <div class="sidebar-note">
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="3.2" y="7" width="9.6" height="6.4" rx="1.6" stroke="currentColor" stroke-width="1.2"/><path d="M5.4 7V5.3a2.6 2.6 0 015.2 0V7" stroke="currentColor" stroke-width="1.2"/></svg>
+          <span data-i18n="sidebar.secureLocal">LAN only · End-to-end encrypted</span>
+        </div>
+        <div class="sidebar-version">GlideLink 0.1.0</div>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="content-header">
+        <div class="title-block">
+          <h1 id="pageTitle" data-i18n="page.session.title">Session</h1>
+          <p id="pageSubtitle" data-i18n="page.session.subtitle.controller">Connect and control another computer</p>
+        </div>
+        <div class="header-actions">
+          <div id="statusPill" class="status-pill status-idle" role="status" aria-live="polite">
+            <span class="dot"></span>
+            <span id="statusText" data-i18n="status.notRunning">Not running</span>
+          </div>
+          <button id="stopBtn" class="button secondary small" type="button" data-i18n="common.stop" hidden>Stop</button>
+        </div>
+      </header>
+
+      <div id="errorBanner" class="error-banner" hidden>
+        <strong data-i18n="error.title">Could not start</strong>
+        <span id="errorText"></span>
+      </div>
+
+      <div id="permissionCard" class="permission-card" hidden>
+        <div>
+          <strong data-i18n="permission.title">macOS Accessibility permission required</strong>
+          <p data-i18n="permission.text">Allow GlideLink to listen for and inject mouse events, then relaunch the app.</p>
+        </div>
+        <button id="permissionBtn" type="button" class="button secondary small" data-i18n="permission.open">Open System Settings</button>
+      </div>
+
+      <div class="page-scroll">
+        <section class="page active" data-page="session">
+          <p class="page-lede" data-i18n="session.lede">Choose this computer's role. Both devices use the same pairing code to create a local-only session.</p>
+
+          <form id="configForm" autocomplete="off">
+            <div class="group">
+              <div class="group-header"><h2 data-i18n="roles.group">Device role</h2></div>
+              <div class="group-card">
+                <button class="role-option choice-row active" type="button" data-role="controller" role="radio" aria-checked="true">
+                  <span class="choice-icon blue" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="12.5" height="8.5" rx="1.6" stroke="currentColor" stroke-width="1.8"/><path d="M6.5 16.5h5M9 12.5v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.7 10.8l2 7 1.2-2.1 2.2-.4-5.4-4.5z" fill="currentColor"/></svg>
+                  </span>
+                  <span class="choice-copy">
+                    <strong data-i18n="role.controller">Controller</strong>
+                    <small data-i18n="role.controllerDesc">This computer has the mouse and controls the other one</small>
+                  </span>
+                  <span class="choice-check" aria-hidden="true">
+                    <svg viewBox="0 0 16 16" fill="none"><path d="M3.3 8.4l3 3 6.4-6.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </span>
+                </button>
+                <div class="separator"></div>
+                <button class="role-option choice-row" type="button" data-role="agent" role="radio" aria-checked="false">
+                  <span class="choice-icon purple" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none"><rect x="2.8" y="4.5" width="18.4" height="12" rx="1.9" stroke="currentColor" stroke-width="1.8"/><path d="M8 20.2h8M12 16.5v3.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="17.4" cy="8.7" r="1.5" fill="currentColor"/></svg>
+                  </span>
+                  <span class="choice-copy">
+                    <strong data-i18n="role.agent">Controlled PC</strong>
+                    <small data-i18n="role.agentDesc">This computer is controlled by the other one</small>
+                  </span>
+                  <span class="choice-check" aria-hidden="true">
+                    <svg viewBox="0 0 16 16" fill="none"><path d="M3.3 8.4l3 3 6.4-6.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            <div class="group">
+              <div class="group-header"><h2 data-i18n="connection.group">Connection</h2><span data-i18n="connection.lanUdp">LAN · UDP</span></div>
+              <div class="group-card">
+                <div id="controllerFields">
+                  <div class="setting-row">
+                    <label for="peerAddr" data-i18n="connection.peerAddress">Peer address</label>
+                    <input id="peerAddr" name="peerAddr" class="control-input" type="text" placeholder="192.168.1.42:45890" spellcheck="false" />
+                  </div>
+                  <div class="separator"></div>
+                </div>
+
+                <div id="agentFields" hidden>
+                  <div class="setting-row">
+                    <label for="listenPort" data-i18n="connection.listenPort">Listening port</label>
+                    <input id="listenPort" name="listenPort" class="control-input narrow" type="number" min="1024" max="65535" value="45890" />
+                  </div>
+                  <div class="separator"></div>
+                  <div class="setting-row hint-row">
+                    <span class="hint-icon" aria-hidden="true">
+                      <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.2"/><path d="M8 7v4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="4.8" r=".85" fill="currentColor"/></svg>
+                    </span>
+                    <span data-i18n="connection.agentHint">Start this device first, then enter this computer's LAN IP and port on the controller.</span>
+                  </div>
+                  <div class="separator"></div>
+                </div>
+
+                <div class="setting-row">
+                  <span class="row-label" data-i18n="connection.layout">Display layout</span>
+                  <button id="editLayout" type="button" class="link-button">
+                    <span id="layoutSummary">Peer on the right</span>
+                    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6 3.8L10.2 8 6 12.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                </div>
+                <div class="separator"></div>
+
+                <div class="setting-row passcode-row">
+                  <label for="passcode" data-i18n="connection.passcode">Pairing code</label>
+                  <div class="input-with-actions">
+                    <input id="passcode" name="passcode" type="password" spellcheck="false" placeholder="At least 8 characters" data-i18n-placeholder="connection.passcodePlaceholder" />
+                    <button id="copyPasscode" type="button" class="icon-button" data-i18n-title="common.copyPasscode" data-i18n-aria-label="common.copyPasscode" title="Copy pairing code" aria-label="Copy pairing code">
+                      <svg viewBox="0 0 20 20" fill="none"><rect x="7" y="7" width="9" height="9" rx="1.7" stroke="currentColor" stroke-width="1.35"/><path d="M13 7V5.4A1.4 1.4 0 0011.6 4H5.4A1.4 1.4 0 004 5.4v6.2A1.4 1.4 0 005.4 13H7" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/></svg>
+                    </button>
+                    <button id="togglePasscode" type="button" class="icon-button" data-i18n-title="common.showPasscode" data-i18n-aria-label="common.showPasscode" title="Show or hide pairing code" aria-label="Show or hide pairing code" aria-pressed="false">
+                      <svg viewBox="0 0 20 20" fill="none"><path d="M2.1 10s2.9-5 7.9-5 7.9 5 7.9 5-2.9 5-7.9 5-7.9-5-7.9-5z" stroke="currentColor" stroke-width="1.35"/><circle cx="10" cy="10" r="2.3" stroke="currentColor" stroke-width="1.35"/></svg>
+                    </button>
+                    <button id="generatePasscode" type="button" class="link-button" data-i18n="common.regenerate">Regenerate</button>
+                  </div>
+                </div>
+              </div>
+              <p class="group-footnote" data-i18n="connection.footnote">Both computers must use exactly the same pairing code. Input events are encrypted with a session key derived from it.</p>
+            </div>
+
+            <div class="group">
+              <div class="group-header"><h2 data-i18n="status.group">Status</h2><span id="sessionState" data-i18n="status.notStarted">Not started</span></div>
+              <div class="group-card">
+                <div class="status-metrics">
+                  <div class="status-metric">
+                    <span data-i18n="status.localScreen">This screen</span>
+                    <strong id="localScreenText">—</strong>
+                  </div>
+                  <div class="status-metric">
+                    <span data-i18n="status.peer">Peer</span>
+                    <strong id="peerText">—</strong>
+                  </div>
+                  <div class="status-metric">
+                    <span data-i18n="status.rtt">Network RTT</span>
+                    <strong><i class="latency-dot" id="latencyDot"></i><span id="latencyValue">—</span></strong>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="session-actions">
+              <button id="startBtn" type="submit" class="button primary">
+                <span class="button-spinner" aria-hidden="true"></span>
+                <span id="startLabel" data-i18n="button.startControl">Start controlling</span>
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <section class="page" data-page="layout" hidden>
+          <p class="page-lede" data-i18n="layout.lede">Place the peer screen on one side of this computer. Move the mouse across that edge to enter the other computer; move back across the same edge to return.</p>
+
+          <div class="group">
+            <div class="group-header"><h2 data-i18n="layout.group">Arrangement</h2><span data-i18n="layout.groupNote">Use like multiple displays</span></div>
+            <div class="group-card layout-card">
+              <div id="layoutStage" class="layout-stage" data-edge="right">
+                <div class="stage-canvas" aria-hidden="true"></div>
+                <div class="screen host-screen" id="hostScreen">
+                  <div class="screen-topline" aria-hidden="true"></div>
+                  <div class="screen-content">
+                    <strong id="hostScreenLabel" data-i18n="common.thisDevice">This device</strong>
+                    <span class="screen-size" id="hostScreenSize">—</span>
+                  </div>
+                </div>
+
+                <div class="link-bridge" aria-hidden="true">
+                  <i></i>
+                </div>
+
+                <div class="screen remote-screen" id="remoteScreen">
+                  <div class="screen-topline" aria-hidden="true"></div>
+                  <div class="screen-content">
+                    <strong id="remoteScreenLabel" data-i18n="common.peerControlled">Controlled PC</strong>
+                    <span class="screen-size" id="remoteScreenSize">—</span>
+                  </div>
+                  <span class="remote-badge" id="remoteBadge" hidden data-i18n="status.controlled">Under control</span>
+                </div>
+              </div>
+
+              <div class="preview-status">
+                <i class="preview-dot"></i>
+                <span id="linkChipText" data-i18n="layout.previewWaiting">Waiting for connection</span>
+              </div>
+              <div class="separator" id="layoutEdgeSeparator"></div>
+
+              <div class="setting-row" id="layoutEdgeRow">
+                <span class="row-label" data-i18n="layout.edgePosition">Peer screen position</span>
+                <div class="segmented" id="edgePicker" role="radiogroup" aria-label="Peer screen position" data-i18n-aria-label="layout.edgePosition">
+                  <button type="button" class="edge-option" data-edge="left" role="radio" aria-checked="false" data-i18n="layout.edgeLeft">Left</button>
+                  <button type="button" class="edge-option active" data-edge="right" role="radio" aria-checked="true" data-i18n="layout.edgeRight">Right</button>
+                  <button type="button" class="edge-option" data-edge="top" role="radio" aria-checked="false" data-i18n="layout.edgeTop">Top</button>
+                  <button type="button" class="edge-option" data-edge="bottom" role="radio" aria-checked="false" data-i18n="layout.edgeBottom">Bottom</button>
+                </div>
+              </div>
+            </div>
+            <p class="group-footnote" data-i18n="layout.footnote">Move out of this computer through the selected edge to control the peer. Cross the same edge in the opposite direction to return.</p>
+          </div>
+        </section>
+
+        <section class="page" data-page="security" hidden>
+          <p class="page-lede" data-i18n="security.lede">GlideLink connects only the two devices you choose. It does not use a cloud service and never sends input traffic to the internet.</p>
+
+          <div class="group">
+            <div class="group-header"><h2 data-i18n="security.transportGroup">Transport security</h2></div>
+            <div class="group-card">
+              <div class="setting-row">
+                <span data-i18n="security.algorithm">Encryption</span>
+                <span class="value">ChaCha20-Poly1305</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="security.kdf">Key derivation</span>
+                <span class="value" data-i18n="security.kdfValue">PBKDF2-HMAC-SHA256 · 100,000 rounds</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="security.replay">Replay protection</span>
+                <span class="value" data-i18n="security.replayValue">64-packet sliding window</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="security.channel">Transport</span>
+                <span class="value" data-i18n="security.channelValue">LAN UDP · never leaves the local network</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="group-header"><h2 data-i18n="security.pairingGroup">Pairing code</h2></div>
+            <div class="group-card">
+              <div class="setting-row note-row">
+                <span data-i18n="security.pairingNote">The pairing code is the only authentication secret. Use the generated high-entropy code, avoid guessable strings, and never expose the UDP port to the internet.</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="page" data-page="about" hidden>
+          <div class="about-hero">
+            <img class="about-icon" src="app-icon.png" alt="" />
+            <h2>GlideLink</h2>
+            <p data-i18n="about.tagline">Low-latency software KVM</p>
+            <span class="version-pill" data-i18n="about.version">Version 0.1.0 · Alpha</span>
+          </div>
+
+          <div class="group">
+            <div class="group-card">
+              <div class="setting-row">
+                <span data-i18n="about.platform">Platforms</span>
+                <span class="value" data-i18n="about.platformValue">Windows · macOS</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="about.input">Input backend</span>
+                <span class="value" data-i18n="about.inputValue">Native global mouse hooks</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="about.transport">Transport</span>
+                <span class="value" data-i18n="about.transportValue">LAN UDP</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="about.latency">Target latency</span>
+                <span class="value" data-i18n="about.latencyValue">Under 10ms</span>
+              </div>
+            </div>
+            <p class="group-footnote" data-i18n="about.footnote">This version supports mouse movement, buttons, and wheel. Keyboard forwarding, discovery, and multiple peers are next.</p>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="i18n.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
