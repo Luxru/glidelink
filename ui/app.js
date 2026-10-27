@@ -6,7 +6,6 @@ const els = {
   form: document.getElementById("configForm"),
   pageScroll: document.querySelector(".page-scroll"),
   pageTitle: document.getElementById("pageTitle"),
-  pageSubtitle: document.getElementById("pageSubtitle"),
   navItems: [...document.querySelectorAll(".nav-item")],
   languageSelect: document.getElementById("languageSelect"),
   roleOptions: [...document.querySelectorAll(".role-option")],
@@ -60,14 +59,10 @@ const ui = {
 };
 
 const PAGES = {
-  session: {
-    title: "page.session.title",
-    subtitle: "page.session.subtitle.controller",
-    subtitleAgent: "page.session.subtitle.agent",
-  },
-  layout: { title: "page.layout.title", subtitle: "page.layout.subtitle" },
-  security: { title: "page.security.title", subtitle: "page.security.subtitle" },
-  about: { title: "page.about.title", subtitle: "page.about.subtitle" },
+  session: "page.session.title",
+  layout: "page.layout.title",
+  security: "page.security.title",
+  about: "page.about.title",
 };
 
 const EDGE_LABELS = {
@@ -154,12 +149,7 @@ function setError(raw) {
 }
 
 function updatePageChrome() {
-  const page = PAGES[ui.page] || PAGES.session;
-  els.pageTitle.textContent = t(page.title);
-  els.pageSubtitle.textContent =
-    ui.page === "session" && ui.role === "agent"
-      ? t(page.subtitleAgent)
-      : t(page.subtitle);
+  els.pageTitle.textContent = t(PAGES[ui.page] || PAGES.session);
 }
 
 function setPage(page) {
@@ -229,7 +219,6 @@ function setRole(role, syncControls = true) {
     : t("common.peerController");
   updateLayoutSummary();
   updateStartLabel();
-  if (ui.page === "session") updatePageChrome();
   if (syncControls && !ui.running) setDisabledControls(false);
 }
 

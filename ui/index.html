@@ -53,10 +53,6 @@
             <option value="en" data-i18n="language.en">English</option>
           </select>
         </label>
-        <div class="sidebar-note">
-          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="3.2" y="7" width="9.6" height="6.4" rx="1.6" stroke="currentColor" stroke-width="1.2"/><path d="M5.4 7V5.3a2.6 2.6 0 015.2 0V7" stroke="currentColor" stroke-width="1.2"/></svg>
-          <span data-i18n="sidebar.secureLocal">LAN only · End-to-end encrypted</span>
-        </div>
         <div class="sidebar-version">GlideLink 0.1.0</div>
       </div>
     </aside>
@@ -65,7 +61,6 @@
       <header class="content-header">
         <div class="title-block">
           <h1 id="pageTitle" data-i18n="page.session.title">Session</h1>
-          <p id="pageSubtitle" data-i18n="page.session.subtitle.controller">Connect and control another computer</p>
         </div>
         <div class="header-actions">
           <div id="statusPill" class="status-pill status-idle" role="status" aria-live="polite">
@@ -91,7 +86,6 @@
 
       <div class="page-scroll">
         <section class="page active" data-page="session">
-          <p class="page-lede" data-i18n="session.lede">Choose this computer's role. Both devices use the same pairing code to create a local-only session.</p>
 
           <form id="configForm" autocomplete="off">
             <div class="group">
@@ -103,7 +97,6 @@
                   </span>
                   <span class="choice-copy">
                     <strong data-i18n="role.controller">Controller</strong>
-                    <small data-i18n="role.controllerDesc">This computer has the mouse and controls the other one</small>
                   </span>
                   <span class="choice-check" aria-hidden="true">
                     <svg viewBox="0 0 16 16" fill="none"><path d="M3.3 8.4l3 3 6.4-6.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -116,7 +109,6 @@
                   </span>
                   <span class="choice-copy">
                     <strong data-i18n="role.agent">Controlled PC</strong>
-                    <small data-i18n="role.agentDesc">This computer is controlled by the other one</small>
                   </span>
                   <span class="choice-check" aria-hidden="true">
                     <svg viewBox="0 0 16 16" fill="none"><path d="M3.3 8.4l3 3 6.4-6.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -126,7 +118,7 @@
             </div>
 
             <div class="group">
-              <div class="group-header"><h2 data-i18n="connection.group">Connection</h2><span data-i18n="connection.lanUdp">LAN · UDP</span></div>
+              <div class="group-header"><h2 data-i18n="connection.group">Connection</h2></div>
               <div class="group-card">
                 <div id="controllerFields">
                   <div class="setting-row">
@@ -140,13 +132,6 @@
                   <div class="setting-row">
                     <label for="listenPort" data-i18n="connection.listenPort">Listening port</label>
                     <input id="listenPort" name="listenPort" class="control-input narrow" type="number" min="1024" max="65535" value="45890" />
-                  </div>
-                  <div class="separator"></div>
-                  <div class="setting-row hint-row">
-                    <span class="hint-icon" aria-hidden="true">
-                      <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.2"/><path d="M8 7v4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="4.8" r=".85" fill="currentColor"/></svg>
-                    </span>
-                    <span data-i18n="connection.agentHint">Start this device first, then enter this computer's LAN IP and port on the controller.</span>
                   </div>
                   <div class="separator"></div>
                 </div>
@@ -174,7 +159,6 @@
                   </div>
                 </div>
               </div>
-              <p class="group-footnote" data-i18n="connection.footnote">Both computers must use exactly the same pairing code. Input events are encrypted with a session key derived from it.</p>
             </div>
 
             <div class="group">
@@ -207,10 +191,9 @@
         </section>
 
         <section class="page" data-page="layout" hidden>
-          <p class="page-lede" data-i18n="layout.lede">Place the peer screen on one side of this computer. Move the mouse across that edge to enter the other computer; move back across the same edge to return.</p>
 
           <div class="group">
-            <div class="group-header"><h2 data-i18n="layout.group">Arrangement</h2><span data-i18n="layout.groupNote">Use like multiple displays</span></div>
+            <div class="group-header"><h2 data-i18n="layout.group">Arrangement</h2></div>
             <div class="group-card layout-card">
               <div id="layoutStage" class="layout-stage" data-edge="right">
                 <div class="stage-canvas" aria-hidden="true"></div>
@@ -252,12 +235,10 @@
                 </div>
               </div>
             </div>
-            <p class="group-footnote" data-i18n="layout.footnote">Move out of this computer through the selected edge to control the peer. Cross the same edge in the opposite direction to return.</p>
           </div>
         </section>
 
         <section class="page" data-page="security" hidden>
-          <p class="page-lede" data-i18n="security.lede">GlideLink connects only the two devices you choose. It does not use a cloud service and never sends input traffic to the internet.</p>
 
           <div class="group">
             <div class="group-header"><h2 data-i18n="security.transportGroup">Transport security</h2></div>
@@ -284,14 +265,6 @@
             </div>
           </div>
 
-          <div class="group">
-            <div class="group-header"><h2 data-i18n="security.pairingGroup">Pairing code</h2></div>
-            <div class="group-card">
-              <div class="setting-row note-row">
-                <span data-i18n="security.pairingNote">The pairing code is the only authentication secret. Use the generated high-entropy code, avoid guessable strings, and never expose the UDP port to the internet.</span>
-              </div>
-            </div>
-          </div>
         </section>
 
         <section class="page" data-page="about" hidden>
@@ -324,7 +297,6 @@
                 <span class="value" data-i18n="about.latencyValue">Under 10ms</span>
               </div>
             </div>
-            <p class="group-footnote" data-i18n="about.footnote">This version supports mouse movement, buttons, and wheel. Keyboard forwarding, discovery, and multiple peers are next.</p>
           </div>
         </section>
       </div>
