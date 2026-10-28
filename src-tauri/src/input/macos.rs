@@ -9,8 +9,8 @@ use super::{
 };
 use crate::error;
 use crate::layout::{
-    advance, entry_point, has_returned, host_point_to_norm, host_return_point, is_outward, Edge,
-    NormPoint, REENTRY_COOLDOWN_MS,
+    advance, clamp_for_edge, entry_point, has_returned, host_point_to_norm, host_return_point,
+    is_outward, Edge, NormPoint, REENTRY_COOLDOWN_MS,
 };
 use crate::status::{ScreenInfo, Status};
 use crossbeam_channel::{Receiver, Sender};
@@ -93,7 +93,10 @@ const CG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
 const CG_MOUSE_EVENT_DELTA_X: u32 = 4;
 const CG_MOUSE_EVENT_DELTA_Y: u32 = 5;
 const CG_MOUSE_EVENT_BUTTON_NUMBER: u32 = 3;
+const CG_MOUSE_EVENT_CLICK_STATE: u32 = 1;
 const CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1: u32 = 11;
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const DOUBLE_CLICK_DISTANCE: f64 = 4.0;
 const CG_KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
 const CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 
@@ -160,7 +163,7 @@ unsafe extern "C" {
     ) -> CGEventRef;
     fn CGEventCreateKeyboardEvent(source: *mut c_void, key: u16, key_down: u8) -> CGEventRef;
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
-    fn CGEventGetFlags(event: CGEventRef) -> u64;
+    fn CGEventSourceCreate(state_id: i32) -> *mut c_void;
     fn CGEventSourceButtonState(state_id: i32, button: u32) -> u8;
     fn CGEventSourceFlagsState(state_id: i32) -> u64;
     fn CGEventSourceKeyState(state_id: i32, key: u16) -> u8;
@@ -375,6 +378,75 @@ fn warp_cursor(point: CGPoint) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ButtonClick {
+    last_down: Option<Instant>,
+    last_point: CGPoint,
+    count: i64,
+    down_count: i64,
+}
+
+impl Default for ButtonClick {
+    fn default() -> Self {
+        Self {
+            last_down: None,
+            last_point: CGPoint::default(),
+            count: 1,
+            down_count: 1,
+        }
+    }
+}
+
+struct ClickTracker {
+    interval: Duration,
+    buttons: [ButtonClick; 5],
+}
+
+impl ClickTracker {
+    fn new() -> Self {
+        Self {
+            interval: DOUBLE_CLICK_INTERVAL,
+            buttons: [ButtonClick::default(); 5],
+        }
+    }
+
+    fn slot(bit: u8) -> usize {
+        match bit {
+            BUTTON_LEFT => 0,
+            BUTTON_RIGHT => 1,
+            BUTTON_MIDDLE => 2,
+            BUTTON_X1 => 3,
+            _ => 4,
+        }
+    }
+
+    fn down(&mut self, bit: u8, point: CGPoint) -> i64 {
+        let now = Instant::now();
+        let slot = &mut self.buttons[Self::slot(bit)];
+        let repeated = slot
+            .last_down
+            .map(|last| {
+                now.saturating_duration_since(last) <= self.interval
+                    && (slot.last_point.x - point.x).abs() <= DOUBLE_CLICK_DISTANCE
+                    && (slot.last_point.y - point.y).abs() <= DOUBLE_CLICK_DISTANCE
+            })
+            .unwrap_or(false);
+        slot.count = if repeated { (slot.count + 1).min(3) } else { 1 };
+        slot.last_down = Some(now);
+        slot.last_point = point;
+        slot.down_count = slot.count;
+        slot.count
+    }
+
+    fn up(&mut self, bit: u8) -> i64 {
+        self.buttons[Self::slot(bit)].down_count.max(1)
+    }
+
+    fn reset(&mut self) {
+        self.buttons = [ButtonClick::default(); 5];
+    }
+}
+
 struct CaptureState {
     shared: Arc<CaptureShared>,
     tx: Sender<CaptureMsg>,
@@ -389,6 +461,7 @@ struct CaptureState {
     cooldown_until: Instant,
     keys: KeyOwnership,
     caps_lock: bool,
+    caps_down: bool,
 }
 
 impl CaptureState {
@@ -459,10 +532,22 @@ impl CaptureState {
         };
 
         if is_caps(hid) {
-            let caps = unsafe { CGEventGetFlags(event) & CG_FLAG_ALPHA_SHIFT != 0 };
-            if caps != self.caps_lock {
-                self.caps_lock = caps;
-                self.send_keys(KeyEvent::None);
+            let physical_down =
+                unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, keycode) } != 0;
+            let pressed = match event_type {
+                CG_EVENT_KEY_DOWN => true,
+                CG_EVENT_KEY_UP => false,
+                CG_EVENT_FLAGS_CHANGED => physical_down,
+                _ => false,
+            };
+            if pressed {
+                if !self.caps_down {
+                    self.caps_down = true;
+                    self.caps_lock = !self.caps_lock;
+                    self.send_keys(KeyEvent::None);
+                }
+            } else {
+                self.caps_down = false;
             }
             return std::ptr::null_mut();
         }
@@ -556,6 +641,7 @@ impl CaptureState {
             if self.active {
                 let held = current_held_keys();
                 self.keys.rebind(held);
+                self.caps_down = false;
                 self.send_keys(KeyEvent::None);
             }
             return event;
@@ -588,6 +674,7 @@ impl CaptureState {
                     if has_returned(self.edge, self.point) {
                         self.deactivate(true);
                     } else {
+                        self.point = clamp_for_edge(self.edge, self.point);
                         self.send(0);
                     }
                 }
@@ -674,6 +761,7 @@ impl CaptureState {
         self.shared.set_active(true);
         self.keys.begin(current_held_keys());
         self.caps_lock = current_caps_lock();
+        self.caps_down = false;
         if !self.hidden {
             hide_cursor();
             unsafe {
@@ -701,6 +789,7 @@ impl CaptureState {
         self.point = self.point.clamped();
         self.send_inactive_keys();
         self.keys.deactivate();
+        self.caps_down = false;
         self.send(0);
         self.shared.set_active(false);
 
@@ -811,6 +900,7 @@ fn run_capture_thread(
         cooldown_until: Instant::now(),
         keys: KeyOwnership::default(),
         caps_lock: false,
+        caps_down: false,
     });
     let state_ptr = (&mut *state) as *mut CaptureState;
 
@@ -927,6 +1017,7 @@ fn injector_loop(
     let _ = ready_tx.send(Ok(()));
     let mut applied_buttons = 0u8;
     let mut applied_position: Option<(u16, u16)> = None;
+    let mut clicks = ClickTracker::new();
     let mut applied_keys = KeyState::default();
     let mut caps_actual = unsafe {
         CGEventSourceFlagsState(CG_EVENT_SOURCE_STATE_HID_SYSTEM) & CG_FLAG_ALPHA_SHIFT != 0
@@ -966,7 +1057,7 @@ fn injector_loop(
                 }
                 InjectStep::Buttons { from, to } => {
                     let point = applied_point_or_origin(applied_position, bounds);
-                    apply_button_transitions(from, to, point);
+                    apply_button_transitions(from, to, point, &mut clicks);
                     applied_buttons = to;
                 }
                 InjectStep::Wheel(delta) => unsafe {
@@ -1000,17 +1091,18 @@ fn injector_loop(
                 }
                 InjectStep::CapsLock(desired) => {
                     if desired != caps_actual {
-                        inject_caps_tap(caps_actual, &applied_keys);
+                        inject_caps_tap(desired, &applied_keys);
                         caps_actual = desired;
                     }
                 }
                 InjectStep::Reset => {
                     release_keys(&mut applied_keys, caps_actual);
                     let point = applied_point_or_origin(applied_position, bounds);
-                    apply_button_transitions(applied_buttons, 0, point);
+                    apply_button_transitions(applied_buttons, 0, point, &mut clicks);
                     applied_buttons = 0;
                     applied_position = None;
                     caps_actual = current_caps_lock();
+                    clicks.reset();
                 }
             }
         }
@@ -1019,7 +1111,7 @@ fn injector_loop(
     release_keys(&mut applied_keys, caps_actual);
     if applied_buttons != 0 {
         let point = applied_point_or_origin(applied_position, bounds);
-        apply_button_transitions(applied_buttons, 0, point);
+        apply_button_transitions(applied_buttons, 0, point, &mut clicks);
     }
 }
 
@@ -1061,18 +1153,22 @@ fn post_key_event(hid: u8, down: bool, repeat: bool, keys: &KeyState, caps_lock:
     }
 }
 
-fn inject_caps_tap(caps_before: bool, keys: &KeyState) {
+fn inject_caps_tap(caps_after: bool, keys: &KeyState) {
     let Some(keycode) = hid_to_mac(CAPS_LOCK) else {
         return;
     };
     unsafe {
+        let source = CGEventSourceCreate(CG_EVENT_SOURCE_STATE_HID_SYSTEM);
         for down in [1u8, 0u8] {
-            let event = CGEventCreateKeyboardEvent(null_mut(), keycode, down);
+            let event = CGEventCreateKeyboardEvent(source, keycode, down);
             if !event.is_null() {
-                CGEventSetFlags(event, mac_flags(keys, caps_before));
+                CGEventSetFlags(event, mac_flags(keys, caps_after));
                 CGEventPost(CG_TAP_LOCATION_HID, event);
                 CFRelease(event as *const c_void);
             }
+        }
+        if !source.is_null() {
+            CFRelease(source);
         }
     }
 }
@@ -1116,6 +1212,17 @@ fn post_mouse_event(event_type: u32, point: CGPoint, button: u32) {
     }
 }
 
+fn post_mouse_event_with_click(event_type: u32, point: CGPoint, button: u32, click_state: i64) {
+    unsafe {
+        let event = CGEventCreateMouseEvent(null_mut(), event_type, point, button);
+        if !event.is_null() {
+            CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_CLICK_STATE, click_state);
+            CGEventPost(CG_TAP_LOCATION_HID, event);
+            CFRelease(event as *const c_void);
+        }
+    }
+}
+
 /// Map a CoreGraphics "other mouse button" number to the button bit used by
 /// the wire protocol. macOS reports the side buttons as 3 and 4.
 fn other_button_bit(number: i64) -> u8 {
@@ -1143,7 +1250,7 @@ fn drag_event(buttons: u8) -> Option<(u32, u32)> {
     }
 }
 
-fn apply_button_transitions(previous: u8, current: u8, point: CGPoint) {
+fn apply_button_transitions(previous: u8, current: u8, point: CGPoint, clicks: &mut ClickTracker) {
     let changed = previous ^ current;
     post_transition(
         changed,
@@ -1153,6 +1260,7 @@ fn apply_button_transitions(previous: u8, current: u8, point: CGPoint) {
         CG_EVENT_LEFT_MOUSE_UP,
         CG_MOUSE_BUTTON_LEFT,
         point,
+        clicks,
     );
     post_transition(
         changed,
@@ -1162,6 +1270,7 @@ fn apply_button_transitions(previous: u8, current: u8, point: CGPoint) {
         CG_EVENT_RIGHT_MOUSE_UP,
         CG_MOUSE_BUTTON_RIGHT,
         point,
+        clicks,
     );
     post_transition(
         changed,
@@ -1171,6 +1280,7 @@ fn apply_button_transitions(previous: u8, current: u8, point: CGPoint) {
         CG_EVENT_OTHER_MOUSE_UP,
         CG_MOUSE_BUTTON_CENTER,
         point,
+        clicks,
     );
     post_transition(
         changed,
@@ -1180,6 +1290,7 @@ fn apply_button_transitions(previous: u8, current: u8, point: CGPoint) {
         CG_EVENT_OTHER_MOUSE_UP,
         CG_MOUSE_BUTTON_X1,
         point,
+        clicks,
     );
     post_transition(
         changed,
@@ -1189,6 +1300,7 @@ fn apply_button_transitions(previous: u8, current: u8, point: CGPoint) {
         CG_EVENT_OTHER_MOUSE_UP,
         CG_MOUSE_BUTTON_X2,
         point,
+        clicks,
     );
 }
 
@@ -1201,12 +1313,19 @@ fn post_transition(
     up: u32,
     button: u32,
     point: CGPoint,
+    clicks: &mut ClickTracker,
 ) {
     if changed & bit == 0 {
         return;
     }
-    let event_type = if current & bit != 0 { down } else { up };
-    post_mouse_event(event_type, point, button);
+    let is_down = current & bit != 0;
+    let click_state = if is_down {
+        clicks.down(bit, point)
+    } else {
+        clicks.up(bit)
+    };
+    let event_type = if is_down { down } else { up };
+    post_mouse_event_with_click(event_type, point, button, click_state);
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -1271,8 +1390,16 @@ pub fn self_test() -> bool {
                 ok = false;
             }
         }
+        match test_caps_injection() {
+            Ok(()) => println!("caps lock:              PASS"),
+            Err(e) => {
+                println!("caps lock:              FAIL ({e})");
+                ok = false;
+            }
+        }
     } else {
         println!("injection:              SKIP (needs Accessibility + event posting)");
+        println!("caps lock:              SKIP (needs Accessibility + event posting)");
         ok = false;
     }
 
@@ -1339,6 +1466,53 @@ fn test_capture(bounds: CGRect) -> Result<(), String> {
     }
     warp_cursor(saved);
     result
+}
+
+fn test_caps_injection() -> Result<(), String> {
+    let status = Status::new(screen_info());
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = crossbeam_channel::unbounded::<InjectMsg>();
+    let handle = start_injector(rx, Arc::clone(&stop), status)?;
+    let before = current_caps_lock();
+
+    let send_caps = |desired: bool| {
+        tx.send(InjectMsg::Keys(KeyPacket {
+            active: true,
+            caps_lock: desired,
+            state: KeyState::default(),
+            event: KeyEvent::None,
+        }))
+        .map_err(|_| "injector thread stopped".to_string())
+    };
+    let wait_caps = |desired: bool| {
+        for _ in 0..50 {
+            if current_caps_lock() == desired {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    };
+
+    let flipped = send_caps(!before).is_ok() && wait_caps(!before);
+    let restored = send_caps(before).is_ok() && wait_caps(before);
+    let _ = tx.send(InjectMsg::Reset);
+    stop.store(true, Ordering::Release);
+    let _ = handle.join();
+
+    let actual = current_caps_lock();
+    if actual != before {
+        inject_caps_tap(before, &KeyState::default());
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    if flipped && restored && current_caps_lock() == before {
+        Ok(())
+    } else {
+        Err(format!(
+            "caps did not toggle/restore (before={before}, flipped={flipped}, restored={restored})"
+        ))
+    }
 }
 
 fn test_injection(bounds: CGRect) -> Result<(), String> {

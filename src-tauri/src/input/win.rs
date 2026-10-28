@@ -9,8 +9,8 @@ use super::{
 };
 use crate::error;
 use crate::layout::{
-    advance, entry_point, has_returned, host_point_to_norm, host_return_point, is_outward, Edge,
-    NormPoint, REENTRY_COOLDOWN_MS,
+    advance, clamp_for_edge, entry_point, has_returned, host_point_to_norm, host_return_point,
+    is_outward, Edge, NormPoint, REENTRY_COOLDOWN_MS,
 };
 use crate::status::{ScreenInfo, Status};
 use crossbeam_channel::{Receiver, Sender};
@@ -325,6 +325,7 @@ impl CaptureState {
             if has_returned(self.edge, self.point) {
                 self.deactivate(true);
             } else {
+                self.point = clamp_for_edge(self.edge, self.point);
                 self.send(0);
             }
             return;

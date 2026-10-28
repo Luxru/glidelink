@@ -1303,9 +1303,9 @@ fn agent_loop(
                                 if seq > active.last_key_seq {
                                     if let Ok(packet) = decode_key(&payload) {
                                         active.last_key_seq = seq;
-                                        if last_logged_key.map_or(true, |previous| {
-                                            previous != packet
-                                        }) {
+                                        if last_logged_key
+                                            .map_or(true, |previous| previous != packet)
+                                        {
                                             log::debug!(
                                                 "recv key active={} caps={} keys={:?}",
                                                 packet.active,

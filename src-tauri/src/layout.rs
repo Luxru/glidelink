@@ -92,6 +92,19 @@ pub fn has_returned(edge: Edge, point: NormPoint) -> bool {
     }
 }
 
+/// Keep overshoot only on the return side of the peer. Without this, moving
+/// past a far screen edge accumulates invisible overshoot; reversing direction
+/// then has to unwind that distance before the injected cursor moves again,
+/// which feels like the pointer is stuck to the edge.
+pub fn clamp_for_edge(edge: Edge, point: NormPoint) -> NormPoint {
+    match edge {
+        Edge::Right => NormPoint::new(point.x.min(1.0), point.y.clamp(0.0, 1.0)),
+        Edge::Left => NormPoint::new(point.x.max(0.0), point.y.clamp(0.0, 1.0)),
+        Edge::Top => NormPoint::new(point.x.clamp(0.0, 1.0), point.y.max(0.0)),
+        Edge::Bottom => NormPoint::new(point.x.clamp(0.0, 1.0), point.y.min(1.0)),
+    }
+}
+
 /// Host position (normalized to the full virtual desktop) to warp to when
 /// returning from the peer. The position is kept a couple of pixels inside the
 /// screen to avoid instantly re-entering the peer. `offset` must match the
@@ -173,6 +186,29 @@ mod tests {
         assert_eq!(entry.x, 1.0);
         let entry = entry_point(Edge::Bottom, NormPoint::new(0.1, 1.0), 0.5);
         assert_eq!(entry.x, 0.0);
+    }
+
+    #[test]
+    fn far_edge_overshoot_is_clamped_but_return_overshoot_is_kept() {
+        let far = clamp_for_edge(Edge::Right, NormPoint::new(1.8, -0.2));
+        assert_eq!(far, NormPoint::new(1.0, 0.0));
+        let returning = clamp_for_edge(Edge::Right, NormPoint::new(-0.2, 0.4));
+        assert_eq!(returning, NormPoint::new(-0.2, 0.4));
+
+        let far = clamp_for_edge(Edge::Left, NormPoint::new(-0.2, 1.4));
+        assert_eq!(far, NormPoint::new(0.0, 1.0));
+        let returning = clamp_for_edge(Edge::Left, NormPoint::new(1.2, 0.4));
+        assert_eq!(returning, NormPoint::new(1.2, 0.4));
+
+        let far = clamp_for_edge(Edge::Top, NormPoint::new(1.3, -0.2));
+        assert_eq!(far, NormPoint::new(1.0, 0.0));
+        let returning = clamp_for_edge(Edge::Top, NormPoint::new(0.4, 1.2));
+        assert_eq!(returning, NormPoint::new(0.4, 1.2));
+
+        let far = clamp_for_edge(Edge::Bottom, NormPoint::new(-0.2, 1.8));
+        assert_eq!(far, NormPoint::new(0.0, 1.0));
+        let returning = clamp_for_edge(Edge::Bottom, NormPoint::new(0.4, -0.2));
+        assert_eq!(returning, NormPoint::new(0.4, -0.2));
     }
 
     #[test]
