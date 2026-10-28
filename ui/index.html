@@ -17,8 +17,7 @@
         </div>
       </div>
 
-      <div class="sidebar-label" data-i18n="sidebar.settings">Settings</div>
-      <nav class="sidebar-nav" aria-label="Settings" data-i18n-aria-label="sidebar.settings">
+      <nav class="sidebar-nav" aria-label="Main navigation" data-i18n-aria-label="nav.label">
         <button class="nav-item active" type="button" data-page-target="session">
           <span class="nav-icon nav-blue" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none"><path d="M4 3.2l11.2 7.1-4.8.9-1.6 4.8L4 3.2z" fill="currentColor"/></svg>
@@ -31,6 +30,12 @@
           </span>
           <span data-i18n="nav.layout">Display Layout</span>
         </button>
+        <button class="nav-item" type="button" data-page-target="settings">
+          <span class="nav-icon nav-green" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="2.5" stroke="currentColor" stroke-width="1.6"/><path d="M10 2.6v2.1M10 15.3v2.1M2.6 10h2.1M15.3 10h2.1M4.8 4.8l1.5 1.5M13.7 13.7l1.5 1.5M15.2 4.8l-1.5 1.5M6.3 13.7l-1.5 1.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          </span>
+          <span data-i18n="nav.settings">Settings</span>
+        </button>
         <button class="nav-item" type="button" data-page-target="about">
           <span class="nav-icon nav-gray" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7.1" stroke="currentColor" stroke-width="1.5"/><path d="M10 9v4.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="10" cy="6.6" r="1.05" fill="currentColor"/></svg>
@@ -40,13 +45,6 @@
       </nav>
 
       <div class="sidebar-footer">
-        <label class="language-control">
-          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="5.7" stroke="currentColor" stroke-width="1.2"/><path d="M2.5 8h11M8 2.3c1.5 1.6 2.2 3.5 2.2 5.7S9.5 13.7 8 13.7C6.5 12.1 5.8 10.2 5.8 8S6.5 3.9 8 2.3z" stroke="currentColor" stroke-width="1.05"/></svg>
-          <select id="languageSelect" data-i18n-aria-label="language.label" aria-label="Language">
-            <option value="zh" data-i18n="language.zh">Chinese</option>
-            <option value="en" data-i18n="language.en">English</option>
-          </select>
-        </label>
         <div class="sidebar-version">GlideLink 0.1.0</div>
       </div>
     </aside>
@@ -119,30 +117,14 @@
               <div class="group-card">
                 <div id="agentFields" hidden>
                   <div class="setting-row">
-                    <label for="interfaceSelect" data-i18n="connection.interface">Network interface</label>
-                    <select id="interfaceSelect" class="control-input interface-select"></select>
-                  </div>
-                  <div class="separator"></div>
-                  <div class="setting-row">
                     <span data-i18n="connection.localIp">Local IP</span>
-                    <span class="value" id="selectedIp">—</span>
-                  </div>
-                  <div class="separator"></div>
-                </div>
-
-                <div class="setting-row">
-                  <span class="row-label" data-i18n="connection.layout">Display layout</span>
-                  <button id="editLayout" type="button" class="link-button">
-                    <span id="layoutSummary">Peer on the right</span>
-                    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6 3.8L10.2 8 6 12.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                  </button>
-                </div>
-                <div class="separator"></div>
-
-                <div id="controllerFields">
-                  <div class="setting-row">
-                    <label for="adaptModifiers" data-i18n="connection.adaptModifiers">Cross-system Cmd ↔ Ctrl</label>
-                    <input id="adaptModifiers" class="toggle-input" type="checkbox" />
+                    <span class="row-value">
+                      <span class="value" id="selectedIp">—</span>
+                      <button id="openNetworkSettings" type="button" class="link-button">
+                        <span data-i18n="connection.settings">Settings</span>
+                        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M6 3.8L10.2 8 6 12.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                      </button>
+                    </span>
                   </div>
                   <div class="separator"></div>
                 </div>
@@ -181,10 +163,6 @@
                     <span data-i18n="status.rtt">Network RTT</span>
                     <strong><i class="latency-dot" id="latencyDot"></i><span id="latencyValue">—</span></strong>
                   </div>
-                  <div class="status-metric">
-                    <span data-i18n="status.keyboard">Keyboard</span>
-                    <strong id="keyboardText">—</strong>
-                  </div>
                 </div>
               </div>
             </div>
@@ -200,39 +178,61 @@
 
         <section class="page" data-page="layout" hidden>
 
+          <div id="layoutStage" class="layout-stage" data-edge="right">
+            <div class="stage-canvas" aria-hidden="true"></div>
+            <div class="screen host-screen" id="hostScreen">
+              <div class="screen-content">
+                <strong id="hostScreenLabel" data-i18n="common.thisDevice">This device</strong>
+                <span class="screen-size" id="hostScreenSize">—</span>
+              </div>
+            </div>
+
+            <div class="link-bridge" aria-hidden="true">
+              <i></i>
+            </div>
+
+            <div class="screen remote-screen" id="remoteScreen" tabindex="0" role="button"
+                 data-i18n-aria-label="layout.peerAriaLabel">
+              <div class="screen-content">
+                <strong id="remoteScreenLabel" data-i18n="common.peerControlled">Controlled PC</strong>
+                <span class="screen-size" id="remoteScreenSize">—</span>
+              </div>
+              <span class="remote-badge" id="remoteBadge" hidden data-i18n="status.controlled">Under control</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="page" data-page="settings" hidden>
           <div class="group">
-            <div class="group-header"><h2 data-i18n="layout.group">Arrangement</h2></div>
-            <div class="group-card layout-card">
-              <div id="layoutStage" class="layout-stage" data-edge="right">
-                <div class="stage-canvas" aria-hidden="true"></div>
-                <div class="screen host-screen" id="hostScreen">
-                  <div class="screen-topline" aria-hidden="true"></div>
-                  <div class="screen-content">
-                    <strong id="hostScreenLabel" data-i18n="common.thisDevice">This device</strong>
-                    <span class="screen-size" id="hostScreenSize">—</span>
-                  </div>
-                </div>
-
-                <div class="link-bridge" aria-hidden="true">
-                  <i></i>
-                </div>
-
-                <div class="screen remote-screen" id="remoteScreen" tabindex="0" role="button"
-                     data-i18n-aria-label="layout.peerAriaLabel">
-                  <div class="screen-topline" aria-hidden="true"></div>
-                  <div class="screen-content">
-                    <strong id="remoteScreenLabel" data-i18n="common.peerControlled">Controlled PC</strong>
-                    <span class="screen-size" id="remoteScreenSize">—</span>
-                  </div>
-                  <span class="remote-badge" id="remoteBadge" hidden data-i18n="status.controlled">Under control</span>
-                </div>
+            <div class="group-header"><h2 data-i18n="settings.appearanceGroup">Appearance</h2></div>
+            <div class="group-card">
+              <div class="setting-row">
+                <label for="languageSelect" data-i18n="settings.language">Interface language</label>
+                <select id="languageSelect" class="control-input interface-select" data-i18n-aria-label="settings.language" aria-label="Interface language">
+                  <option value="zh" data-i18n="language.zh">Chinese</option>
+                  <option value="en" data-i18n="language.en">English</option>
+                </select>
               </div>
+            </div>
+          </div>
 
-              <div class="preview-status">
-                <i class="preview-dot"></i>
-                <span id="linkChipText" data-i18n="layout.previewWaiting">Waiting for connection</span>
+          <div class="group">
+            <div class="group-header"><h2 data-i18n="settings.inputGroup">Keyboard &amp; shortcuts</h2></div>
+            <div class="group-card">
+              <div class="setting-row">
+                <label for="adaptModifiers" data-i18n="settings.adaptModifiers">Auto-map Cmd / Ctrl</label>
+                <input id="adaptModifiers" class="toggle-input" type="checkbox" />
               </div>
+            </div>
+          </div>
 
+          <div class="group">
+            <div class="group-header"><h2 data-i18n="settings.networkGroup">Network</h2></div>
+            <div class="group-card">
+              <div class="setting-row">
+                <label for="interfaceSelect" data-i18n="settings.interface">Network interface</label>
+                <select id="interfaceSelect" class="control-input interface-select"></select>
+              </div>
             </div>
           </div>
         </section>

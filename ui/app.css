@@ -112,13 +112,6 @@ input {
   font-size: 10.5px;
 }
 
-.sidebar-label {
-  padding: 8px 8px 6px;
-  color: var(--text-tertiary);
-  font-size: 11px;
-  font-weight: 500;
-}
-
 .sidebar-nav {
   display: flex;
   flex-direction: column;
@@ -496,18 +489,17 @@ input {
   font-variant-numeric: tabular-nums;
 }
 
+.setting-row .row-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
 .separator {
   height: 0.5px;
   margin-left: 14px;
   background: var(--separator);
-}
-
-.group-footnote {
-  margin: 0;
-  padding: 7px 3px 0;
-  color: var(--text-tertiary);
-  font-size: 11px;
-  line-height: 1.5;
 }
 
 .hint-row {
@@ -942,15 +934,10 @@ input[type="number"]::-webkit-outer-spin-button {
 
 /* Layout preview ----------------------------------------------------------- */
 
-.layout-card {
-  padding: 0;
-}
-
 .layout-stage {
   position: relative;
   height: clamp(540px, 65vh, 650px);
-  margin: 10px;
-  border-radius: 9px;
+  border-radius: 10px;
   border: 0.5px solid var(--separator);
   background: #f7f7f9;
   overflow: hidden;
@@ -975,36 +962,14 @@ input[type="number"]::-webkit-outer-spin-button {
   aspect-ratio: 5 / 3;
   border: 1.5px solid #c7c7cc;
   border-radius: 8px;
-  background: linear-gradient(180deg, #ffffff 0%, #f4f8ff 100%);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.07);
+  background: #ffffff;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.04),
+    0 8px 20px rgba(0, 0, 0, 0.05);
   transition:
     transform 260ms cubic-bezier(0.22, 1, 0.36, 1),
     border-color 160ms ease,
     box-shadow 160ms ease;
-}
-
-.screen::before {
-  content: "";
-  position: absolute;
-  left: 50%;
-  bottom: -8px;
-  width: 42px;
-  height: 6px;
-  border-radius: 0 0 2px 2px;
-  background: #d8d8dd;
-  transform: translateX(-50%);
-}
-
-.screen::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  bottom: -12px;
-  width: 78px;
-  height: 4px;
-  border-radius: 2px;
-  background: #e4e4e9;
-  transform: translateX(-50%);
 }
 
 .screen * {
@@ -1012,19 +977,9 @@ input[type="number"]::-webkit-outer-spin-button {
   user-select: none;
 }
 
-.screen-topline {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 7px;
-  border-radius: 6px 6px 0 0;
-  background: rgba(60, 60, 67, 0.055);
-}
-
 .screen-content {
   position: absolute;
-  inset: 7px 0 0;
+  inset: 0;
   padding: 16px 18px;
   display: flex;
   flex-direction: column;
@@ -1153,43 +1108,6 @@ input[type="number"]::-webkit-outer-spin-button {
   }
 }
 
-.preview-status {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 14px;
-  color: var(--text-secondary);
-  font-size: 11.5px;
-}
-
-.preview-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--text-tertiary);
-  transition: background 140ms ease;
-}
-
-.layout-stage.is-connected + .preview-status .preview-dot {
-  background: var(--green);
-}
-
-.layout-stage.is-connected + .preview-status {
-  color: #1b7a34;
-}
-
-.layout-stage.remote-active + .preview-status .preview-dot {
-  background: var(--accent);
-}
-
-.layout-stage.remote-active + .preview-status {
-  color: var(--accent);
-}
-
-.layout-card > .separator {
-  margin-left: 0;
-}
-
 /* About ------------------------------------------------------------------- */
 
 .note-row {
@@ -1311,43 +1229,4 @@ input[type="number"]::-webkit-outer-spin-button {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
-}
-
-.language-control {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 2px 10px;
-  color: var(--text-secondary);
-}
-
-.language-control > svg {
-  width: 14px;
-  height: 14px;
-  flex: 0 0 auto;
-}
-
-.language-control select {
-  appearance: none;
-  -webkit-appearance: none;
-  max-width: 116px;
-  padding: 2px 15px 2px 2px;
-  border: 0;
-  border-radius: 4px;
-  background-color: transparent;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M1 1l3 3 3-3' fill='none' stroke='%238e8e93' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 2px center;
-  color: var(--text-secondary);
-  font-size: 11px;
-  cursor: pointer;
-  outline: none;
-}
-
-.language-control select:hover {
-  color: var(--text);
-}
-
-.language-control select:focus-visible {
-  outline: 3px solid rgba(0, 122, 255, 0.24);
 }

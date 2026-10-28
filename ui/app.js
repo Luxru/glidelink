@@ -10,10 +10,10 @@ const els = {
   languageSelect: document.getElementById("languageSelect"),
   roleOptions: [...document.querySelectorAll(".role-option")],
   agentFields: document.getElementById("agentFields"),
-  controllerFields: document.getElementById("controllerFields"),
   adaptModifiers: document.getElementById("adaptModifiers"),
   interfaceSelect: document.getElementById("interfaceSelect"),
   selectedIp: document.getElementById("selectedIp"),
+  openNetworkSettings: document.getElementById("openNetworkSettings"),
   codeCells: [...document.querySelectorAll(".code-cell")],
   startBtn: document.getElementById("startBtn"),
   startLabel: document.getElementById("startLabel"),
@@ -29,19 +29,15 @@ const els = {
   hostScreenLabel: document.getElementById("hostScreenLabel"),
   remoteScreenLabel: document.getElementById("remoteScreenLabel"),
   remoteBadge: document.getElementById("remoteBadge"),
-  linkChipText: document.getElementById("linkChipText"),
   latencyDot: document.getElementById("latencyDot"),
   latencyValue: document.getElementById("latencyValue"),
   localScreenText: document.getElementById("localScreenText"),
   peerText: document.getElementById("peerText"),
-  keyboardText: document.getElementById("keyboardText"),
   permissionCard: document.getElementById("permissionCard"),
   permissionBtn: document.getElementById("permissionBtn"),
   reopenBtn: document.getElementById("reopenBtn"),
   copyPasscode: document.getElementById("copyPasscode"),
   sessionState: document.getElementById("sessionState"),
-  layoutSummary: document.getElementById("layoutSummary"),
-  editLayout: document.getElementById("editLayout"),
   remoteScreen: document.getElementById("remoteScreen"),
   aboutRole: document.getElementById("aboutRole"),
   aboutState: document.getElementById("aboutState"),
@@ -78,6 +74,12 @@ const ui = {
   configLocalIp: "",
   previewIp: "",
   previewPromise: null,
+  language: i18n.getLocale(),
+  adaptModifiers: false,
+  savedConfig: null,
+  languageSynced: false,
+  languageSyncGuard: false,
+  settingsSavePromise: null,
 };
 
 const SCREEN_W = 250;
@@ -92,14 +94,8 @@ let lastDrag = null;
 const PAGES = {
   session: "page.session.title",
   layout: "page.layout.title",
+  settings: "page.settings.title",
   about: "page.about.title",
-};
-
-const EDGE_SUMMARIES = {
-  left: "layout.summaryLeft",
-  right: "layout.summaryRight",
-  top: "layout.summaryTop",
-  bottom: "layout.summaryBottom",
 };
 
 const PAIRING_CODE_LENGTH = 20;
@@ -353,16 +349,9 @@ function renderLayout() {
   els.remoteScreen.setAttribute("aria-disabled", String(disabled));
 }
 
-function updateLayoutSummary() {
-  els.layoutSummary.textContent = ui.role === "agent"
-    ? t("layout.summaryAgent")
-    : t(EDGE_SUMMARIES[ui.edge]);
-  renderLayout();
-}
-
 function setEdge(edge) {
   ui.edge = DRAG_EDGES.includes(edge) ? edge : "right";
-  updateLayoutSummary();
+  renderLayout();
 }
 
 function setOffset(offset) {
@@ -436,7 +425,6 @@ function onPeerPointerUp(event) {
   if (els.remoteScreen.hasPointerCapture?.(event.pointerId)) {
     els.remoteScreen.releasePointerCapture(event.pointerId);
   }
-  updateLayoutSummary();
   renderLayout();
 }
 
@@ -507,7 +495,7 @@ function updateInterfaces(interfaces, preferredIp) {
     ui.selectedIp = els.interfaceSelect.value;
   }
   els.selectedIp.textContent = ui.selectedIp || "—";
-  els.interfaceSelect.disabled = ui.running || ui.loading || ui.role === "controller";
+  updateSettingsControls();
 }
 
 async function refreshInvitePreview() {
@@ -541,7 +529,7 @@ function setLoading(loading) {
   els.startBtn.classList.toggle("loading", loading);
   els.startBtn.setAttribute("aria-busy", String(loading));
   els.startBtn.disabled = loading || ui.running;
-  updateLayoutSummary();
+  updateSettingsControls();
   updateStartLabel();
 }
 
@@ -554,7 +542,6 @@ function setRole(role, syncControls = true) {
     option.setAttribute("aria-checked", String(active));
   }
   els.agentFields.hidden = ui.role !== "agent";
-  els.controllerFields.hidden = ui.role !== "controller";
   els.hostScreenLabel.textContent = t("common.thisDevice");
   els.remoteScreenLabel.textContent = ui.role === "controller"
     ? t("common.peerControlled")
@@ -566,20 +553,91 @@ function setRole(role, syncControls = true) {
   }
   updateInterfaces(ui.interfaces, ui.configLocalIp);
   if (ui.role === "agent" && !ui.running) refreshInvitePreview();
-  updateLayoutSummary();
+  renderLayout();
   updateStartLabel();
+  updateSettingsControls();
   if (syncControls && !ui.running) setDisabledControls(false);
 }
 
 function setDisabledControls(disabled) {
   for (const input of els.form.querySelectorAll("input")) input.disabled = disabled;
   for (const option of els.roleOptions) option.disabled = disabled;
-  els.interfaceSelect.disabled = disabled;
-  els.editLayout.disabled = disabled;
   els.startBtn.disabled = disabled || ui.loading;
   els.stopBtn.hidden = !disabled;
-  updateLayoutSummary();
+  updateSettingsControls();
   updateStartLabel();
+}
+
+/// Settings that only affect the next session are locked while one runs.
+/// Language is safe to change at any time.
+function updateSettingsControls() {
+  const busy = ui.running || ui.loading;
+  els.adaptModifiers.disabled = busy;
+  els.interfaceSelect.disabled = busy;
+}
+
+function syncLanguage(configLanguage) {
+  if (ui.languageSynced) return;
+  ui.languageSynced = true;
+  const fromSettings = configLanguage === "zh" || configLanguage === "en"
+    ? configLanguage
+    : "";
+  const cached = i18n.getStoredLocale();
+  ui.languageSyncGuard = true;
+  try {
+    if (fromSettings) {
+      ui.language = fromSettings;
+      i18n.setLocale(fromSettings);
+    } else {
+      ui.language = i18n.getLocale();
+      // Import an explicit choice made in a pre-settings build once.
+      if (cached) saveSettings({ language: cached });
+    }
+  } finally {
+    ui.languageSyncGuard = false;
+  }
+  els.languageSelect.value = ui.language;
+}
+
+function revertSettingsFromSaved() {
+  const config = ui.savedConfig;
+  if (!config) return;
+  els.adaptModifiers.checked = Boolean(config.adaptModifiers);
+  ui.adaptModifiers = Boolean(config.adaptModifiers);
+  ui.configLocalIp = config.localIp || "";
+  const preferred = config.localIp || ui.selectedIp;
+  updateInterfaces(ui.interfaces, preferred);
+  if (config.language && config.language !== ui.language) {
+    ui.language = config.language;
+    i18n.setLocale(config.language);
+  }
+  els.languageSelect.value = ui.language;
+}
+
+async function saveSettings(patch) {
+  if (!invoke) return null;
+  const promise = withTimeout(invoke("save_settings", { patch }))
+    .then((config) => {
+      ui.savedConfig = config;
+      ui.adaptModifiers = Boolean(config.adaptModifiers);
+      els.adaptModifiers.checked = ui.adaptModifiers;
+      ui.configLocalIp = config.localIp || "";
+      if (config.language) {
+        ui.language = config.language;
+        els.languageSelect.value = config.language;
+      }
+      return config;
+    })
+    .catch((error) => {
+      revertSettingsFromSaved();
+      setError(errorToRaw(error));
+      return null;
+    })
+    .finally(() => {
+      if (ui.settingsSavePromise === promise) ui.settingsSavePromise = null;
+    });
+  ui.settingsSavePromise = promise;
+  return promise;
 }
 
 function withTimeout(promise, ms = COMMAND_TIMEOUT_MS) {
@@ -599,15 +657,21 @@ function applyState(state) {
   ui.lastStatus = incomingStatus || null;
 
   if (config && !ui.initialized) {
+    ui.savedConfig = config;
     ui.configLocalIp = config.localIp || "";
     ui.interfaces = Array.isArray(state.localInterfaces) ? state.localInterfaces : [];
-    els.adaptModifiers.checked = Boolean(config.adaptModifiers);
+    ui.adaptModifiers = Boolean(config.adaptModifiers);
+    els.adaptModifiers.checked = ui.adaptModifiers;
     setRole(config.role, false);
     setEdge(config.edge);
     setOffset(config.peerOffset ?? 0);
     updateInterfaces(ui.interfaces, ui.configLocalIp);
     setDisabledControls(ui.running);
     ui.initialized = true;
+    syncLanguage(config.language);
+    // Persist the interface the UI had to fall back to (fresh install, or a
+    // saved interface that no longer exists).
+    if (!config.localIp && ui.selectedIp) saveSettings({ localIp: ui.selectedIp });
   } else if (config && !ui.running && wasRunning) {
     setDisabledControls(false);
     setPairingCode("");
@@ -654,11 +718,6 @@ function applyState(state) {
   els.latencyValue.textContent = latency == null ? "—" : `${latency.toFixed(1)} ms`;
   els.latencyDot.className = `latency-dot${connected && latency != null ? (latency < 10 ? " good" : " warn") : ""}`;
   els.peerText.textContent = status.peer || t("common.notConnected");
-  els.keyboardText.textContent = !ui.running || !connected
-    ? "—"
-    : active
-      ? t("status.keyboardRemote")
-      : t("status.keyboardLocal");
   els.remoteBadge.hidden = !active;
   els.layoutStage.classList.toggle("remote-active", active);
   els.layoutStage.classList.toggle("is-connected", connected);
@@ -695,13 +754,6 @@ function applyState(state) {
 
   els.statusPill.className = `status-pill ${pillClass}`;
   els.statusText.textContent = text;
-  els.linkChipText.textContent = active
-    ? (ui.role === "agent" ? t("layout.previewReceiving") : t("layout.previewForwarding"))
-    : connected
-      ? t("layout.previewReady")
-      : ui.running
-        ? t("status.waitingPeer")
-        : t("layout.previewWaiting");
   els.startBtn.disabled = ui.running || ui.loading;
   els.stopBtn.hidden = !ui.running;
   updateStartLabel();
@@ -752,13 +804,15 @@ async function startSession(event) {
   setError(null);
   setLoading(true);
   try {
+    if (ui.settingsSavePromise) await ui.settingsSavePromise;
     await withTimeout(invoke("start_session", {
       config: {
         role: ui.role,
         localIp: ui.role === "agent" ? ui.selectedIp : "",
         edge: ui.edge,
         peerOffset: ui.role === "agent" ? 0 : clampedOffset(),
-        adaptModifiers: ui.role === "controller" && els.adaptModifiers.checked,
+        adaptModifiers: ui.role === "controller" && ui.adaptModifiers,
+        language: ui.language || "",
       },
       pairingCode,
     }));
@@ -841,7 +895,7 @@ function initEvents() {
     dragState = null;
     lastDrag = null;
     els.layoutStage.classList.remove("is-dragging");
-    updateLayoutSummary();
+    renderLayout();
   });
   els.remoteScreen.addEventListener("keydown", onPeerKeyDown);
 
@@ -890,17 +944,19 @@ function initEvents() {
     if (ui.running) return;
     ui.selectedIp = els.interfaceSelect.value;
     els.selectedIp.textContent = ui.selectedIp || "—";
-    try {
-      localStorage.setItem(INTERFACE_STORAGE_KEY, ui.selectedIp);
-    } catch {
-      // ignore storage failures
-    }
     setPairingCode("");
     ui.previewIp = "";
+    saveSettings({ localIp: ui.selectedIp });
     refreshInvitePreview();
   });
 
-  els.editLayout.addEventListener("click", () => setPage("layout"));
+  els.adaptModifiers.addEventListener("change", () => {
+    if (ui.running) return;
+    ui.adaptModifiers = els.adaptModifiers.checked;
+    saveSettings({ adaptModifiers: ui.adaptModifiers });
+  });
+
+  els.openNetworkSettings.addEventListener("click", () => setPage("settings"));
   els.form.addEventListener("submit", startSession);
   els.stopBtn.addEventListener("click", stopSession);
   els.permissionBtn.addEventListener("click", async () => {
@@ -920,13 +976,17 @@ function initEvents() {
   });
 
   els.languageSelect.addEventListener("change", () => {
-    i18n.setLocale(els.languageSelect.value);
+    const next = els.languageSelect.value;
+    ui.language = next;
+    i18n.setLocale(next);
+    saveSettings({ language: next });
   });
 
   document.addEventListener("glidelink:locale", () => {
+    if (ui.languageSyncGuard) return;
     updatePageChrome();
     updateStartLabel();
-    updateLayoutSummary();
+    renderLayout();
     setEdge(ui.edge);
     setRole(ui.role, false);
     if (ui.lastState) applyState(ui.lastState);

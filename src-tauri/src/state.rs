@@ -13,23 +13,34 @@ use std::time::Duration;
 
 pub struct AppState {
     pub config: Mutex<AppConfig>,
-    pub config_path: PathBuf,
+    pub settings_path: PathBuf,
     pub engine: Engine,
     pub status: Status,
 }
 
 impl AppState {
-    pub fn new(config_path: PathBuf, config: AppConfig, status: Status) -> Self {
+    pub fn new(settings_path: PathBuf, config: AppConfig, status: Status) -> Self {
         Self {
             config: Mutex::new(config),
-            config_path,
+            settings_path,
             engine: Engine::new(status.clone()),
             status,
         }
     }
 
-    pub fn save_config(&self, config: &AppConfig) -> Result<(), String> {
-        config::save(&self.config_path, config)
+    /// Apply `mutate` to a copy of the persisted config, write it, and only
+    /// then publish it in memory. The lock is held across the write so a
+    /// concurrent `save_settings` or `start_session` cannot interleave.
+    pub fn update_config<F>(&self, mutate: F) -> Result<AppConfig, String>
+    where
+        F: FnOnce(&mut AppConfig) -> Result<(), String>,
+    {
+        let mut current = self.config.lock().map_err(|_| error::code("E_INTERNAL"))?;
+        let mut next = current.clone();
+        mutate(&mut next)?;
+        config::save(&self.settings_path, &next)?;
+        *current = next.clone();
+        Ok(next)
     }
 }
 

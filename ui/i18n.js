@@ -2,12 +2,12 @@
   const dictionaries = {
     zh: {
       "app.taglineShort": "软件 KVM",
-      "sidebar.settings": "设置",
       "sidebar.secureLocal": "仅局域网 · 端到端加密",
+      "nav.label": "主导航",
       "nav.session": "会话",
-      "nav.layout": "屏幕布局",
+      "nav.layout": "布局",
+      "nav.settings": "设置",
       "nav.about": "关于",
-      "language.label": "语言",
       "language.zh": "中文",
       "language.en": "English",
 
@@ -16,6 +16,7 @@
       "page.session.subtitle.agent": "接受另一台电脑的鼠标控制",
       "page.layout.title": "屏幕布局",
       "page.layout.subtitle": "像多显示器一样排列两台电脑",
+      "page.settings.title": "设置",
       "page.about.title": "关于",
       "page.about.subtitle": "GlideLink 版本与会话统计",
 
@@ -52,19 +53,21 @@
       "role.agentDesc": "这台电脑接受另一台电脑的鼠标控制",
 
       "connection.group": "连接",
-      "connection.interface": "网络接口",
       "connection.localIp": "本机 IP",
-      "connection.layout": "屏幕布局",
-      "connection.adaptModifiers": "跨系统 Cmd ↔ Ctrl",
+      "connection.settings": "设置",
       "connection.passcode": "配对码",
+
+      "settings.appearanceGroup": "外观",
+      "settings.language": "界面语言",
+      "settings.inputGroup": "键盘与快捷键",
+      "settings.adaptModifiers": "自动对应 Cmd / Ctrl",
+      "settings.networkGroup": "网络",
+      "settings.interface": "网络接口",
 
       "status.group": "状态",
       "status.localScreen": "本机屏幕",
       "status.peer": "对端",
       "status.rtt": "网络往返",
-      "status.keyboard": "键盘",
-      "status.keyboardLocal": "本地",
-      "status.keyboardRemote": "远端",
 
       "button.startControl": "开始控制",
       "button.startListening": "开始监听",
@@ -83,18 +86,8 @@
       "validation.interface": "请选择网络接口。",
 
       "layout.lede": "把被控端屏幕放在本机的某一侧。鼠标越过对应边缘后会进入另一台电脑，反向移动即可返回。",
-      "layout.group": "排列",
       "layout.groupNote": "像多显示器一样使用",
-      "layout.previewWaiting": "等待连接",
-      "layout.previewReady": "链路已就绪",
-      "layout.previewForwarding": "输入转发中",
-      "layout.previewReceiving": "接收输入中",
       "layout.peerAriaLabel": "被控端屏幕，可拖动排列。方向键选择方位，Shift 加方向键调整偏移。",
-      "layout.summaryLeft": "被控端在左侧",
-      "layout.summaryRight": "被控端在右侧",
-      "layout.summaryTop": "被控端在上方",
-      "layout.summaryBottom": "被控端在下方",
-      "layout.summaryAgent": "由控制端决定",
 
       "about.tagline": "低延迟软件 KVM",
       "about.version": "版本 0.1.0 · Alpha",
@@ -160,12 +153,12 @@
 
     en: {
       "app.taglineShort": "Software KVM",
-      "sidebar.settings": "Settings",
       "sidebar.secureLocal": "LAN only · End-to-end encrypted",
+      "nav.label": "Main navigation",
       "nav.session": "Session",
       "nav.layout": "Display Layout",
+      "nav.settings": "Settings",
       "nav.about": "About",
-      "language.label": "Language",
       "language.zh": "Chinese",
       "language.en": "English",
 
@@ -174,6 +167,7 @@
       "page.session.subtitle.agent": "Accept mouse control from another computer",
       "page.layout.title": "Display Layout",
       "page.layout.subtitle": "Arrange both computers like multiple displays",
+      "page.settings.title": "Settings",
       "page.about.title": "About",
       "page.about.subtitle": "GlideLink version and session statistics",
 
@@ -210,19 +204,21 @@
       "role.agentDesc": "This computer is controlled by the other one",
 
       "connection.group": "Connection",
-      "connection.interface": "Network interface",
       "connection.localIp": "Local IP",
-      "connection.layout": "Display layout",
-      "connection.adaptModifiers": "Cross-system Cmd ↔ Ctrl",
+      "connection.settings": "Settings",
       "connection.passcode": "Pairing code",
+
+      "settings.appearanceGroup": "Appearance",
+      "settings.language": "Interface language",
+      "settings.inputGroup": "Keyboard & shortcuts",
+      "settings.adaptModifiers": "Auto-map Cmd / Ctrl",
+      "settings.networkGroup": "Network",
+      "settings.interface": "Network interface",
 
       "status.group": "Status",
       "status.localScreen": "This screen",
       "status.peer": "Peer",
       "status.rtt": "Network RTT",
-      "status.keyboard": "Keyboard",
-      "status.keyboardLocal": "Local",
-      "status.keyboardRemote": "Remote",
 
       "button.startControl": "Start controlling",
       "button.startListening": "Start listening",
@@ -241,18 +237,8 @@
       "validation.interface": "Select a network interface.",
 
       "layout.lede": "Place the peer screen on one side of this computer. Move the mouse across that edge to enter the other computer; move back across the same edge to return.",
-      "layout.group": "Arrangement",
       "layout.groupNote": "Use like multiple displays",
-      "layout.previewWaiting": "Waiting for connection",
-      "layout.previewReady": "Link ready",
-      "layout.previewForwarding": "Forwarding input",
-      "layout.previewReceiving": "Receiving input",
       "layout.peerAriaLabel": "Peer screen. Drag to arrange it. Arrow keys choose a side; Shift plus arrows adjust the offset.",
-      "layout.summaryLeft": "Peer on the left",
-      "layout.summaryRight": "Peer on the right",
-      "layout.summaryTop": "Peer above",
-      "layout.summaryBottom": "Peer below",
-      "layout.summaryAgent": "Set by the controller",
 
       "about.tagline": "Low-latency software KVM",
       "about.version": "Version 0.1.0 · Alpha",
@@ -320,13 +306,20 @@
   const supported = ["zh", "en"];
   const storageKey = "glidelink.locale";
 
-  function detectLocale() {
+  /// The language the user explicitly picked in an older build. Used once to
+  /// seed `settings.json`; the system locale is not reported here.
+  function getStoredLocale() {
     try {
       const saved = localStorage.getItem(storageKey);
-      if (supported.includes(saved)) return saved;
+      return supported.includes(saved) ? saved : "";
     } catch {
-      // ignore storage failures
+      return "";
     }
+  }
+
+  function detectLocale() {
+    const saved = getStoredLocale();
+    if (saved) return saved;
     const language = (navigator.language || "en").toLowerCase();
     return language.startsWith("zh") ? "zh" : "en";
   }
@@ -380,6 +373,7 @@
     t: translate,
     setLocale,
     getLocale: () => locale,
+    getStoredLocale,
     apply,
     supported,
   };

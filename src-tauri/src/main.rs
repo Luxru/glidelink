@@ -39,10 +39,13 @@ fn start_session(
         return Err(error::code("E_SESSION_RUNNING"));
     }
 
-    state.save_config(&config)?;
-    if let Ok(mut current) = state.config.lock() {
-        *current = config.clone();
-    }
+    let incoming = config;
+    let config = state.update_config(move |next| {
+        let previous = next.clone();
+        *next = incoming.clone();
+        next.inherit_persisted_settings(&previous);
+        Ok(())
+    })?;
     log::info!(
         "starting {} session (local_ip={})",
         config.role.as_str(),
@@ -53,6 +56,14 @@ fn start_session(
         }
     );
     state.engine.start(&config, &pairing_code)
+}
+
+#[tauri::command]
+fn save_settings(
+    patch: config::SettingsPatch,
+    state: tauri::State<'_, AppState>,
+) -> Result<AppConfig, String> {
+    state.update_config(|config| config.apply_patch(&patch))
 }
 
 #[tauri::command]
@@ -98,9 +109,20 @@ fn main() {
 
     let app = tauri::Builder::default()
         .setup(|app| {
-            let config_dir = app.path().app_config_dir()?;
-            std::fs::create_dir_all(&config_dir)?;
-            let config_path = config_dir.join("config.json");
+            // Settings live in `~/.glidelink/settings.json`. The old
+            // per-identifier config file is only used once for migration.
+            let legacy_path = app
+                .path()
+                .app_config_dir()
+                .ok()
+                .map(|dir| dir.join("config.json"));
+            let settings_path = match app.path().home_dir() {
+                Ok(home) => home.join(".glidelink").join("settings.json"),
+                Err(err) => {
+                    log::warn!("home directory unavailable ({err}); using app config dir");
+                    app.path().app_config_dir()?.join("settings.json")
+                }
+            };
             let screen = input::screen_info();
             let status = status::Status::new(screen);
             log::info!(
@@ -110,7 +132,7 @@ fn main() {
                 input::permissions_ok()
             );
 
-            let config = match config::load_or_create(&config_path) {
+            let config = match config::load_or_migrate(&settings_path, legacy_path.as_deref()) {
                 Ok(config) => config,
                 Err(load_error) => {
                     log::error!("{load_error}");
@@ -120,7 +142,7 @@ fn main() {
                 }
             };
 
-            app.manage(AppState::new(config_path, config, status));
+            app.manage(AppState::new(settings_path, config, status));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -129,6 +151,7 @@ fn main() {
             stop_session,
             open_permissions,
             preview_invite,
+            save_settings,
             reopen_app
         ])
         .build(tauri::generate_context!())

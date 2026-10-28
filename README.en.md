@@ -2,142 +2,66 @@
 
 English | [Chinese](README.md)
 
-Repository: [Luxru/glidelink](https://github.com/Luxru/glidelink)
+Control two computers with one mouse and keyboard. Move the pointer off the screen edge to switch computers; move it back to return.
+No switcher, drivers, or cloud account — input stays on your local network.
 
-GlideLink is a software KVM built with Rust and Tauri. It lets one mouse and keyboard move seamlessly between two computers without extra hardware or drivers.
+![GlideLink](screenshot.png)
 
 ## Features
 
-- One physical mouse and keyboard controlling two computers.
+- One mouse and keyboard for two computers, switching at the screen edge.
 - Mouse movement, left/right/middle buttons, X1/X2, and wheel.
-- Keyboard follows the mouse: it controls the peer while the pointer is remote and returns locally when the pointer comes back.
-- Standard keyboard, modifiers, and combinations, with optional cross-system Cmd ↔ Ctrl adaptation.
-- Four screen-edge directions with an adjustable offset along the shared edge; drag the peer screen to arrange it like a second display.
-- Pick a network interface and get a self-contained code containing the local IPv4, an automatically chosen port, and a one-time token; SPAKE2 PAKE establishes the session.
-- Low-latency LAN UDP with fixed 2ms coalescing and RTT, jitter, and packet-loss readouts.
-- Chinese / English UI.
-- Windows and macOS support.
+- Keyboard follows the mouse; optional automatic Cmd / Ctrl mapping between macOS and Windows.
+- Four screen-edge directions, draggable peer arrangement, and an offset along the shared edge.
+- Encrypted session established by a 20-character pairing code over LAN UDP.
+- Chinese / English UI; Windows and macOS support.
 
 ## How it works
 
-The controller captures the mouse and keyboard and, after the pointer crosses a screen edge, sends encrypted input over the LAN to the peer, which injects it. Crossing the same edge in the opposite direction returns control. No cloud service or kernel driver is involved.
+The controller captures mouse and keyboard input locally. When the pointer crosses the configured edge, input is encrypted and sent over the LAN to the controlled computer, which injects it. Moving back returns control and releases all remote keys. Nothing goes through the cloud and no kernel driver is required.
+
+The UI is built with Tauri (Rust + WebView); settings are stored in `~/.glidelink/settings.json`.
 
 ## Requirements
 
 - Rust 1.90 or newer.
-- Windows 10/11 with WebView2.
-- macOS 12 or newer with Xcode Command Line Tools.
-- Both computers on the same LAN, able to reach each other over UDP.
+- Windows 10/11 (WebView2) or macOS 12 or newer.
+- Both computers on the same local network.
 
 Node.js and a frontend build step are not required.
 
-## Getting started
-
-### Build and run
+## Build and develop
 
 ```bash
-cd glidelink/src-tauri
-cargo run
+cd src-tauri
+cargo run              # development run
+cargo test             # run tests
+cargo build --release  # release build
 ```
 
-Release build:
+The UI lives in `ui/` and is plain HTML / CSS / JS; rebuild to pick up changes.
 
-```bash
-cd glidelink/src-tauri
-cargo build --release
-```
+## Usage
 
-If crates.io is slow, you can use a mirror temporarily:
-
-```bash
-cargo run --config 'source.crates-io.replace-with="ustc"' \
-  --config 'source.ustc.registry="sparse+https://mirrors.ustc.edu.cn/crates.io-index/"'
-```
-
-### 1. Start the controlled computer
-
-1. Select **Controlled PC** and choose a network interface; the app immediately generates a 20-character code (5 groups of 4).
-2. Click **Start listening**; the app listens on the port carried by the code.
-3. Allow the app's UDP traffic on private networks in the system firewall.
-
-### 2. Start the controller
-
-1. Select **Controller**.
-2. Enter or paste the 20-character code shown on the controlled computer (whole-code paste is supported).
-3. Open **Display layout** and drag the peer screen to the side of this device; slide it along the edge to set the offset.
-4. Click **Start controlling**.
-
-The code carries the peer IP, port, and verification token, so no address or port needs to be entered separately.
-
-Once connected, move the mouse across the shared edge to control the peer; the keyboard follows the mouse. Cross the same edge in the opposite direction to return.
-
-### 3. Change the language
-
-Use the Chinese / English selector in the lower-left corner of the app. The choice is stored locally. On first launch, the language follows the system locale.
+1. **Controlled PC**: select **Controlled PC**, choose a network interface in **Settings**, click **Start listening**, and send the generated pairing code to the controller.
+2. **Controller**: select **Controller**, enter the pairing code, place the peer on a screen side in **Layout**, and click **Start controlling**.
+3. Move the mouse across that edge to control the other computer; the keyboard follows. Move back across the edge to return.
 
 ## macOS permissions
 
-macOS requires:
-
-- System Settings → Privacy & Security → Accessibility
-- System Settings → Privacy & Security → Input Monitoring
-
-Click **Open System Settings** in the app to show the system prompt and open the pane for the permission that is still missing. After granting permissions, click **Reopen** to restart the app. macOS associates these grants with the built executable, so an unsigned development build may need to be granted again after it is rebuilt. On Windows, GlideLink must also run as administrator if you need to control elevated windows.
+Grant Accessibility and Input Monitoring in System Settings → Privacy & Security. Follow the in-app prompt, then reopen the app.
 
 ## Configuration
 
-Configuration file locations:
+Settings are stored in your home directory:
 
-- Windows: `%APPDATA%\io.glidelink.desktop\config.json`
-- macOS: `~/Library/Application Support/io.glidelink.desktop/config.json`
+- Windows: `C:\Users\<you>\.glidelink\settings.json`
+- macOS: `~/.glidelink/settings.json`
 
-The file stores the role, selected interface IP, and layout; the one-time pairing code is never written to disk.
+The file holds the language, Cmd / Ctrl mapping, interface, role, and screen layout. The old `config.json` is migrated once on first launch.
 
-## Security and latency
+## Current limitations
 
-- A 20-character code carries IPv4, port, a 4-byte random token, and a checksum; SPAKE2 PAKE derives session keys, and ChaCha20-Poly1305 encrypts traffic with directional keys and a replay window.
-- The code is LAN-only and handshake attempts are rate-limited. Never expose the UDP port to the internet.
-- No cloud or accounts. The target is 3–8ms of input feedback on a healthy LAN. The controller heartbeats every 100ms, estimates RTT/jitter with RFC 6298, and shows RFC 3550-style receiver packet loss.
-- Mouse movement is coalesced at a fixed 2ms; mouse buttons and wheel are sent immediately. Keyboard state is sent on every change and refreshed every 100ms; Caps Lock is latched, and returning to the local screen or disconnecting releases all remote keys. The agent collapses backlogged pure moves while preserving every button, wheel, and reset transition.
-- The controller lets the OS choose its egress path. During a session, Windows raises timer resolution and input-thread priority, macOS prevents App Nap and raises QoS, and UDP is marked DSCP EF on a best-effort basis.
-- The PAKE exchange and protocol have not had an independent security audit. See the architecture document for details.
-
-## Status and limitations
-
-- The Windows backend type-checks for `x86_64-pc-windows-msvc`; macOS capture and injection pass `--self-test` on macOS 13.6 (Intel). A real Windows ↔ macOS pair, Apple Silicon, signing, and notarization are still unverified.
-- Protocol v2 does not support older builds; both computers must run the same version.
-- The automatic port range is `45890–45999`; the controller never needs to enter a port.
-- IPv4 only. The code is always 20 characters because it carries the address, port, and token.
-- Keyboard follows the mouse and supports the standard keyboard (letters, digits, punctuation, modifiers, arrows, Home/End/Page/Delete, F1–F12, Esc/Tab/Enter/Backspace/Space, Caps Lock); no numpad, media keys, or IME-specific handling.
-- Keys are forwarded as physical HID positions, so both layouts should match. Keys already held before entering the remote stay local; release and press again to forward them.
-- Secure Input, elevated windows, and OS-reserved shortcuts such as Ctrl+Alt+Del cannot be guaranteed. Optional cross-system Cmd ↔ Ctrl adaptation is off by default.
-- One peer; the peer snaps to one of four edges with an offset along that edge. Arbitrary 2D placement, gaps, and overlap are not implemented.
-- Display placement is configured manually; there is no automatic discovery yet.
-- Applications running with elevated privileges may not receive injected events.
-- Signed installers, tray support, and launch-at-login are not included yet.
-
-## Development and tests
-
-```bash
-cd glidelink/src-tauri
-cargo test
-cargo build
-```
-
-Tests cover the SPAKE2 handshake, encryption, replay protection, coordinate and key mapping, keyboard state planning, and a real UDP loopback handshake with mouse and keyboard forwarding.
-
-On macOS, after granting permissions, run the self-test through the signed app bundle so TCC is attributed to GlideLink:
-
-```bash
-open -n -W -o /tmp/glidelink-selftest.out --stderr /tmp/glidelink-selftest.err \
-  src-tauri/target/release/bundle/macos/GlideLink.app --args --self-test
-cat /tmp/glidelink-selftest.out
-```
-
-It reports displays and TCC permissions, exercises a synthetic edge crossing (capture), moves the cursor to a known point (injection), and restores the cursor. Running `cargo run -- --self-test` directly may attribute TCC to the terminal instead of GlideLink and report missing permissions.
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) / [ARCHITECTURE.en.md](ARCHITECTURE.en.md) for more details.
-
-## License
-
-This project is licensed under the GNU General Public License v3.0 only (GPL-3.0-only). See [LICENSE](LICENSE).
+- One controlled PC only; standard keyboards only (no numpad, media keys, or IME-specific handling).
+- Controlling elevated windows requires GlideLink to run elevated as well.
+- The macOS input backend has not yet been verified on real hardware.

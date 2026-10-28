@@ -1400,8 +1400,7 @@ mod tests {
             role: Role::Agent,
             local_ip: "127.0.0.1".into(),
             edge: Edge::Right,
-            peer_offset: 0.0,
-            adapt_modifiers: false,
+            ..AppConfig::default()
         };
         let controller_config = AppConfig {
             role: Role::Controller,
