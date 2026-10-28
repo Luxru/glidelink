@@ -42,6 +42,15 @@ pub struct AppConfig {
     /// UI follows the system locale on the next launch.
     #[serde(default)]
     pub language: String,
+    /// Agent-only: last generated invite code. Reused after a disconnect and
+    /// across app restarts as long as the selected interface and port remain
+    /// usable.
+    #[serde(default)]
+    pub last_invite: String,
+    /// Controller-only: last pairing code entered, restored in the UI after a
+    /// disconnect or restart.
+    #[serde(default)]
+    pub last_pairing_code: String,
 }
 
 /// Partial update sent by the Settings page. Missing fields are left alone.
@@ -62,6 +71,8 @@ impl Default for AppConfig {
             peer_offset: 0.0,
             adapt_modifiers: false,
             language: String::new(),
+            last_invite: String::new(),
+            last_pairing_code: String::new(),
         }
     }
 }
@@ -122,6 +133,12 @@ impl AppConfig {
         }
         if self.role == Role::Controller && self.local_ip.trim().is_empty() {
             self.local_ip = previous.local_ip.clone();
+        }
+        if self.last_invite.is_empty() {
+            self.last_invite = previous.last_invite.clone();
+        }
+        if self.last_pairing_code.is_empty() {
+            self.last_pairing_code = previous.last_pairing_code.clone();
         }
         self.normalize();
     }

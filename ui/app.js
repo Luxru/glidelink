@@ -76,6 +76,7 @@ const ui = {
   configLocalIp: "",
   previewIp: "",
   previewPromise: null,
+  lastPairingCode: "",
   language: i18n.getLocale(),
   adaptModifiers: false,
   savedConfig: null,
@@ -553,7 +554,7 @@ function setRole(role, syncControls = true) {
     : t("common.peerController");
   for (const cell of els.codeCells) cell.readOnly = ui.role === "agent";
   if (previousRole !== ui.role) {
-    setPairingCode("");
+    setPairingCode(ui.role === "controller" ? ui.lastPairingCode || "" : "");
     ui.previewIp = "";
   }
   updateInterfaces(ui.interfaces, ui.configLocalIp);
@@ -660,6 +661,9 @@ function applyState(state) {
   const wasRunning = ui.running;
   ui.running = Boolean(incomingStatus?.running);
   ui.lastStatus = incomingStatus || null;
+  if (config) {
+    ui.lastPairingCode = config.lastPairingCode || ui.lastPairingCode || "";
+  }
 
   if (config && !ui.initialized) {
     ui.savedConfig = config;
@@ -668,6 +672,9 @@ function applyState(state) {
     ui.adaptModifiers = Boolean(config.adaptModifiers);
     els.adaptModifiers.checked = ui.adaptModifiers;
     setRole(config.role, false);
+    if (config.role === "controller" && ui.lastPairingCode) {
+      setPairingCode(ui.lastPairingCode);
+    }
     setEdge(config.edge);
     setOffset(config.peerOffset ?? 0);
     updateInterfaces(ui.interfaces, ui.configLocalIp);
@@ -679,9 +686,13 @@ function applyState(state) {
     if (!config.localIp && ui.selectedIp) saveSettings({ localIp: ui.selectedIp });
   } else if (config && !ui.running && wasRunning) {
     setDisabledControls(false);
-    setPairingCode("");
-    ui.previewIp = "";
-    refreshInvitePreview();
+    if (ui.role === "controller") {
+      if (ui.lastPairingCode) setPairingCode(ui.lastPairingCode);
+    } else {
+      setPairingCode("");
+      ui.previewIp = "";
+      refreshInvitePreview();
+    }
   }
 
   if (Array.isArray(state.localInterfaces)) {

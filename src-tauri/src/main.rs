@@ -40,10 +40,15 @@ fn start_session(
     }
 
     let incoming = config;
+    let saved_code = pairing_code.clone();
     let config = state.update_config(move |next| {
         let previous = next.clone();
         *next = incoming.clone();
         next.inherit_persisted_settings(&previous);
+        match next.role {
+            Role::Agent => next.last_invite = saved_code.clone(),
+            Role::Controller => next.last_pairing_code = saved_code.clone(),
+        }
         Ok(())
     })?;
     log::info!(
@@ -67,7 +72,10 @@ fn save_settings(
 }
 
 #[tauri::command]
-fn preview_invite(local_ip: String) -> Result<String, String> {
+fn preview_invite(
+    local_ip: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
     let ip = local_ip
         .trim()
         .parse::<Ipv4Addr>()
@@ -75,7 +83,29 @@ fn preview_invite(local_ip: String) -> Result<String, String> {
     if ip.is_loopback() || ip.is_unspecified() {
         return Err(error::code("E_LOCAL_IP"));
     }
-    net::preview_invite(ip)
+
+    if let Some(code) = state.status.snapshot().pairing_code {
+        return Ok(code);
+    }
+
+    let existing = state
+        .config
+        .lock()
+        .map(|config| config.last_invite.clone())
+        .unwrap_or_default();
+    if let Ok(invite) = Invite::decode(&existing) {
+        let bind = std::net::SocketAddr::new(std::net::IpAddr::V4(ip), invite.port);
+        if invite.ip == ip && std::net::UdpSocket::bind(bind).is_ok() {
+            return Ok(existing);
+        }
+    }
+
+    let code = net::preview_invite(ip)?;
+    state.update_config(|next| {
+        next.last_invite = code.clone();
+        Ok(())
+    })?;
+    Ok(code)
 }
 
 #[tauri::command]
