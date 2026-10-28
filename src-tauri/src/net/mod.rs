@@ -47,6 +47,17 @@ fn is_benign_recv_error(error: &std::io::Error) -> bool {
     )
 }
 
+fn send_packet(
+    socket: &UdpSocket,
+    packet: &[u8],
+    addr: SocketAddr,
+    status: &Status,
+) -> std::io::Result<usize> {
+    let sent = socket.send_to(packet, addr)?;
+    status.add_sent(sent);
+    Ok(sent)
+}
+
 pub fn start_controller(
     config: &AppConfig,
     capture_rx: Receiver<RemoteInput>,
@@ -59,8 +70,7 @@ pub fn start_controller(
         return Err(error::code("E_IPV6_UNSUPPORTED"));
     }
 
-    let socket =
-        UdpSocket::bind("0.0.0.0:0").map_err(|e| error::detail("E_NET_BIND", e))?;
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| error::detail("E_NET_BIND", e))?;
     socket
         .set_read_timeout(Some(CONTROLLER_READ_TIMEOUT))
         .map_err(|e| error::detail("E_NET_SOCKET", e))?;
@@ -77,6 +87,8 @@ pub fn start_controller(
         s.latency_ms = None;
         s.last_error_code = None;
         s.last_error_detail = None;
+        s.remote_screen = None;
+        s.started_at_ms = Some(now_ms());
     });
 
     thread::Builder::new()
@@ -136,7 +148,7 @@ fn controller_loop(
                     let Some(packet) = packet else {
                         continue;
                     };
-                    if let Err(e) = socket.send_to(&packet, peer) {
+                    if let Err(e) = send_packet(&socket, &packet, peer, &status) {
                         log::warn!("input send failed: {e}");
                         session = None;
                         capture_shared.clear_peer();
@@ -178,7 +190,7 @@ fn controller_loop(
                     });
                 }
                 if let Some(p) = pending.as_ref() {
-                    if let Err(e) = socket.send_to(&p.packet, peer) {
+                    if let Err(e) = send_packet(&socket, &p.packet, peer, &status) {
                         log::warn!("handshake send failed: {e}");
                     }
                 }
@@ -195,7 +207,7 @@ fn controller_loop(
                     let id = next_ping_id;
                     next_ping_id = next_ping_id.wrapping_add(1).max(1);
                     let packet = active.encrypt_packet(TYPE_PING, &encode_u64(id));
-                    if let Err(e) = socket.send_to(&packet, peer) {
+                    if let Err(e) = send_packet(&socket, &packet, peer, &status) {
                         log::warn!("ping send failed: {e}");
                     } else {
                         pending_ping = Some((id, Instant::now()));
@@ -225,6 +237,7 @@ fn controller_loop(
 
         match socket.recv_from(&mut buf) {
             Ok((n, from)) => {
+                status.add_received(n);
                 if from != peer {
                     continue;
                 }
@@ -297,7 +310,7 @@ fn controller_loop(
 
     if let Some(active) = session.as_mut() {
         let bye = active.encrypt_packet(TYPE_BYE, &[]);
-        let _ = socket.send_to(&bye, peer);
+        let _ = send_packet(&socket, &bye, peer, &status);
     }
     capture_shared.clear_peer();
 }
@@ -328,6 +341,7 @@ pub fn start_agent(
         s.last_error_detail = None;
         s.peer = None;
         s.remote_screen = None;
+        s.started_at_ms = Some(now_ms());
     });
 
     thread::Builder::new()
@@ -362,6 +376,7 @@ fn agent_loop(
     while !stop.load(Ordering::Acquire) {
         match socket.recv_from(&mut buf) {
             Ok((n, from)) => {
+                status.add_received(n);
                 let packet = &buf[..n];
                 let is_hello = packet.len() == protocol::HELLO_LEN && packet[5] == TYPE_HELLO;
 
@@ -380,7 +395,7 @@ fn agent_loop(
                                 timestamp_ms: now_ms(),
                             };
                             let response = build_accept(&current.master, &accept);
-                            let _ = socket.send_to(&response, from);
+                            let _ = send_packet(&socket, &response, from, &status);
                             continue;
                         }
                     }
@@ -399,7 +414,7 @@ fn agent_loop(
                             timestamp_ms: now_ms(),
                         },
                     );
-                    if let Err(e) = socket.send_to(&response, from) {
+                    if let Err(e) = send_packet(&socket, &response, from, &status) {
                         log::warn!("accept send failed: {e}");
                         continue;
                     }
@@ -455,7 +470,7 @@ fn agent_loop(
                         active.last_packet = Instant::now();
                         if payload.len() == 8 {
                             let response = active.session.encrypt_packet(TYPE_PONG, &payload);
-                            let _ = socket.send_to(&response, from);
+                            let _ = send_packet(&socket, &response, from, &status);
                         }
                     }
                     Ok((TYPE_BYE, _)) => {
@@ -532,9 +547,7 @@ mod tests {
 
     #[test]
     fn constants_fit_in_udp_buffers() {
-        assert!(
-            protocol::HEADER_LEN + protocol::INPUT_LEN + protocol::TAG_LEN < 2048
-        );
+        assert!(protocol::HEADER_LEN + protocol::INPUT_LEN + protocol::TAG_LEN < 2048);
         assert_eq!(protocol::HELLO_LEN, 62);
     }
 
@@ -558,6 +571,7 @@ mod tests {
             listen_port: port,
             passcode: passcode.clone(),
             edge: Edge::Right,
+            peer_offset: 0.0,
         };
         let controller_config = AppConfig {
             role: Role::Controller,
@@ -565,6 +579,7 @@ mod tests {
             listen_port: 0,
             passcode,
             edge: Edge::Right,
+            peer_offset: 0.0,
         };
 
         let agent_status = Status::new(None);

@@ -33,6 +33,10 @@ pub struct AppConfig {
     pub listen_port: u16,
     pub passcode: String,
     pub edge: Edge,
+    /// Offset of the peer screen along the shared edge, normalized to the
+    /// host edge. Controller-only; defaults to zero for older configs.
+    #[serde(default)]
+    pub peer_offset: f32,
 }
 
 impl Default for AppConfig {
@@ -43,6 +47,7 @@ impl Default for AppConfig {
             listen_port: DEFAULT_PORT,
             passcode: generate_passcode(12),
             edge: Edge::Right,
+            peer_offset: 0.0,
         }
     }
 }
@@ -102,8 +107,7 @@ pub fn generate_passcode(len: usize) -> String {
 
 pub fn load_or_create(path: &Path) -> Result<AppConfig, String> {
     if path.exists() {
-        let raw =
-            fs::read_to_string(path).map_err(|e| error::detail("E_CONFIG_READ", e))?;
+        let raw = fs::read_to_string(path).map_err(|e| error::detail("E_CONFIG_READ", e))?;
         let config: AppConfig =
             serde_json::from_str(&raw).map_err(|e| error::detail("E_CONFIG_PARSE", e))?;
         return Ok(config);
@@ -118,8 +122,8 @@ pub fn save(path: &Path, config: &AppConfig) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| error::detail("E_CONFIG_WRITE", e))?;
     }
-    let raw = serde_json::to_string_pretty(config)
-        .map_err(|e| error::detail("E_CONFIG_WRITE", e))?;
+    let raw =
+        serde_json::to_string_pretty(config).map_err(|e| error::detail("E_CONFIG_WRITE", e))?;
     fs::write(path, raw).map_err(|e| error::detail("E_CONFIG_WRITE", e))?;
 
     #[cfg(unix)]

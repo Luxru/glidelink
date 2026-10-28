@@ -41,6 +41,9 @@ pub const ENTRY_INSET: f32 = 0.006;
 pub const RETURN_THRESHOLD: f32 = 0.004;
 /// Ignore edge re-entry for this long after returning to the host.
 pub const REENTRY_COOLDOWN_MS: u64 = 300;
+/// Largest peer offset along the shared edge, normalized to the host edge.
+/// Keeping some overlap means the pointer always has a route back.
+pub const MAX_OFFSET: f32 = 0.75;
 
 /// Convert an absolute pointer position inside the host's virtual desktop to a
 /// 0..=1 position. Origins can be negative on multi-monitor setups.
@@ -54,13 +57,19 @@ pub fn host_point_to_norm(px: f64, py: f64, x: i32, y: i32, w: i32, h: i32) -> N
 }
 
 /// Map a host pointer position to the point where it enters the peer screen.
-pub fn entry_point(edge: Edge, host: NormPoint) -> NormPoint {
-    match edge {
-        Edge::Right => NormPoint::new(ENTRY_INSET, host.y),
-        Edge::Left => NormPoint::new(1.0 - ENTRY_INSET, host.y),
-        Edge::Top => NormPoint::new(host.x, 1.0 - ENTRY_INSET),
-        Edge::Bottom => NormPoint::new(host.x, ENTRY_INSET),
-    }
+///
+/// `offset` shifts the peer screen along the shared edge, normalized to the
+/// host edge. Positive means the peer is shifted down (left/right) or right
+/// (top/bottom). Points that fall outside the peer are clamped to its edge.
+pub fn entry_point(edge: Edge, host: NormPoint, offset: f32) -> NormPoint {
+    let offset = offset.clamp(-MAX_OFFSET, MAX_OFFSET);
+    let point = match edge {
+        Edge::Right => NormPoint::new(ENTRY_INSET, host.y - offset),
+        Edge::Left => NormPoint::new(1.0 - ENTRY_INSET, host.y - offset),
+        Edge::Top => NormPoint::new(host.x - offset, 1.0 - ENTRY_INSET),
+        Edge::Bottom => NormPoint::new(host.x - offset, ENTRY_INSET),
+    };
+    point.clamped()
 }
 
 /// Advance the pointer inside the peer screen. Deltas are normalized against
@@ -85,15 +94,18 @@ pub fn has_returned(edge: Edge, point: NormPoint) -> bool {
 
 /// Host position (normalized to the full virtual desktop) to warp to when
 /// returning from the peer. The position is kept a couple of pixels inside the
-/// screen to avoid instantly re-entering the peer.
-pub fn host_return_point(edge: Edge, point: NormPoint) -> NormPoint {
+/// screen to avoid instantly re-entering the peer. `offset` must match the
+/// value used by [`entry_point`] so the pointer returns at the same height.
+pub fn host_return_point(edge: Edge, point: NormPoint, offset: f32) -> NormPoint {
+    let offset = offset.clamp(-MAX_OFFSET, MAX_OFFSET);
     let p = point.clamped();
-    match edge {
-        Edge::Right => NormPoint::new(0.9995, p.y),
-        Edge::Left => NormPoint::new(0.0005, p.y),
-        Edge::Top => NormPoint::new(p.x, 0.0005),
-        Edge::Bottom => NormPoint::new(p.x, 0.9995),
-    }
+    let host = match edge {
+        Edge::Right => NormPoint::new(0.9995, p.y + offset),
+        Edge::Left => NormPoint::new(0.0005, p.y + offset),
+        Edge::Top => NormPoint::new(p.x + offset, 0.0005),
+        Edge::Bottom => NormPoint::new(p.x + offset, 0.9995),
+    };
+    host.clamped()
 }
 
 /// Whether a raw delta points away from the host and into the peer.
@@ -112,7 +124,7 @@ mod tests {
 
     #[test]
     fn right_edge_round_trip() {
-        let entry = entry_point(Edge::Right, NormPoint::new(1.0, 0.4));
+        let entry = entry_point(Edge::Right, NormPoint::new(1.0, 0.4), 0.0);
         assert!(entry.x > 0.0 && entry.x < 0.01);
         let moved = advance(entry, 100.0, 0.0, 1920, 1080);
         assert!(moved.x > entry.x);
@@ -120,19 +132,47 @@ mod tests {
 
         let returned = NormPoint::new(-0.01, 0.4);
         assert!(has_returned(Edge::Right, returned));
-        let host = host_return_point(Edge::Right, returned);
+        let host = host_return_point(Edge::Right, returned, 0.0);
         assert!(host.x > 0.999);
     }
 
     #[test]
     fn top_and_bottom_edges() {
-        let top = entry_point(Edge::Top, NormPoint::new(0.3, 0.0));
+        let top = entry_point(Edge::Top, NormPoint::new(0.3, 0.0), 0.0);
         assert!((top.y - (1.0 - ENTRY_INSET)).abs() < f32::EPSILON);
         assert!(has_returned(Edge::Top, NormPoint::new(0.3, 1.1)));
 
-        let bottom = entry_point(Edge::Bottom, NormPoint::new(0.3, 1.0));
+        let bottom = entry_point(Edge::Bottom, NormPoint::new(0.3, 1.0), 0.0);
         assert!((bottom.y - ENTRY_INSET).abs() < f32::EPSILON);
         assert!(has_returned(Edge::Bottom, NormPoint::new(0.3, -0.1)));
+    }
+
+    #[test]
+    fn peer_offset_shifts_entry_and_return() {
+        // Peer moved down: a host point maps above the peer center.
+        let entry = entry_point(Edge::Right, NormPoint::new(1.0, 0.6), 0.2);
+        assert!((entry.y - 0.4).abs() < 1e-6);
+        let host = host_return_point(Edge::Right, NormPoint::new(0.0, 0.4), 0.2);
+        assert!((host.y - 0.6).abs() < 1e-6);
+
+        // Peer moved right on a vertical edge.
+        let entry = entry_point(Edge::Top, NormPoint::new(0.5, 0.0), 0.25);
+        assert!((entry.x - 0.25).abs() < 1e-6);
+        let host = host_return_point(Edge::Top, NormPoint::new(0.25, 1.0), 0.25);
+        assert!((host.x - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn entry_and_return_clamp_to_screen() {
+        let entry = entry_point(Edge::Right, NormPoint::new(1.0, 0.05), 0.5);
+        assert_eq!(entry.y, 0.0);
+        let host = host_return_point(Edge::Right, NormPoint::new(0.0, 0.9), 0.5);
+        assert_eq!(host.y, 1.0);
+
+        let entry = entry_point(Edge::Bottom, NormPoint::new(0.9, 1.0), -0.5);
+        assert_eq!(entry.x, 1.0);
+        let entry = entry_point(Edge::Bottom, NormPoint::new(0.1, 1.0), 0.5);
+        assert_eq!(entry.x, 0.0);
     }
 
     #[test]

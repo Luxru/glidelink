@@ -100,7 +100,9 @@ impl CaptureHandle {
 pub use win::{open_permissions, permissions_ok, screen_info, start_capture, start_injector};
 
 #[cfg(target_os = "macos")]
-pub use macos::{open_permissions, permissions_ok, screen_info, start_capture, start_injector};
+pub use macos::{
+    open_permissions, permissions_ok, screen_info, self_test, start_capture, start_injector,
+};
 
 #[cfg(not(any(windows, target_os = "macos")))]
 mod unsupported {
@@ -122,6 +124,7 @@ mod unsupported {
         _shared: Arc<CaptureShared>,
         _tx: Sender<RemoteInput>,
         _edge: Edge,
+        _offset: f32,
     ) -> Result<CaptureHandle, String> {
         Err(crate::error::code("E_UNSUPPORTED"))
     }

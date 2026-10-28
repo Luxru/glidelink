@@ -31,12 +31,6 @@
           </span>
           <span data-i18n="nav.layout">Display Layout</span>
         </button>
-        <button class="nav-item" type="button" data-page-target="security">
-          <span class="nav-icon nav-green" aria-hidden="true">
-            <svg viewBox="0 0 20 20" fill="none"><path d="M10 2.6l5.4 2.2v4.1c0 3.4-2.2 6.2-5.4 7.7-3.2-1.5-5.4-4.3-5.4-7.7V4.8L10 2.6z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M7.5 10l1.7 1.7 3.4-3.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </span>
-          <span data-i18n="nav.security">Security</span>
-        </button>
         <button class="nav-item" type="button" data-page-target="about">
           <span class="nav-icon nav-gray" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7.1" stroke="currentColor" stroke-width="1.5"/><path d="M10 9v4.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="10" cy="6.6" r="1.05" fill="currentColor"/></svg>
@@ -78,7 +72,7 @@
 
       <div id="permissionCard" class="permission-card" hidden>
         <div>
-          <strong data-i18n="permission.title">macOS Accessibility permission required</strong>
+          <strong data-i18n="permission.title">macOS permissions required</strong>
           <p data-i18n="permission.text">Allow GlideLink to listen for and inject mouse events, then relaunch the app.</p>
         </div>
         <button id="permissionBtn" type="button" class="button secondary small" data-i18n="permission.open">Open System Settings</button>
@@ -209,7 +203,9 @@
                   <i></i>
                 </div>
 
-                <div class="screen remote-screen" id="remoteScreen">
+                <div class="screen remote-screen" id="remoteScreen" tabindex="0" role="button"
+                     data-i18n-aria-label="layout.peerAriaLabel"
+                     aria-describedby="layoutDragHint">
                   <div class="screen-topline" aria-hidden="true"></div>
                   <div class="screen-content">
                     <strong id="remoteScreenLabel" data-i18n="common.peerControlled">Controlled PC</strong>
@@ -223,48 +219,12 @@
                 <i class="preview-dot"></i>
                 <span id="linkChipText" data-i18n="layout.previewWaiting">Waiting for connection</span>
               </div>
-              <div class="separator" id="layoutEdgeSeparator"></div>
 
-              <div class="setting-row" id="layoutEdgeRow">
-                <span class="row-label" data-i18n="layout.edgePosition">Peer screen position</span>
-                <div class="segmented" id="edgePicker" role="radiogroup" aria-label="Peer screen position" data-i18n-aria-label="layout.edgePosition">
-                  <button type="button" class="edge-option" data-edge="left" role="radio" aria-checked="false" data-i18n="layout.edgeLeft">Left</button>
-                  <button type="button" class="edge-option active" data-edge="right" role="radio" aria-checked="true" data-i18n="layout.edgeRight">Right</button>
-                  <button type="button" class="edge-option" data-edge="top" role="radio" aria-checked="false" data-i18n="layout.edgeTop">Top</button>
-                  <button type="button" class="edge-option" data-edge="bottom" role="radio" aria-checked="false" data-i18n="layout.edgeBottom">Bottom</button>
-                </div>
-              </div>
+              <p class="layout-hint" id="layoutDragHint" data-i18n="layout.dragHint">
+                Drag the peer screen to any side of this device. Arrow keys choose a side; Shift + arrows adjust the offset.
+              </p>
             </div>
           </div>
-        </section>
-
-        <section class="page" data-page="security" hidden>
-
-          <div class="group">
-            <div class="group-header"><h2 data-i18n="security.transportGroup">Transport security</h2></div>
-            <div class="group-card">
-              <div class="setting-row">
-                <span data-i18n="security.algorithm">Encryption</span>
-                <span class="value">ChaCha20-Poly1305</span>
-              </div>
-              <div class="separator"></div>
-              <div class="setting-row">
-                <span data-i18n="security.kdf">Key derivation</span>
-                <span class="value" data-i18n="security.kdfValue">PBKDF2-HMAC-SHA256 · 100,000 rounds</span>
-              </div>
-              <div class="separator"></div>
-              <div class="setting-row">
-                <span data-i18n="security.replay">Replay protection</span>
-                <span class="value" data-i18n="security.replayValue">64-packet sliding window</span>
-              </div>
-              <div class="separator"></div>
-              <div class="setting-row">
-                <span data-i18n="security.channel">Transport</span>
-                <span class="value" data-i18n="security.channelValue">LAN UDP · never leaves the local network</span>
-              </div>
-            </div>
-          </div>
-
         </section>
 
         <section class="page" data-page="about" hidden>
@@ -276,25 +236,76 @@
           </div>
 
           <div class="group">
+            <div class="group-header"><h2 data-i18n="about.sessionGroup">Session</h2></div>
             <div class="group-card">
               <div class="setting-row">
-                <span data-i18n="about.platform">Platforms</span>
-                <span class="value" data-i18n="about.platformValue">Windows · macOS</span>
+                <span data-i18n="about.role">Role</span>
+                <span class="value" id="aboutRole">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.input">Input backend</span>
-                <span class="value" data-i18n="about.inputValue">Native global mouse hooks</span>
+                <span data-i18n="about.state">State</span>
+                <span class="value" id="aboutState">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.transport">Transport</span>
-                <span class="value" data-i18n="about.transportValue">LAN UDP</span>
+                <span data-i18n="about.duration">Duration</span>
+                <span class="value" id="aboutDuration">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.latency">Target latency</span>
-                <span class="value" data-i18n="about.latencyValue">Under 10ms</span>
+                <span data-i18n="about.peer">Peer</span>
+                <span class="value" id="aboutPeer">—</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="about.linkState">Link</span>
+                <span class="value" id="aboutLinkState">—</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="group-header"><h2 data-i18n="about.linkGroup">Link</h2></div>
+            <div class="group-card">
+              <div class="setting-row">
+                <span data-i18n="about.rtt">Round-trip time</span>
+                <span class="value" id="aboutRtt">—</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="about.localScreen">This screen</span>
+                <span class="value" id="aboutLocalScreen">—</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="about.remoteScreen">Peer screen</span>
+                <span class="value" id="aboutRemoteScreen">—</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="group">
+            <div class="group-header"><h2 data-i18n="about.trafficGroup">Session traffic</h2></div>
+            <div class="group-card">
+              <div class="setting-row">
+                <span data-i18n="about.packetsSent">Packets sent</span>
+                <span class="value" id="aboutPacketsSent">—</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="about.packetsReceived">Packets received</span>
+                <span class="value" id="aboutPacketsReceived">—</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="about.bytesSent">Data sent</span>
+                <span class="value" id="aboutBytesSent">—</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="about.bytesReceived">Data received</span>
+                <span class="value" id="aboutBytesReceived">—</span>
               </div>
             </div>
           </div>

@@ -62,6 +62,13 @@ fn main() {
     )
     .try_init();
 
+    // Hardware smoke test used to validate the macOS input backend without
+    // starting the UI. See README: Development and tests.
+    #[cfg(target_os = "macos")]
+    if std::env::args().skip(1).any(|arg| arg == "--self-test") {
+        std::process::exit(if input::self_test() { 0 } else { 1 });
+    }
+
     let app = tauri::Builder::default()
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
@@ -69,6 +76,12 @@ fn main() {
             let config_path = config_dir.join("config.json");
             let screen = input::screen_info();
             let status = status::Status::new(screen);
+            log::info!(
+                "starting on {} (screen={:?}, permissions_ok={})",
+                input::platform_name(),
+                screen,
+                input::permissions_ok()
+            );
 
             let config = match config::load_or_create(&config_path) {
                 Ok(config) => config,

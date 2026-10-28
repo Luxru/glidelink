@@ -9,7 +9,6 @@ const els = {
   navItems: [...document.querySelectorAll(".nav-item")],
   languageSelect: document.getElementById("languageSelect"),
   roleOptions: [...document.querySelectorAll(".role-option")],
-  edgeOptions: [...document.querySelectorAll(".edge-option")],
   controllerFields: document.getElementById("controllerFields"),
   agentFields: document.getElementById("agentFields"),
   peerAddr: document.getElementById("peerAddr"),
@@ -23,6 +22,7 @@ const els = {
   errorBanner: document.getElementById("errorBanner"),
   errorText: document.getElementById("errorText"),
   layoutStage: document.getElementById("layoutStage"),
+  hostScreen: document.getElementById("hostScreen"),
   hostScreenSize: document.getElementById("hostScreenSize"),
   remoteScreenSize: document.getElementById("remoteScreenSize"),
   hostScreenLabel: document.getElementById("hostScreenLabel"),
@@ -41,8 +41,20 @@ const els = {
   sessionState: document.getElementById("sessionState"),
   layoutSummary: document.getElementById("layoutSummary"),
   editLayout: document.getElementById("editLayout"),
-  layoutEdgeRow: document.getElementById("layoutEdgeRow"),
-  layoutEdgeSeparator: document.getElementById("layoutEdgeSeparator"),
+  remoteScreen: document.getElementById("remoteScreen"),
+  layoutDragHint: document.getElementById("layoutDragHint"),
+  aboutRole: document.getElementById("aboutRole"),
+  aboutState: document.getElementById("aboutState"),
+  aboutDuration: document.getElementById("aboutDuration"),
+  aboutPeer: document.getElementById("aboutPeer"),
+  aboutLinkState: document.getElementById("aboutLinkState"),
+  aboutRtt: document.getElementById("aboutRtt"),
+  aboutLocalScreen: document.getElementById("aboutLocalScreen"),
+  aboutRemoteScreen: document.getElementById("aboutRemoteScreen"),
+  aboutPacketsSent: document.getElementById("aboutPacketsSent"),
+  aboutPacketsReceived: document.getElementById("aboutPacketsReceived"),
+  aboutBytesSent: document.getElementById("aboutBytesSent"),
+  aboutBytesReceived: document.getElementById("aboutBytesReceived"),
   toast: document.getElementById("toast"),
 };
 
@@ -50,6 +62,7 @@ const ui = {
   page: "session",
   role: "controller",
   edge: "right",
+  offset: 0,
   running: false,
   loading: false,
   initialized: false,
@@ -58,18 +71,19 @@ const ui = {
   startError: null,
 };
 
+const SCREEN_W = 250;
+const SCREEN_H = 150;
+const SCREEN_GAP = 12;
+const MAX_OFFSET = 0.65;
+const DRAG_EDGES = ["left", "right", "top", "bottom"];
+
+let dragState = null;
+let lastDrag = null;
+
 const PAGES = {
   session: "page.session.title",
   layout: "page.layout.title",
-  security: "page.security.title",
   about: "page.about.title",
-};
-
-const EDGE_LABELS = {
-  left: "layout.edgeLeft",
-  right: "layout.edgeRight",
-  top: "layout.edgeTop",
-  bottom: "layout.edgeBottom",
 };
 
 const EDGE_SUMMARIES = {
@@ -97,6 +111,67 @@ function generatePasscode(length = 12) {
 function formatScreen(screen) {
   if (!screen || !screen.width || !screen.height) return "—";
   return `${screen.width} × ${screen.height}`;
+}
+
+function formatDuration(ms) {
+  const total = Math.max(0, Math.floor(Number(ms) / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const pad = (value) => String(value).padStart(2, "0");
+  return hours > 0
+    ? `${hours}:${pad(minutes)}:${pad(seconds)}`
+    : `${minutes}:${pad(seconds)}`;
+}
+
+function formatBytes(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value < 1024) return `${value} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let scaled = value / 1024;
+  let index = 0;
+  while (scaled >= 1024 && index < units.length - 1) {
+    scaled /= 1024;
+    index += 1;
+  }
+  return `${scaled >= 10 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[index]}`;
+}
+
+function formatCount(value) {
+  return Math.max(0, Number(value) || 0).toLocaleString();
+}
+
+function sessionStateLabel() {
+  const status = ui.lastStatus || {};
+  if (!ui.running) return t("status.notRunning");
+  if (status.remoteActive) {
+    return ui.role === "agent" ? t("status.controlled") : t("status.controlling");
+  }
+  return status.connected ? t("status.connected") : t("status.waitingPeer");
+}
+
+function updateAboutStats(status) {
+  const running = Boolean(status?.running);
+  const connected = Boolean(status?.connected);
+  const latency = status?.latencyMs == null ? null : Number(status.latencyMs);
+  els.aboutRole.textContent = ui.role === "agent" ? t("role.agent") : t("role.controller");
+  els.aboutState.textContent = sessionStateLabel();
+  els.aboutDuration.textContent = running && status?.startedAtMs
+    ? formatDuration(Date.now() - status.startedAtMs)
+    : "—";
+  els.aboutPeer.textContent = status?.peer || "—";
+  els.aboutLinkState.textContent = connected
+    ? t("status.connected")
+    : running
+      ? t("status.waiting")
+      : t("status.notRunning");
+  els.aboutRtt.textContent = latency == null ? "—" : `${latency.toFixed(1)} ms`;
+  els.aboutLocalScreen.textContent = formatScreen(status?.localScreen);
+  els.aboutRemoteScreen.textContent = formatScreen(status?.remoteScreen);
+  els.aboutPacketsSent.textContent = formatCount(status?.packetsSent);
+  els.aboutPacketsReceived.textContent = formatCount(status?.packetsReceived);
+  els.aboutBytesSent.textContent = formatBytes(status?.bytesSent);
+  els.aboutBytesReceived.textContent = formatBytes(status?.bytesReceived);
 }
 
 function errorToRaw(error) {
@@ -182,18 +257,159 @@ function updateStartLabel() {
   }
 }
 
+function layoutDisabled() {
+  return ui.running || ui.loading || ui.role === "agent";
+}
+
+function peerPosition() {
+  const edge = ui.role === "agent" ? "right" : ui.edge;
+  const offset = ui.role === "agent" ? 0 : ui.offset;
+  let hostDx = 0;
+  let hostDy = 0;
+  let peerDx = 0;
+  let peerDy = 0;
+  if (edge === "left" || edge === "right") {
+    const half = (SCREEN_W + SCREEN_GAP) / 2;
+    hostDx = edge === "right" ? -half : half;
+    peerDx = -hostDx;
+    peerDy = offset * SCREEN_H;
+  } else {
+    const half = (SCREEN_H + SCREEN_GAP) / 2;
+    hostDy = edge === "bottom" ? -half : half;
+    peerDy = -hostDy;
+    peerDx = offset * SCREEN_W;
+  }
+  return { hostDx, hostDy, peerDx, peerDy };
+}
+
+function renderLayout() {
+  const { hostDx, hostDy, peerDx, peerDy } = peerPosition();
+  els.hostScreen.style.transform =
+    `translate(calc(-50% + ${hostDx}px), calc(-50% + ${hostDy}px))`;
+  if (!dragState) {
+    els.remoteScreen.style.transform =
+      `translate(calc(-50% + ${peerDx}px), calc(-50% + ${peerDy}px))`;
+  }
+  const disabled = layoutDisabled();
+  els.layoutStage.dataset.edge = ui.role === "agent" ? "right" : ui.edge;
+  els.layoutStage.classList.toggle("is-disabled", disabled);
+  els.remoteScreen.tabIndex = disabled ? -1 : 0;
+  els.remoteScreen.setAttribute("aria-disabled", String(disabled));
+}
+
 function updateLayoutSummary() {
-  if (ui.role === "agent") {
-    els.layoutSummary.textContent = t("layout.summaryAgent");
-    els.layoutEdgeRow.hidden = true;
-    els.layoutEdgeSeparator.hidden = true;
-    els.layoutStage.dataset.edge = "right";
+  els.layoutSummary.textContent = ui.role === "agent"
+    ? t("layout.summaryAgent")
+    : t(EDGE_SUMMARIES[ui.edge]);
+  els.layoutDragHint.hidden = layoutDisabled();
+  renderLayout();
+}
+
+function setEdge(edge) {
+  ui.edge = DRAG_EDGES.includes(edge) ? edge : "right";
+  updateLayoutSummary();
+}
+
+function setOffset(offset) {
+  const value = Number(offset);
+  ui.offset = Number.isFinite(value)
+    ? Math.max(-MAX_OFFSET, Math.min(MAX_OFFSET, value))
+    : 0;
+  renderLayout();
+}
+
+function dominantEdge(dx, dy) {
+  if (Math.abs(dx) >= Math.abs(dy)) return dx >= 0 ? "right" : "left";
+  return dy >= 0 ? "bottom" : "top";
+}
+
+function onPeerPointerDown(event) {
+  if (layoutDisabled() || event.button !== 0) return;
+  const { peerDx, peerDy } = peerPosition();
+  dragState = {
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    peerDx,
+    peerDy,
+  };
+  lastDrag = null;
+  els.layoutStage.classList.add("is-dragging");
+  els.remoteScreen.setPointerCapture?.(event.pointerId);
+  els.remoteScreen.focus({ preventScroll: true });
+  event.preventDefault();
+}
+
+function onPeerPointerMove(event) {
+  if (!dragState || event.pointerId !== dragState.pointerId) return;
+  const stageRect = els.layoutStage.getBoundingClientRect();
+  let dx = dragState.peerDx + (event.clientX - dragState.startX);
+  let dy = dragState.peerDy + (event.clientY - dragState.startY);
+  const limitX = Math.max(0, stageRect.width / 2 - SCREEN_W / 2 - 6);
+  const limitY = Math.max(0, stageRect.height / 2 - SCREEN_H / 2 - 6);
+  dx = Math.max(-limitX, Math.min(limitX, dx));
+  dy = Math.max(-limitY, Math.min(limitY, dy));
+  const pointerDx = event.clientX - (stageRect.left + stageRect.width / 2);
+  const pointerDy = event.clientY - (stageRect.top + stageRect.height / 2);
+  lastDrag = { dx, dy, pointerDx, pointerDy };
+  els.remoteScreen.style.transform =
+    `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+  els.layoutStage.dataset.edge = dominantEdge(pointerDx, pointerDy);
+}
+
+function onPeerPointerUp(event) {
+  if (!dragState || event.pointerId !== dragState.pointerId) return;
+  const moved = lastDrag
+    ? Math.hypot(lastDrag.dx - dragState.peerDx, lastDrag.dy - dragState.peerDy)
+    : 0;
+  if (moved >= 6 && lastDrag) {
+    const edge = dominantEdge(lastDrag.pointerDx, lastDrag.pointerDy);
+    const rawOffset = edge === "left" || edge === "right"
+      ? lastDrag.dy / SCREEN_H
+      : lastDrag.dx / SCREEN_W;
+    ui.edge = edge;
+    ui.offset = Math.max(-MAX_OFFSET, Math.min(MAX_OFFSET, rawOffset));
+  }
+  dragState = null;
+  lastDrag = null;
+  els.layoutStage.classList.remove("is-dragging");
+  if (els.remoteScreen.hasPointerCapture?.(event.pointerId)) {
+    els.remoteScreen.releasePointerCapture(event.pointerId);
+  }
+  updateLayoutSummary();
+  renderLayout();
+}
+
+function onPeerKeyDown(event) {
+  if (layoutDisabled()) return;
+  const step = 0.05;
+  if (event.key === "0") {
+    setOffset(0);
+    event.preventDefault();
     return;
   }
-  els.layoutSummary.textContent = t(EDGE_SUMMARIES[ui.edge]);
-  els.layoutEdgeRow.hidden = false;
-  els.layoutEdgeSeparator.hidden = false;
-  els.layoutStage.dataset.edge = ui.edge;
+  const shift = event.shiftKey;
+  const horizontal = ui.edge === "left" || ui.edge === "right";
+  if (shift && horizontal && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+    setOffset(ui.offset + (event.key === "ArrowDown" ? step : -step));
+    event.preventDefault();
+    return;
+  }
+  if (shift && !horizontal && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+    setOffset(ui.offset + (event.key === "ArrowRight" ? step : -step));
+    event.preventDefault();
+    return;
+  }
+  const edges = {
+    ArrowLeft: "left",
+    ArrowRight: "right",
+    ArrowUp: "top",
+    ArrowDown: "bottom",
+  };
+  if (edges[event.key]) {
+    setEdge(edges[event.key]);
+    event.preventDefault();
+  }
 }
 
 function setLoading(loading) {
@@ -201,6 +417,7 @@ function setLoading(loading) {
   els.startBtn.classList.toggle("loading", loading);
   els.startBtn.setAttribute("aria-busy", String(loading));
   els.startBtn.disabled = loading || ui.running;
+  updateLayoutSummary();
   updateStartLabel();
 }
 
@@ -222,26 +439,15 @@ function setRole(role, syncControls = true) {
   if (syncControls && !ui.running) setDisabledControls(false);
 }
 
-function setEdge(edge) {
-  ui.edge = ["left", "right", "top", "bottom"].includes(edge) ? edge : "right";
-  for (const option of els.edgeOptions) {
-    const active = option.dataset.edge === ui.edge;
-    option.classList.toggle("active", active);
-    option.setAttribute("aria-checked", String(active));
-    option.setAttribute("aria-label", t(EDGE_LABELS[option.dataset.edge]));
-  }
-  updateLayoutSummary();
-}
-
 function setDisabledControls(disabled) {
   for (const input of els.form.querySelectorAll("input")) input.disabled = disabled;
   for (const option of els.roleOptions) option.disabled = disabled;
-  for (const option of els.edgeOptions) option.disabled = disabled;
   els.generatePasscode.disabled = disabled;
   els.togglePasscode.disabled = disabled;
   els.editLayout.disabled = disabled;
   els.startBtn.disabled = disabled || ui.loading;
   els.stopBtn.hidden = !disabled;
+  updateLayoutSummary();
   updateStartLabel();
 }
 
@@ -267,6 +473,7 @@ function applyState(state) {
     els.passcode.value = config.passcode || "";
     setRole(config.role, false);
     setEdge(config.edge);
+    setOffset(config.peerOffset ?? 0);
     setDisabledControls(ui.running);
     ui.initialized = true;
   } else if (config && !ui.running && wasRunning) {
@@ -287,7 +494,7 @@ function applyState(state) {
   const statusError = status.lastErrorCode
     ? `${status.lastErrorCode}${status.lastErrorDetail ? `|${status.lastErrorDetail}` : ""}`
     : null;
-  const errorRaw = ui.startError || statusError || (permissionBlocked ? "errors.PERMISSIONS_BLOCKED" : null);
+  const errorRaw = ui.startError || statusError || (permissionBlocked && ui.running ? "errors.PERMISSIONS_BLOCKED" : null);
 
   els.hostScreenSize.textContent = formatScreen(localScreen);
   els.remoteScreenSize.textContent = remoteScreen
@@ -351,6 +558,8 @@ function applyState(state) {
   } else if (!ui.startError) {
     els.errorBanner.hidden = true;
   }
+
+  updateAboutStats(status);
 }
 
 async function refresh() {
@@ -401,6 +610,7 @@ async function startSession(event) {
         listenPort,
         passcode,
         edge: ui.edge,
+        peerOffset: ui.offset,
       },
     }));
     showToast(ui.role === "controller" ? t("toast.startedController") : t("toast.startedAgent"));
@@ -467,12 +677,18 @@ function initEvents() {
     });
   }
 
-  for (const option of els.edgeOptions) {
-    option.addEventListener("click", () => {
-      if (ui.running) return;
-      setEdge(option.dataset.edge);
-    });
-  }
+  els.remoteScreen.addEventListener("pointerdown", onPeerPointerDown);
+  els.remoteScreen.addEventListener("pointermove", onPeerPointerMove);
+  els.remoteScreen.addEventListener("pointerup", onPeerPointerUp);
+  els.remoteScreen.addEventListener("pointercancel", onPeerPointerUp);
+  els.remoteScreen.addEventListener("lostpointercapture", () => {
+    if (!dragState) return;
+    dragState = null;
+    lastDrag = null;
+    els.layoutStage.classList.remove("is-dragging");
+    updateLayoutSummary();
+  });
+  els.remoteScreen.addEventListener("keydown", onPeerKeyDown);
 
   els.togglePasscode.addEventListener("click", () => {
     const visible = els.passcode.type === "password";
@@ -516,6 +732,7 @@ function initEvents() {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
       if (ui.page !== "session") setPage("session");
+      if (ui.running || ui.loading) return;
       els.form.requestSubmit();
     }
   });

@@ -65,7 +65,7 @@ UDP is used instead of TCP/QUIC because pointer position is replaceable state: a
 
 Each machine's virtual desktop is mapped to `[0,1] × [0,1]`. The controller normalizes against its own virtual desktop; the agent maps the result to its own desktop. This keeps movement proportional across different resolutions.
 
-Four directions are currently supported: the peer may be placed to the left, right, above, or below the controller.
+Four directions are currently supported: the peer may be placed to the left, right, above, or below the controller. The peer can also slide along the shared edge; that offset is normalized to the host edge and shifts the entry/return mapping while the wire protocol stays unchanged.
 
 - The pointer enters the peer after reaching an edge and continuing outward.
 - The remote pointer starts just inside the edge to avoid jitter causing an immediate return.
@@ -119,36 +119,21 @@ The controller sends a heartbeat every 250ms and measures RTT. On timeout it sto
 
 ## 7. Security model
 
-- Traffic is encrypted with keys derived from the pairing code.
-- No accounts, cloud services, or internet access are involved.
-- The pairing code is the only authentication secret and must be sufficiently random.
-- The UDP port should only be reachable on a trusted LAN.
-- The current version has no pinned device public keys, key rotation, or independent security audit.
+- Traffic uses keys derived from the pairing code; there are no accounts or cloud services.
+- The pairing code must be sufficiently random, and the UDP port should only be reachable on a trusted LAN.
+- The current version has no pinned device keys, key rotation, or independent security audit.
 
 ## 8. Performance design
 
-- The input hot path avoids the WebView and Tauri IPC.
-- The status lock is written only on state transitions.
-- Input packets are small and use unicast UDP without congestion control or retransmission overhead.
-- The agent injects movement only when coordinates change, avoiding idle event noise.
-- The target is 3–8ms end-to-end on a healthy LAN. Actual results depend on the mouse, Wi-Fi, OS scheduling, and power settings.
+- The hot path avoids the WebView and Tauri IPC; the status lock is written only on transitions.
+- Packets are small, unicast UDP with no retransmission; the agent injects only when coordinates change.
+- The target is 3–8ms end-to-end on a healthy LAN; actual results depend on the network and OS scheduling.
 
-## 9. Known limitations
+## 9. Future work
 
-- Mouse only; keyboard forwarding is not implemented.
-- One agent is supported.
-- Four edge directions only; arbitrary display layouts are not implemented yet.
-- Peer addresses are entered manually; there is no automatic discovery.
-- The Windows secure desktop (UAC) cannot be captured.
-- The macOS backend still needs validation on macOS hardware.
-- No signed installers, tray integration, or launch-at-login.
-- The protocol has not undergone an independent security audit.
+Current limitations are listed in the [README](README.en.md). Future work:
 
-## 10. Future work
-
-- Keyboard forwarding.
-- Multiple agents and arbitrary rectangular display layouts.
+- Keyboard forwarding, multiple agents, and arbitrary rectangular layouts.
 - LAN discovery and pairing.
 - Batched `SendInput` injection on Windows.
-- macOS hardware validation, signing, and notarization.
-- Tray support, launch-at-login, and installers.
+- Apple Silicon validation, signing/notarization, tray support, launch-at-login, and installers.
