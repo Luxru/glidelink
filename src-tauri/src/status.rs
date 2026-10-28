@@ -28,6 +28,8 @@ pub struct RuntimeStatus {
     pub last_error_code: Option<String>,
     pub last_error_detail: Option<String>,
     pub peer: Option<String>,
+    /// Platform reported by the peer during the handshake (1 = macOS, 2 = Windows).
+    pub peer_platform: Option<u8>,
     pub local_screen: Option<ScreenInfo>,
     pub remote_screen: Option<ScreenInfo>,
     pub started_at_ms: Option<u64>,

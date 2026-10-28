@@ -48,4 +48,4 @@ Ports are chosen automatically from 45890–45999 and should only be reachable o
 
 ## Configuration
 
-All settings are read and written by the Rust backend and stored in `~/.glidelink/settings.json`. The old `config.json` is migrated once on first launch and is never read again.
+All settings are read and written by the Rust backend and stored in `~/.glidelink/settings.json`.

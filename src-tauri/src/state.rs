@@ -189,6 +189,8 @@ pub struct StateView {
     pub config: AppConfig,
     pub status: crate::status::RuntimeStatus,
     pub platform: &'static str,
+    /// Short git commit (plus `-dirty`) the binary was built from.
+    pub build: &'static str,
     pub permissions_ok: bool,
     pub local_interfaces: Vec<net::NetworkInterface>,
 }
@@ -208,6 +210,7 @@ impl StateView {
             config,
             status,
             platform: input::platform_name(),
+            build: env!("GLIDELINK_BUILD"),
             permissions_ok: input::permissions_ok(),
             local_interfaces: net::local_interfaces(),
         }

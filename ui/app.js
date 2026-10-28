@@ -43,6 +43,7 @@ const els = {
   aboutState: document.getElementById("aboutState"),
   aboutDuration: document.getElementById("aboutDuration"),
   aboutPeer: document.getElementById("aboutPeer"),
+  aboutPeerPlatform: document.getElementById("aboutPeerPlatform"),
   aboutLinkState: document.getElementById("aboutLinkState"),
   aboutRtt: document.getElementById("aboutRtt"),
   aboutJitter: document.getElementById("aboutJitter"),
@@ -54,6 +55,7 @@ const els = {
   aboutPacketsReceived: document.getElementById("aboutPacketsReceived"),
   aboutBytesSent: document.getElementById("aboutBytesSent"),
   aboutBytesReceived: document.getElementById("aboutBytesReceived"),
+  aboutBuild: document.getElementById("aboutBuild"),
   toast: document.getElementById("toast"),
 };
 
@@ -175,6 +177,8 @@ function updateAboutStats(status) {
     ? formatDuration(Date.now() - status.startedAtMs)
     : "—";
   els.aboutPeer.textContent = status?.peer || "—";
+  const peerPlatform = { 1: "platform.macos", 2: "platform.windows" }[status?.peerPlatform];
+  els.aboutPeerPlatform.textContent = peerPlatform ? t(peerPlatform) : "—";
   els.aboutLinkState.textContent = connected
     ? t("status.connected")
     : running
@@ -196,6 +200,7 @@ function updateAboutStats(status) {
   els.aboutPacketsReceived.textContent = formatCount(status?.packetsReceived);
   els.aboutBytesSent.textContent = formatBytes(status?.bytesSent);
   els.aboutBytesReceived.textContent = formatBytes(status?.bytesReceived);
+  els.aboutBuild.textContent = ui.lastState?.build || "—";
 }
 
 function errorToRaw(error) {

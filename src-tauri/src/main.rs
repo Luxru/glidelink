@@ -109,13 +109,7 @@ fn main() {
 
     let app = tauri::Builder::default()
         .setup(|app| {
-            // Settings live in `~/.glidelink/settings.json`. The old
-            // per-identifier config file is only used once for migration.
-            let legacy_path = app
-                .path()
-                .app_config_dir()
-                .ok()
-                .map(|dir| dir.join("config.json"));
+            // Settings live in `~/.glidelink/settings.json`.
             let settings_path = match app.path().home_dir() {
                 Ok(home) => home.join(".glidelink").join("settings.json"),
                 Err(err) => {
@@ -126,13 +120,14 @@ fn main() {
             let screen = input::screen_info();
             let status = status::Status::new(screen);
             log::info!(
-                "starting on {} (screen={:?}, permissions_ok={})",
+                "starting on {} (build={}, screen={:?}, permissions_ok={})",
                 input::platform_name(),
+                env!("GLIDELINK_BUILD"),
                 screen,
                 input::permissions_ok()
             );
 
-            let config = match config::load_or_migrate(&settings_path, legacy_path.as_deref()) {
+            let config = match config::load_or_create(&settings_path) {
                 Ok(config) => config,
                 Err(load_error) => {
                     log::error!("{load_error}");

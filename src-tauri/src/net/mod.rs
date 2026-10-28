@@ -514,6 +514,14 @@ fn controller_loop(
                             break;
                         }
                     }
+                    if last_key_packet.map_or(true, |previous| previous != packet) {
+                        log::debug!(
+                            "send key active={} caps={} keys={:?}",
+                            packet.active,
+                            packet.caps_lock,
+                            packet.state
+                        );
+                    }
                     if let Err(e) = send_encrypted(
                         &mut current.session,
                         TYPE_KEY,
@@ -855,6 +863,7 @@ fn controller_loop(
                                 status.update(|s| {
                                     s.connected = true;
                                     s.remote_screen = Some(screen);
+                                    s.peer_platform = Some(peer_platform);
                                     s.latency_ms = None;
                                     s.last_error_code = None;
                                     s.last_error_detail = None;
@@ -871,9 +880,10 @@ fn controller_loop(
                                 last_key_packet = Some(KeyPacket::INACTIVE);
                                 last_key_send = now;
                                 log::info!(
-                                    "v2 session confirmed with {peer} ({}x{})",
+                                    "v2 session confirmed with {peer} ({}x{}, platform={})",
                                     screen.width,
-                                    screen.height
+                                    screen.height,
+                                    platform_label(peer_platform)
                                 );
                             } else {
                                 last_pong = now;
@@ -1078,8 +1088,17 @@ struct PendingAgent {
     sid: [u8; protocol::SID_LEN],
     controller: SocketAddr,
     controller_screen: ScreenInfo,
+    controller_platform: u8,
     accept_packet: Vec<u8>,
     created: Instant,
+}
+
+fn platform_label(id: u8) -> &'static str {
+    match id {
+        1 => "macos",
+        2 => "windows",
+        _ => "unknown",
+    }
 }
 
 fn agent_loop(
@@ -1096,6 +1115,7 @@ fn agent_loop(
     let mut pending: Option<PendingAgent> = None;
     let mut last_input = Instant::now();
     let mut active_reported = false;
+    let mut last_logged_key: Option<KeyPacket> = None;
     let mut pake_limiter = PakeLimiter::new();
     let mut buf = [0u8; 2048];
 
@@ -1172,6 +1192,7 @@ fn agent_loop(
                         sid,
                         controller: from,
                         controller_screen: hello.screen,
+                        controller_platform: hello.platform,
                         accept_packet,
                         created: Instant::now(),
                     });
@@ -1204,6 +1225,7 @@ fn agent_loop(
                         };
                         let now = Instant::now();
                         let screen = p.controller_screen;
+                        let controller_platform = p.controller_platform;
                         let _ = inject_tx.send(InjectMsg::Reset);
                         session = Some(AgentSession {
                             session: p.session,
@@ -1214,16 +1236,21 @@ fn agent_loop(
                         });
                         last_input = now;
                         active_reported = false;
+                        last_logged_key = None;
                         status.update(|s| {
                             s.connected = true;
                             s.remote_active = false;
                             s.peer = Some(from.to_string());
                             s.remote_screen = Some(screen);
+                            s.peer_platform = Some(controller_platform);
                             s.last_error_code = None;
                             s.last_error_detail = None;
                             s.packet_loss_percent = None;
                         });
-                        log::info!("v2 session confirmed with {from}");
+                        log::info!(
+                            "v2 session confirmed with {from} (platform={})",
+                            platform_label(controller_platform)
+                        );
                     }
                     continue;
                 }
@@ -1276,6 +1303,17 @@ fn agent_loop(
                                 if seq > active.last_key_seq {
                                     if let Ok(packet) = decode_key(&payload) {
                                         active.last_key_seq = seq;
+                                        if last_logged_key.map_or(true, |previous| {
+                                            previous != packet
+                                        }) {
+                                            log::debug!(
+                                                "recv key active={} caps={} keys={:?}",
+                                                packet.active,
+                                                packet.caps_lock,
+                                                packet.state
+                                            );
+                                            last_logged_key = Some(packet);
+                                        }
                                         let _ = inject_tx.send(InjectMsg::Keys(packet));
                                         if packet.active {
                                             last_input = now;
@@ -1292,7 +1330,7 @@ fn agent_loop(
                                             status.update(|s| s.remote_active = false);
                                         }
                                     } else {
-                                        log::debug!("rejected key state from {from}");
+                                        log::warn!("rejected key state from {from}");
                                     }
                                 }
                             }

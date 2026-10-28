@@ -48,4 +48,4 @@ ui/ ──命令──► Engine
 
 ## 配置
 
-所有设置由 Rust 后端读写，保存在 `~/.glidelink/settings.json`。旧版 `config.json` 在首次启动时迁移一次，之后不再读取。
+所有设置由 Rust 后端读写，保存在 `~/.glidelink/settings.json`。

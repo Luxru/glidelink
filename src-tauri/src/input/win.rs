@@ -277,6 +277,10 @@ impl CaptureState {
                 HookAction::Swallow
             };
         };
+        log::debug!(
+            "captured key {hid:#04x} {}",
+            if down { "down" } else { "up" }
+        );
 
         if is_caps(hid) {
             if down {

@@ -135,12 +135,7 @@ fn normalize_language(value: &str) -> String {
     }
 }
 
-/// Load `settings_path`, migrating the pre-settings `config.json` once. The
-/// legacy file is never read again after the first successful migration.
-pub fn load_or_migrate(
-    settings_path: &Path,
-    legacy_path: Option<&Path>,
-) -> Result<AppConfig, String> {
+pub fn load_or_create(settings_path: &Path) -> Result<AppConfig, String> {
     if settings_path.exists() {
         let mut config = match read(settings_path) {
             Ok(config) => config,
@@ -151,16 +146,12 @@ pub fn load_or_migrate(
             }
         };
         config.normalize();
-        // Drop fields from older formats (including the old passcode).
+        // Drop unknown fields from older formats.
         let _ = save(settings_path, &config);
         return Ok(config);
     }
 
-    let mut config = match legacy_path.filter(|path| path.exists()) {
-        Some(legacy) => read(legacy)?,
-        None => AppConfig::default(),
-    };
-    config.normalize();
+    let config = AppConfig::default();
     save(settings_path, &config)?;
     Ok(config)
 }
@@ -310,30 +301,16 @@ mod tests {
     }
 
     #[test]
-    fn migrates_legacy_config_once() {
-        let dir = test_dir("migrate");
-        let legacy = dir.join("config.json");
+    fn creates_default_settings_when_missing() {
+        let dir = test_dir("create");
         let settings = dir.join("settings.json");
-        fs::write(
-            &legacy,
-            r#"{"role":"agent","localIp":"192.168.1.10","edge":"left","peerOffset":0.25,"adaptModifiers":true}"#,
-        )
-        .unwrap();
 
-        let config = load_or_migrate(&settings, Some(&legacy)).expect("migrate");
-        assert_eq!(config.role, Role::Agent);
-        assert_eq!(config.local_ip, "192.168.1.10");
-        assert_eq!(config.peer_offset, 0.25);
-        assert!(config.adapt_modifiers);
-        assert!(config.language.is_empty());
+        let config = load_or_create(&settings).expect("create");
+        assert_eq!(config.role, Role::Controller);
         assert!(settings.exists());
-        assert!(legacy.exists());
 
-        // The legacy file is ignored once settings.json exists.
-        fs::write(&legacy, r#"{"role":"controller","edge":"top"}"#).unwrap();
-        let again = load_or_migrate(&settings, Some(&legacy)).expect("reload");
-        assert_eq!(again.role, Role::Agent);
-        assert_eq!(again.local_ip, "192.168.1.10");
+        let reloaded = load_or_create(&settings).expect("reload");
+        assert_eq!(reloaded.role, Role::Controller);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -344,11 +321,11 @@ mod tests {
         let settings = dir.join("settings.json");
         fs::write(&settings, "{not json").unwrap();
 
-        let err = load_or_migrate(&settings, None).unwrap_err();
+        let err = load_or_create(&settings).unwrap_err();
         assert!(err.contains("E_CONFIG_PARSE"), "unexpected error: {err}");
         assert!(dir.join("settings.json.bak").exists());
 
-        let recovered = load_or_migrate(&settings, None).expect("defaults");
+        let recovered = load_or_create(&settings).expect("defaults");
         assert_eq!(recovered.role, Role::Controller);
 
         let _ = fs::remove_dir_all(&dir);
