@@ -4,21 +4,23 @@ English | [Chinese](README.md)
 
 Repository: [Luxru/glidelink](https://github.com/Luxru/glidelink)
 
-GlideLink is a software KVM built with Rust and Tauri. It lets one mouse move seamlessly between two computers without extra hardware or drivers.
+GlideLink is a software KVM built with Rust and Tauri. It lets one mouse and keyboard move seamlessly between two computers without extra hardware or drivers.
 
 ## Features
 
-- One physical mouse controlling two computers.
+- One physical mouse and keyboard controlling two computers.
 - Mouse movement, left/right/middle buttons, X1/X2, and wheel.
+- Keyboard follows the mouse: it controls the peer while the pointer is remote and returns locally when the pointer comes back.
+- Standard keyboard, modifiers, and combinations, with optional cross-system Cmd ↔ Ctrl adaptation.
 - Four screen-edge directions with an adjustable offset along the shared edge; drag the peer screen to arrange it like a second display.
 - Pick a network interface and get a self-contained code containing the local IPv4, an automatically chosen port, and a one-time token; SPAKE2 PAKE establishes the session.
-- Low-latency LAN UDP with RTT/jitter-adaptive input pacing.
+- Low-latency LAN UDP with fixed 2ms coalescing and RTT, jitter, and packet-loss readouts.
 - Chinese / English UI.
 - Windows and macOS support.
 
 ## How it works
 
-The controller captures the mouse and, after the pointer crosses a screen edge, sends encrypted input over the LAN to the peer, which injects it. Crossing the same edge in the opposite direction returns control. No cloud service or kernel driver is involved.
+The controller captures the mouse and keyboard and, after the pointer crosses a screen edge, sends encrypted input over the LAN to the peer, which injects it. Crossing the same edge in the opposite direction returns control. No cloud service or kernel driver is involved.
 
 ## Requirements
 
@@ -67,7 +69,7 @@ cargo run --config 'source.crates-io.replace-with="ustc"' \
 
 The code carries the peer IP, port, and verification token, so no address or port needs to be entered separately.
 
-Once connected, move the mouse across the shared edge to control the peer. Cross the same edge in the opposite direction to return.
+Once connected, move the mouse across the shared edge to control the peer; the keyboard follows the mouse. Cross the same edge in the opposite direction to return.
 
 ### 3. Change the language
 
@@ -96,7 +98,7 @@ The file stores the role, selected interface IP, and layout; the one-time pairin
 - A 20-character code carries IPv4, port, a 4-byte random token, and a checksum; SPAKE2 PAKE derives session keys, and ChaCha20-Poly1305 encrypts traffic with directional keys and a replay window.
 - The code is LAN-only and handshake attempts are rate-limited. Never expose the UDP port to the internet.
 - No cloud or accounts. The target is 3–8ms of input feedback on a healthy LAN. The controller heartbeats every 100ms, estimates RTT/jitter with RFC 6298, and shows RFC 3550-style receiver packet loss.
-- Mouse movement is coalesced at a fixed 2ms; buttons and wheel are sent immediately. The agent collapses backlogged pure moves while preserving every button, wheel, and reset transition.
+- Mouse movement is coalesced at a fixed 2ms; mouse buttons and wheel are sent immediately. Keyboard state is sent on every change and refreshed every 100ms; Caps Lock is latched, and returning to the local screen or disconnecting releases all remote keys. The agent collapses backlogged pure moves while preserving every button, wheel, and reset transition.
 - The controller lets the OS choose its egress path. During a session, Windows raises timer resolution and input-thread priority, macOS prevents App Nap and raises QoS, and UDP is marked DSCP EF on a best-effort basis.
 - The PAKE exchange and protocol have not had an independent security audit. See the architecture document for details.
 
@@ -106,7 +108,9 @@ The file stores the role, selected interface IP, and layout; the one-time pairin
 - Protocol v2 does not support older builds; both computers must run the same version.
 - The automatic port range is `45890–45999`; the controller never needs to enter a port.
 - IPv4 only. The code is always 20 characters because it carries the address, port, and token.
-- Mouse only; keyboard forwarding is not implemented.
+- Keyboard follows the mouse and supports the standard keyboard (letters, digits, punctuation, modifiers, arrows, Home/End/Page/Delete, F1–F12, Esc/Tab/Enter/Backspace/Space, Caps Lock); no numpad, media keys, or IME-specific handling.
+- Keys are forwarded as physical HID positions, so both layouts should match. Keys already held before entering the remote stay local; release and press again to forward them.
+- Secure Input, elevated windows, and OS-reserved shortcuts such as Ctrl+Alt+Del cannot be guaranteed. Optional cross-system Cmd ↔ Ctrl adaptation is off by default.
 - One peer; the peer snaps to one of four edges with an offset along that edge. Arbitrary 2D placement, gaps, and overlap are not implemented.
 - Display placement is configured manually; there is no automatic discovery yet.
 - Applications running with elevated privileges may not receive injected events.
@@ -120,7 +124,7 @@ cargo test
 cargo build
 ```
 
-Tests cover the SPAKE2 handshake, encryption, replay protection, coordinate mapping, and a real UDP loopback handshake and input-forwarding path.
+Tests cover the SPAKE2 handshake, encryption, replay protection, coordinate and key mapping, keyboard state planning, and a real UDP loopback handshake with mouse and keyboard forwarding.
 
 On macOS, after granting permissions, run the self-test through the signed app bundle so TCC is attributed to GlideLink:
 

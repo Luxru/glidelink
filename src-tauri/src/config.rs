@@ -34,6 +34,10 @@ pub struct AppConfig {
     /// host edge. Controller-only; defaults to zero for older configs.
     #[serde(default)]
     pub peer_offset: f32,
+    /// Controller-only: map Command <-> Control when the peer runs a
+    /// different operating system. Off by default (strict physical keys).
+    #[serde(default)]
+    pub adapt_modifiers: bool,
 }
 
 impl Default for AppConfig {
@@ -43,6 +47,7 @@ impl Default for AppConfig {
             local_ip: String::new(),
             edge: Edge::Right,
             peer_offset: 0.0,
+            adapt_modifiers: false,
         }
     }
 }
@@ -114,6 +119,7 @@ mod tests {
         let cfg: AppConfig = serde_json::from_str(old).expect("old config parses");
         assert!(cfg.local_ip.is_empty());
         assert_eq!(cfg.peer_offset, 0.0);
+        assert!(!cfg.adapt_modifiers);
     }
 
     #[test]

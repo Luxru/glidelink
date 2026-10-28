@@ -1,3 +1,4 @@
+use crate::input::keymap::{KeyEvent, KeyPacket, KeyState};
 use crate::input::RemoteInput;
 use crate::status::ScreenInfo;
 use chacha20poly1305::aead::AeadInPlace;
@@ -19,16 +20,31 @@ pub const TYPE_PONG: u8 = 5;
 pub const TYPE_BYE: u8 = 6;
 pub const TYPE_CONFIRM: u8 = 7;
 pub const TYPE_CONFIRM_ACK: u8 = 8;
+pub const TYPE_KEY: u8 = 9;
 
 pub const SID_LEN: usize = 8;
 pub const TAG_LEN: usize = 16;
 pub const HEADER_LEN: usize = 4 + 1 + 1 + SID_LEN + 8;
 pub const PAKE_MSG_LEN: usize = 33;
-pub const HELLO_LEN: usize = HEADER_LEN + 4 + 4 + 8 + PAKE_MSG_LEN;
+pub const HELLO_LEN: usize = HEADER_LEN + 4 + 4 + 8 + 1 + PAKE_MSG_LEN;
 pub const ACCEPT_LEN: usize = HELLO_LEN;
 pub const INPUT_LEN: usize = 8;
+pub const KEY_LEN: usize = 34;
 pub const PONG_STATS_LEN: usize = 24;
 pub const CONFIRM_PAYLOAD: &[u8] = b"GlideLink/v2/confirm";
+
+const KEY_FLAG_ACTIVE: u8 = 1 << 0;
+const KEY_FLAG_CAPS_LOCK: u8 = 1 << 1;
+const KEY_EVENT_SHIFT: u8 = 2;
+const KEY_EVENT_MASK: u8 = 0b11 << KEY_EVENT_SHIFT;
+const KEY_EVENT_STATE: u8 = 0;
+const KEY_EVENT_REPEAT: u8 = 1;
+
+pub const PLATFORM_UNKNOWN: u8 = 0;
+#[allow(dead_code)]
+pub const PLATFORM_MACOS: u8 = 1;
+#[allow(dead_code)]
+pub const PLATFORM_WINDOWS: u8 = 2;
 
 const C2A_LABEL: &[u8] = b"GlideLink/v2/controller-to-agent";
 const A2C_LABEL: &[u8] = b"GlideLink/v2/agent-to-controller";
@@ -44,6 +60,7 @@ pub struct Handshake {
     pub sid: [u8; SID_LEN],
     pub screen: ScreenInfo,
     pub timestamp_ms: u64,
+    pub platform: u8,
 }
 
 #[derive(Debug, Error)]
@@ -142,6 +159,7 @@ fn build_pake_packet(kind: u8, handshake: &Handshake, pake_msg: &[u8]) -> Vec<u8
     out.extend_from_slice(&handshake.screen.width.to_le_bytes());
     out.extend_from_slice(&handshake.screen.height.to_le_bytes());
     out.extend_from_slice(&handshake.timestamp_ms.to_le_bytes());
+    out.push(handshake.platform);
     out.extend_from_slice(pake_msg);
     debug_assert_eq!(out.len(), HELLO_LEN);
     out
@@ -156,13 +174,15 @@ fn parse_pake_packet(packet: &[u8], kind: u8) -> Result<(Handshake, Vec<u8>), Pr
     let height = u32::from_le_bytes(packet[HEADER_LEN + 4..HEADER_LEN + 8].try_into().unwrap());
     let timestamp_ms =
         u64::from_le_bytes(packet[HEADER_LEN + 8..HEADER_LEN + 16].try_into().unwrap());
+    let platform = packet[HEADER_LEN + 16];
     Ok((
         Handshake {
             sid,
             screen: ScreenInfo { width, height },
             timestamp_ms,
+            platform,
         },
-        packet[HEADER_LEN + 16..].to_vec(),
+        packet[HEADER_LEN + 17..].to_vec(),
     ))
 }
 
@@ -369,6 +389,57 @@ pub fn decode_input(payload: &[u8]) -> Result<RemoteInput, ProtocolError> {
     })
 }
 
+pub fn encode_key(packet: &KeyPacket) -> [u8; KEY_LEN] {
+    let mut out = [0u8; KEY_LEN];
+    out[..KeyState::BITS].copy_from_slice(packet.state.bits());
+    let mut flags = 0u8;
+    if packet.active {
+        flags |= KEY_FLAG_ACTIVE;
+    }
+    if packet.caps_lock {
+        flags |= KEY_FLAG_CAPS_LOCK;
+    }
+    if let KeyEvent::Repeat(hid) = packet.event {
+        flags |= KEY_EVENT_REPEAT << KEY_EVENT_SHIFT;
+        out[33] = hid;
+    }
+    out[32] = flags;
+    out
+}
+
+pub fn decode_key(payload: &[u8]) -> Result<KeyPacket, ProtocolError> {
+    if payload.len() != KEY_LEN {
+        return Err(ProtocolError::Malformed);
+    }
+    let flags = payload[32];
+    if flags & 0b1111_0000 != 0 {
+        return Err(ProtocolError::Malformed);
+    }
+    let mut bits = [0u8; KeyState::BITS];
+    bits.copy_from_slice(&payload[..KeyState::BITS]);
+    let event = match (flags & KEY_EVENT_MASK) >> KEY_EVENT_SHIFT {
+        KEY_EVENT_STATE => {
+            if payload[33] != 0 {
+                return Err(ProtocolError::Malformed);
+            }
+            KeyEvent::None
+        }
+        KEY_EVENT_REPEAT => {
+            if payload[33] == 0 {
+                return Err(ProtocolError::Malformed);
+            }
+            KeyEvent::Repeat(payload[33])
+        }
+        _ => return Err(ProtocolError::Malformed),
+    };
+    Ok(KeyPacket {
+        active: flags & KEY_FLAG_ACTIVE != 0,
+        caps_lock: flags & KEY_FLAG_CAPS_LOCK != 0,
+        state: KeyState::from_bits(bits),
+        event,
+    })
+}
+
 pub fn encode_u64(value: u64) -> [u8; 8] {
     value.to_le_bytes()
 }
@@ -425,11 +496,13 @@ mod tests {
             sid,
             screen: screen(2560, 1440),
             timestamp_ms: now_ms(),
+            platform: PLATFORM_MACOS,
         };
         let accept = Handshake {
             sid,
             screen: screen(1920, 1080),
             timestamp_ms: now_ms(),
+            platform: PLATFORM_WINDOWS,
         };
         let hello_packet = build_pake_hello(&hello, &[0x41; PAKE_MSG_LEN]);
         let accept_packet = build_pake_accept(&accept, &[0x42; PAKE_MSG_LEN]);
@@ -506,6 +579,50 @@ mod tests {
         let v = 0xdead_beef_cafe_u64;
         assert_eq!(decode_u64(&encode_u64(v)).unwrap(), v);
         assert!(decode_u64(&[0u8; 7]).is_err());
+    }
+
+    #[test]
+    fn key_packet_round_trip_and_validation() {
+        let mut state = KeyState::default();
+        for hid in [0x04, 0xE3, 0xE1] {
+            state.insert(hid);
+        }
+        let packet = KeyPacket {
+            active: true,
+            caps_lock: true,
+            state,
+            event: KeyEvent::Repeat(0x04),
+        };
+        let encoded = encode_key(&packet);
+        assert_eq!(encoded.len(), KEY_LEN);
+        assert_eq!(decode_key(&encoded).unwrap(), packet);
+
+        let inactive = KeyPacket {
+            active: false,
+            caps_lock: false,
+            state: KeyState::default(),
+            event: KeyEvent::None,
+        };
+        assert_eq!(decode_key(&encode_key(&inactive)).unwrap(), inactive);
+
+        assert!(decode_key(&[]).is_err());
+        assert!(decode_key(&[0u8; KEY_LEN - 1]).is_err());
+
+        let mut reserved = encoded;
+        reserved[32] |= 0b1000_0000;
+        assert!(decode_key(&reserved).is_err());
+
+        let mut bad_event = encoded;
+        bad_event[32] = KEY_EVENT_REPEAT << KEY_EVENT_SHIFT;
+        bad_event[33] = 0;
+        assert!(decode_key(&bad_event).is_err());
+
+        let mut state_with_key = inactive;
+        state_with_key.event = KeyEvent::Repeat(0x04);
+        let mut encoded_state = encode_key(&state_with_key);
+        encoded_state[32] = 0;
+        encoded_state[33] = 0x04;
+        assert!(decode_key(&encoded_state).is_err());
     }
 
     #[test]

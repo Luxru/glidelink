@@ -1,6 +1,6 @@
 use crate::config::{self, AppConfig, Role};
 use crate::error;
-use crate::input::{self, CaptureHandle, CaptureShared, InjectMsg};
+use crate::input::{self, CaptureHandle, CaptureMsg, CaptureShared, InjectMsg};
 use crate::net;
 use crate::status::Status;
 use crossbeam_channel::unbounded;
@@ -72,7 +72,7 @@ impl Engine {
         match config.role {
             Role::Controller => {
                 let shared = CaptureShared::new(status.clone());
-                let (tx, rx) = unbounded::<crate::input::RemoteInput>();
+                let (tx, rx) = unbounded::<CaptureMsg>();
                 let net_handle = match net::start_controller(
                     config,
                     pairing_code,

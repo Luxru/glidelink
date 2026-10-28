@@ -1,6 +1,11 @@
 use super::{
-    plan_injection_batch, CaptureHandle, CaptureShared, InjectCursor, InjectMsg, InjectStep,
-    RemoteInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
+    keymap::{
+        hid_to_mac, is_caps, is_modifier, mac_to_hid, KeyEvent, KeyPacket, KeyState, CAPS_LOCK,
+        KEY_DEFS,
+    },
+    plan_injection_batch, CaptureHandle, CaptureMsg, CaptureShared, InjectCursor, InjectMsg,
+    InjectStep, KeyAction, KeyOwnership, RemoteInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT,
+    BUTTON_X1, BUTTON_X2,
 };
 use crate::error;
 use crate::layout::{
@@ -75,6 +80,9 @@ const CG_EVENT_RIGHT_MOUSE_UP: u32 = 4;
 const CG_EVENT_MOUSE_MOVED: u32 = 5;
 const CG_EVENT_LEFT_MOUSE_DRAGGED: u32 = 6;
 const CG_EVENT_RIGHT_MOUSE_DRAGGED: u32 = 7;
+const CG_EVENT_KEY_DOWN: u32 = 10;
+const CG_EVENT_KEY_UP: u32 = 11;
+const CG_EVENT_FLAGS_CHANGED: u32 = 12;
 const CG_EVENT_SCROLL_WHEEL: u32 = 22;
 const CG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
 const CG_EVENT_OTHER_MOUSE_UP: u32 = 26;
@@ -86,6 +94,14 @@ const CG_MOUSE_EVENT_DELTA_X: u32 = 4;
 const CG_MOUSE_EVENT_DELTA_Y: u32 = 5;
 const CG_MOUSE_EVENT_BUTTON_NUMBER: u32 = 3;
 const CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1: u32 = 11;
+const CG_KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
+const CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
+
+const CG_FLAG_ALPHA_SHIFT: u64 = 1 << 16;
+const CG_FLAG_SHIFT: u64 = 1 << 17;
+const CG_FLAG_CONTROL: u64 = 1 << 18;
+const CG_FLAG_ALTERNATE: u64 = 1 << 19;
+const CG_FLAG_COMMAND: u64 = 1 << 20;
 
 const CG_EVENT_SOURCE_STATE_HID_SYSTEM: i32 = 1;
 const CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
@@ -103,6 +119,9 @@ const CG_EVENT_MASK: u64 = (1 << CG_EVENT_LEFT_MOUSE_DOWN)
     | (1 << CG_EVENT_MOUSE_MOVED)
     | (1 << CG_EVENT_LEFT_MOUSE_DRAGGED)
     | (1 << CG_EVENT_RIGHT_MOUSE_DRAGGED)
+    | (1 << CG_EVENT_KEY_DOWN)
+    | (1 << CG_EVENT_KEY_UP)
+    | (1 << CG_EVENT_FLAGS_CHANGED)
     | (1 << CG_EVENT_SCROLL_WHEEL)
     | (1 << CG_EVENT_OTHER_MOUSE_DOWN)
     | (1 << CG_EVENT_OTHER_MOUSE_UP)
@@ -139,7 +158,12 @@ unsafe extern "C" {
         wheel_count: u32,
         ...
     ) -> CGEventRef;
+    fn CGEventCreateKeyboardEvent(source: *mut c_void, key: u16, key_down: u8) -> CGEventRef;
+    fn CGEventSetFlags(event: CGEventRef, flags: u64);
+    fn CGEventGetFlags(event: CGEventRef) -> u64;
     fn CGEventSourceButtonState(state_id: i32, button: u32) -> u8;
+    fn CGEventSourceFlagsState(state_id: i32) -> u64;
+    fn CGEventSourceKeyState(state_id: i32, key: u16) -> u8;
     fn CGMainDisplayID() -> u32;
     fn CGDisplayHideCursor(display: u32) -> i32;
     fn CGDisplayShowCursor(display: u32) -> i32;
@@ -353,7 +377,7 @@ fn warp_cursor(point: CGPoint) {
 
 struct CaptureState {
     shared: Arc<CaptureShared>,
-    tx: Sender<RemoteInput>,
+    tx: Sender<CaptureMsg>,
     edge: Edge,
     offset: f32,
     bounds: CGRect,
@@ -363,6 +387,8 @@ struct CaptureState {
     buttons: u8,
     point: NormPoint,
     cooldown_until: Instant,
+    keys: KeyOwnership,
+    caps_lock: bool,
 }
 
 impl CaptureState {
@@ -373,7 +399,120 @@ impl CaptureState {
             buttons: self.buttons,
             wheel,
         };
-        let _ = self.tx.try_send(input);
+        let _ = self.tx.try_send(CaptureMsg::Mouse(input));
+    }
+
+    fn send_keys(&self, event: KeyEvent) {
+        let packet = KeyPacket {
+            active: true,
+            caps_lock: self.caps_lock,
+            state: self.keys.remote,
+            event,
+        };
+        let _ = self.tx.try_send(CaptureMsg::Keys(packet));
+    }
+
+    fn send_inactive_keys(&self) {
+        let packet = KeyPacket {
+            active: false,
+            caps_lock: self.caps_lock,
+            state: KeyState::default(),
+            event: KeyEvent::None,
+        };
+        let _ = self.tx.try_send(CaptureMsg::Keys(packet));
+    }
+
+    fn apply_key_action(&mut self, action: KeyAction, hid: u8, event: CGEventRef) -> CGEventRef {
+        match action {
+            KeyAction::Down => {
+                self.send_keys(KeyEvent::None);
+                std::ptr::null_mut()
+            }
+            KeyAction::Up => {
+                self.send_keys(KeyEvent::None);
+                std::ptr::null_mut()
+            }
+            KeyAction::Repeat => {
+                self.send_keys(KeyEvent::Repeat(hid));
+                std::ptr::null_mut()
+            }
+            KeyAction::Passthrough => event,
+            KeyAction::Swallow => std::ptr::null_mut(),
+        }
+    }
+
+    fn handle_key_event(&mut self, event_type: u32, event: CGEventRef) -> CGEventRef {
+        if !self.active {
+            return event;
+        }
+
+        let keycode =
+            unsafe { CGEventGetIntegerValueField(event, CG_KEYBOARD_EVENT_KEYCODE) } as u16;
+        let Some(hid) = mac_to_hid(keycode) else {
+            // Unsupported keys are swallowed while remote, except their release
+            // so a key held before activation cannot stick locally.
+            return if event_type == CG_EVENT_KEY_UP {
+                event
+            } else {
+                std::ptr::null_mut()
+            };
+        };
+
+        if is_caps(hid) {
+            let caps = unsafe { CGEventGetFlags(event) & CG_FLAG_ALPHA_SHIFT != 0 };
+            if caps != self.caps_lock {
+                self.caps_lock = caps;
+                self.send_keys(KeyEvent::None);
+            }
+            return std::ptr::null_mut();
+        }
+
+        if event_type == CG_EVENT_FLAGS_CHANGED {
+            if is_modifier(hid) {
+                let was_down = self.keys.local.contains(hid) || self.keys.remote.contains(hid);
+                let action = if was_down {
+                    self.keys.key_up(true, hid)
+                } else {
+                    self.keys.key_down(true, hid)
+                };
+                return self.apply_key_action(action, hid, event);
+            }
+            return std::ptr::null_mut();
+        }
+
+        if is_modifier(hid) {
+            // Modifier transitions arrive as flagsChanged; ignore duplicates.
+            return std::ptr::null_mut();
+        }
+
+        if event_type == CG_EVENT_KEY_DOWN {
+            let repeat =
+                unsafe { CGEventGetIntegerValueField(event, CG_KEYBOARD_EVENT_AUTOREPEAT) } != 0;
+            let action = self.keys.key_down(true, hid);
+            if repeat {
+                match action {
+                    KeyAction::Repeat => self.apply_key_action(KeyAction::Repeat, hid, event),
+                    KeyAction::Down => {
+                        self.send_keys(KeyEvent::None);
+                        std::ptr::null_mut()
+                    }
+                    _ => std::ptr::null_mut(),
+                }
+            } else {
+                match action {
+                    KeyAction::Down | KeyAction::Repeat => {
+                        self.send_keys(KeyEvent::None);
+                        std::ptr::null_mut()
+                    }
+                    _ => std::ptr::null_mut(),
+                }
+            }
+        } else if event_type == CG_EVENT_KEY_UP {
+            let action = self.keys.key_up(true, hid);
+            self.apply_key_action(action, hid, event)
+        } else {
+            std::ptr::null_mut()
+        }
     }
 
     fn at_edge(&self, location: CGPoint) -> bool {
@@ -414,7 +553,19 @@ impl CaptureState {
                     CGEventTapEnable(self.tap, 1);
                 }
             }
+            if self.active {
+                let held = current_held_keys();
+                self.keys.rebind(held);
+                self.send_keys(KeyEvent::None);
+            }
             return event;
+        }
+
+        if matches!(
+            event_type,
+            CG_EVENT_KEY_DOWN | CG_EVENT_KEY_UP | CG_EVENT_FLAGS_CHANGED
+        ) {
+            return self.handle_key_event(event_type, event);
         }
 
         let location = unsafe { CGEventGetLocation(event) };
@@ -521,6 +672,8 @@ impl CaptureState {
         };
         self.active = true;
         self.shared.set_active(true);
+        self.keys.begin(current_held_keys());
+        self.caps_lock = current_caps_lock();
         if !self.hidden {
             hide_cursor();
             unsafe {
@@ -528,6 +681,7 @@ impl CaptureState {
             }
             self.hidden = true;
         }
+        self.send_keys(KeyEvent::None);
         self.send(0);
     }
 
@@ -545,6 +699,8 @@ impl CaptureState {
         self.active = false;
         self.buttons = 0;
         self.point = self.point.clamped();
+        self.send_inactive_keys();
+        self.keys.deactivate();
         self.send(0);
         self.shared.set_active(false);
 
@@ -567,6 +723,23 @@ impl CaptureState {
     }
 }
 
+fn current_held_keys() -> KeyState {
+    let mut held = KeyState::default();
+    for def in KEY_DEFS {
+        if is_caps(def.hid) {
+            continue;
+        }
+        if unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, def.mac) } != 0 {
+            held.insert(def.hid);
+        }
+    }
+    held
+}
+
+fn current_caps_lock() -> bool {
+    unsafe { CGEventSourceFlagsState(CG_EVENT_SOURCE_STATE_HID_SYSTEM) & CG_FLAG_ALPHA_SHIFT != 0 }
+}
+
 unsafe extern "C" fn event_tap_callback(
     _proxy: *mut c_void,
     event_type: u32,
@@ -582,7 +755,7 @@ unsafe extern "C" fn event_tap_callback(
 
 pub fn start_capture(
     shared: Arc<CaptureShared>,
-    tx: Sender<RemoteInput>,
+    tx: Sender<CaptureMsg>,
     edge: Edge,
     offset: f32,
 ) -> Result<CaptureHandle, String> {
@@ -617,7 +790,7 @@ pub fn start_capture(
 
 fn run_capture_thread(
     shared: Arc<CaptureShared>,
-    tx: Sender<RemoteInput>,
+    tx: Sender<CaptureMsg>,
     edge: Edge,
     offset: f32,
     bounds: CGRect,
@@ -636,6 +809,8 @@ fn run_capture_thread(
         buttons: 0,
         point: NormPoint::default(),
         cooldown_until: Instant::now(),
+        keys: KeyOwnership::default(),
+        caps_lock: false,
     });
     let state_ptr = (&mut *state) as *mut CaptureState;
 
@@ -752,6 +927,10 @@ fn injector_loop(
     let _ = ready_tx.send(Ok(()));
     let mut applied_buttons = 0u8;
     let mut applied_position: Option<(u16, u16)> = None;
+    let mut applied_keys = KeyState::default();
+    let mut caps_actual = unsafe {
+        CGEventSourceFlagsState(CG_EVENT_SOURCE_STATE_HID_SYSTEM) & CG_FLAG_ALPHA_SHIFT != 0
+    };
     let mut cursor = InjectCursor::default();
     let mut batch = Vec::with_capacity(16);
     let mut steps = Vec::with_capacity(16);
@@ -802,19 +981,112 @@ fn injector_loop(
                         CFRelease(event as *const c_void);
                     }
                 },
+                InjectStep::KeyPress(hid) => {
+                    if !applied_keys.contains(hid) {
+                        applied_keys.insert(hid);
+                        post_key_event(hid, true, false, &applied_keys, caps_actual);
+                    }
+                }
+                InjectStep::KeyRelease(hid) => {
+                    if applied_keys.contains(hid) {
+                        applied_keys.remove(hid);
+                        post_key_event(hid, false, false, &applied_keys, caps_actual);
+                    }
+                }
+                InjectStep::KeyRepeat(hid) => {
+                    if applied_keys.contains(hid) {
+                        post_key_event(hid, true, true, &applied_keys, caps_actual);
+                    }
+                }
+                InjectStep::CapsLock(desired) => {
+                    if desired != caps_actual {
+                        inject_caps_tap(caps_actual, &applied_keys);
+                        caps_actual = desired;
+                    }
+                }
                 InjectStep::Reset => {
+                    release_keys(&mut applied_keys, caps_actual);
                     let point = applied_point_or_origin(applied_position, bounds);
                     apply_button_transitions(applied_buttons, 0, point);
                     applied_buttons = 0;
                     applied_position = None;
+                    caps_actual = current_caps_lock();
                 }
             }
         }
     }
 
+    release_keys(&mut applied_keys, caps_actual);
     if applied_buttons != 0 {
         let point = applied_point_or_origin(applied_position, bounds);
         apply_button_transitions(applied_buttons, 0, point);
+    }
+}
+
+fn mac_flags(keys: &KeyState, caps_lock: bool) -> u64 {
+    let mut flags = 0;
+    if keys.contains(0xE1) || keys.contains(0xE5) {
+        flags |= CG_FLAG_SHIFT;
+    }
+    if keys.contains(0xE0) || keys.contains(0xE4) {
+        flags |= CG_FLAG_CONTROL;
+    }
+    if keys.contains(0xE2) || keys.contains(0xE6) {
+        flags |= CG_FLAG_ALTERNATE;
+    }
+    if keys.contains(0xE3) || keys.contains(0xE7) {
+        flags |= CG_FLAG_COMMAND;
+    }
+    if caps_lock {
+        flags |= CG_FLAG_ALPHA_SHIFT;
+    }
+    flags
+}
+
+fn post_key_event(hid: u8, down: bool, repeat: bool, keys: &KeyState, caps_lock: bool) {
+    let Some(keycode) = hid_to_mac(hid) else {
+        return;
+    };
+    unsafe {
+        let event = CGEventCreateKeyboardEvent(null_mut(), keycode, if down { 1 } else { 0 });
+        if event.is_null() {
+            return;
+        }
+        CGEventSetFlags(event, mac_flags(keys, caps_lock));
+        if repeat {
+            CGEventSetIntegerValueField(event, CG_KEYBOARD_EVENT_AUTOREPEAT, 1);
+        }
+        CGEventPost(CG_TAP_LOCATION_HID, event);
+        CFRelease(event as *const c_void);
+    }
+}
+
+fn inject_caps_tap(caps_before: bool, keys: &KeyState) {
+    let Some(keycode) = hid_to_mac(CAPS_LOCK) else {
+        return;
+    };
+    unsafe {
+        for down in [1u8, 0u8] {
+            let event = CGEventCreateKeyboardEvent(null_mut(), keycode, down);
+            if !event.is_null() {
+                CGEventSetFlags(event, mac_flags(keys, caps_before));
+                CGEventPost(CG_TAP_LOCATION_HID, event);
+                CFRelease(event as *const c_void);
+            }
+        }
+    }
+}
+
+fn release_keys(keys: &mut KeyState, caps_lock: bool) {
+    let mut hids: Vec<u8> = keys.iter().collect();
+    hids.sort_unstable();
+    for hid in hids.iter().copied().filter(|hid| !is_modifier(*hid)) {
+        keys.remove(hid);
+        post_key_event(hid, false, false, keys, caps_lock);
+    }
+    for hid in hids.iter().copied().filter(|hid| is_modifier(*hid)) {
+        keys.remove(hid);
+        post_key_event(hid, false, false, keys, caps_lock);
     }
 }
 
@@ -1021,7 +1293,7 @@ fn test_capture(bounds: CGRect) -> Result<(), String> {
     let shared = CaptureShared::new(status);
     // Pretend a peer is connected so edge crossing activates immediately.
     shared.set_peer(1920, 1080);
-    let (tx, rx) = crossbeam_channel::unbounded::<RemoteInput>();
+    let (tx, rx) = crossbeam_channel::unbounded::<CaptureMsg>();
     let handle = start_capture(Arc::clone(&shared), tx, Edge::Right, 0.0)?;
     let saved = cursor_location();
 
@@ -1048,10 +1320,18 @@ fn test_capture(bounds: CGRect) -> Result<(), String> {
         CFRelease(event as *const c_void);
     }
 
-    let result = rx
-        .recv_timeout(Duration::from_secs(1))
-        .map(|_| ())
-        .map_err(|_| "no input was captured after a synthetic edge crossing".to_string());
+    let result = (|| {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(CaptureMsg::Mouse(_)) => return Ok(()),
+                Ok(CaptureMsg::Keys(_)) => continue,
+                Err(_) => {
+                    return Err("no input was captured after a synthetic edge crossing".to_string())
+                }
+            }
+        }
+    })();
 
     handle.stop_and_join();
     unsafe {

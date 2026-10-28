@@ -10,6 +10,8 @@ const els = {
   languageSelect: document.getElementById("languageSelect"),
   roleOptions: [...document.querySelectorAll(".role-option")],
   agentFields: document.getElementById("agentFields"),
+  controllerFields: document.getElementById("controllerFields"),
+  adaptModifiers: document.getElementById("adaptModifiers"),
   interfaceSelect: document.getElementById("interfaceSelect"),
   selectedIp: document.getElementById("selectedIp"),
   codeCells: [...document.querySelectorAll(".code-cell")],
@@ -32,6 +34,7 @@ const els = {
   latencyValue: document.getElementById("latencyValue"),
   localScreenText: document.getElementById("localScreenText"),
   peerText: document.getElementById("peerText"),
+  keyboardText: document.getElementById("keyboardText"),
   permissionCard: document.getElementById("permissionCard"),
   permissionBtn: document.getElementById("permissionBtn"),
   reopenBtn: document.getElementById("reopenBtn"),
@@ -551,6 +554,7 @@ function setRole(role, syncControls = true) {
     option.setAttribute("aria-checked", String(active));
   }
   els.agentFields.hidden = ui.role !== "agent";
+  els.controllerFields.hidden = ui.role !== "controller";
   els.hostScreenLabel.textContent = t("common.thisDevice");
   els.remoteScreenLabel.textContent = ui.role === "controller"
     ? t("common.peerControlled")
@@ -597,6 +601,7 @@ function applyState(state) {
   if (config && !ui.initialized) {
     ui.configLocalIp = config.localIp || "";
     ui.interfaces = Array.isArray(state.localInterfaces) ? state.localInterfaces : [];
+    els.adaptModifiers.checked = Boolean(config.adaptModifiers);
     setRole(config.role, false);
     setEdge(config.edge);
     setOffset(config.peerOffset ?? 0);
@@ -649,6 +654,11 @@ function applyState(state) {
   els.latencyValue.textContent = latency == null ? "—" : `${latency.toFixed(1)} ms`;
   els.latencyDot.className = `latency-dot${connected && latency != null ? (latency < 10 ? " good" : " warn") : ""}`;
   els.peerText.textContent = status.peer || t("common.notConnected");
+  els.keyboardText.textContent = !ui.running || !connected
+    ? "—"
+    : active
+      ? t("status.keyboardRemote")
+      : t("status.keyboardLocal");
   els.remoteBadge.hidden = !active;
   els.layoutStage.classList.toggle("remote-active", active);
   els.layoutStage.classList.toggle("is-connected", connected);
@@ -748,6 +758,7 @@ async function startSession(event) {
         localIp: ui.role === "agent" ? ui.selectedIp : "",
         edge: ui.edge,
         peerOffset: ui.role === "agent" ? 0 : clampedOffset(),
+        adaptModifiers: ui.role === "controller" && els.adaptModifiers.checked,
       },
       pairingCode,
     }));

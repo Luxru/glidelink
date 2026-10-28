@@ -139,6 +139,14 @@
                 </div>
                 <div class="separator"></div>
 
+                <div id="controllerFields">
+                  <div class="setting-row">
+                    <label for="adaptModifiers" data-i18n="connection.adaptModifiers">Cross-system Cmd ↔ Ctrl</label>
+                    <input id="adaptModifiers" class="toggle-input" type="checkbox" />
+                  </div>
+                  <div class="separator"></div>
+                </div>
+
                 <div class="setting-row passcode-row">
                   <label for="passcode" data-i18n="connection.passcode">Pairing code</label>
                   <div class="input-with-actions">
@@ -172,6 +180,10 @@
                   <div class="status-metric">
                     <span data-i18n="status.rtt">Network RTT</span>
                     <strong><i class="latency-dot" id="latencyDot"></i><span id="latencyValue">—</span></strong>
+                  </div>
+                  <div class="status-metric">
+                    <span data-i18n="status.keyboard">Keyboard</span>
+                    <strong id="keyboardText">—</strong>
                   </div>
                 </div>
               </div>

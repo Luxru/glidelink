@@ -1,6 +1,11 @@
 use super::{
-    plan_injection_batch, CaptureHandle, CaptureShared, InjectCursor, InjectMsg, InjectStep,
-    RemoteInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
+    keymap::{
+        hid_to_scan, is_caps, is_modifier, scan_to_hid, KeyEvent, KeyPacket, KeyState, CAPS_LOCK,
+        KEY_DEFS,
+    },
+    plan_injection_batch, CaptureHandle, CaptureMsg, CaptureShared, InjectCursor, InjectMsg,
+    InjectStep, KeyAction, KeyOwnership, RemoteInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT,
+    BUTTON_X1, BUTTON_X2,
 };
 use crate::error;
 use crate::layout::{
@@ -20,15 +25,19 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{mouse_event, GetAsyncKeyState};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    mouse_event, GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, VK_CAPITAL,
+};
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetMessageW, GetSystemMetrics, KillTimer, PostQuitMessage, RegisterClassW, SetCursorPos,
-    SetTimer, SetWindowsHookExW, ShowCursor, TranslateMessage, UnhookWindowsHookEx, MSG,
-    MSLLHOOKSTRUCT, WNDCLASSW,
+    SetTimer, SetWindowsHookExW, ShowCursor, TranslateMessage, UnhookWindowsHookEx,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL,
+    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
 };
 
 const WH_MOUSE_LL: i32 = 14;
@@ -92,7 +101,7 @@ enum HookAction {
 
 struct CaptureState {
     shared: Arc<CaptureShared>,
-    tx: Sender<RemoteInput>,
+    tx: Sender<CaptureMsg>,
     edge: Edge,
     offset: f32,
     vx: i32,
@@ -106,11 +115,15 @@ struct CaptureState {
     buttons: u8,
     point: NormPoint,
     cooldown_until: Instant,
+    keys: KeyOwnership,
+    caps_lock: bool,
+    caps_down: bool,
 }
 
 thread_local! {
     static CAPTURE: RefCell<Option<CaptureState>> = RefCell::new(None);
     static HOOK: Cell<*mut c_void> = Cell::new(null_mut());
+    static HOOK_KEYBOARD: Cell<*mut c_void> = Cell::new(null_mut());
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -132,7 +145,27 @@ impl CaptureState {
             buttons: self.buttons,
             wheel,
         };
-        let _ = self.tx.try_send(input);
+        let _ = self.tx.try_send(CaptureMsg::Mouse(input));
+    }
+
+    fn send_keys(&self, event: KeyEvent) {
+        let packet = KeyPacket {
+            active: true,
+            caps_lock: self.caps_lock,
+            state: self.keys.remote,
+            event,
+        };
+        let _ = self.tx.try_send(CaptureMsg::Keys(packet));
+    }
+
+    fn send_inactive_keys(&self) {
+        let packet = KeyPacket {
+            active: false,
+            caps_lock: self.caps_lock,
+            state: KeyState::default(),
+            event: KeyEvent::None,
+        };
+        let _ = self.tx.try_send(CaptureMsg::Keys(packet));
     }
 
     fn at_edge(&self) -> bool {
@@ -221,6 +254,67 @@ impl CaptureState {
         }
     }
 
+    fn handle_key_hook(&mut self, code: i32, wparam: WPARAM, lparam: LPARAM) -> HookAction {
+        if code < 0 || !self.active {
+            return HookAction::Pass;
+        }
+        let message = wparam as u32;
+        let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+        let up = matches!(message, WM_KEYUP | WM_SYSKEYUP);
+        if !down && !up {
+            return HookAction::Pass;
+        }
+
+        let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+        if info.flags & LLKHF_INJECTED != 0 {
+            return HookAction::Pass;
+        }
+        let extended = info.flags & LLKHF_EXTENDED != 0;
+        let Some(hid) = scan_to_hid(info.scanCode as u16, extended) else {
+            return if up {
+                HookAction::Pass
+            } else {
+                HookAction::Swallow
+            };
+        };
+
+        if is_caps(hid) {
+            if down {
+                if !self.caps_down {
+                    self.caps_down = true;
+                    self.caps_lock = !self.caps_lock;
+                    self.send_keys(KeyEvent::None);
+                }
+            } else {
+                self.caps_down = false;
+            }
+            return HookAction::Swallow;
+        }
+
+        if down {
+            match self.keys.key_down(true, hid) {
+                KeyAction::Down => {
+                    self.send_keys(KeyEvent::None);
+                    HookAction::Swallow
+                }
+                KeyAction::Repeat => {
+                    self.send_keys(KeyEvent::Repeat(hid));
+                    HookAction::Swallow
+                }
+                _ => HookAction::Swallow,
+            }
+        } else {
+            match self.keys.key_up(true, hid) {
+                KeyAction::Up => {
+                    self.send_keys(KeyEvent::None);
+                    HookAction::Swallow
+                }
+                KeyAction::Passthrough => HookAction::Pass,
+                _ => HookAction::Swallow,
+            }
+        }
+    }
+
     fn handle_raw(&mut self, dx: f64, dy: f64) {
         if self.active {
             self.point = advance(self.point, dx, dy, self.vw, self.vh);
@@ -261,6 +355,9 @@ impl CaptureState {
         );
         self.point = entry_point(self.edge, host, self.offset);
         self.buttons = unsafe { query_buttons() };
+        self.keys.rebind(unsafe { query_held_keys() });
+        self.caps_lock = unsafe { query_caps_lock() };
+        self.caps_down = false;
         self.active = true;
         self.armed = false;
         self.shared.set_active(true);
@@ -270,6 +367,7 @@ impl CaptureState {
             }
             self.hidden = true;
         }
+        self.send_keys(KeyEvent::None);
         self.send(0);
     }
 
@@ -286,6 +384,9 @@ impl CaptureState {
         self.active = false;
         self.buttons = 0;
         self.point = self.point.clamped();
+        self.send_inactive_keys();
+        self.keys.deactivate();
+        self.caps_down = false;
         self.send(0);
         self.shared.set_active(false);
 
@@ -329,6 +430,23 @@ impl CaptureState {
     }
 }
 
+unsafe fn query_held_keys() -> KeyState {
+    let mut held = KeyState::default();
+    for def in KEY_DEFS {
+        if is_caps(def.hid) {
+            continue;
+        }
+        if GetAsyncKeyState(def.vk as i32) as u16 & 0x8000 != 0 {
+            held.insert(def.hid);
+        }
+    }
+    held
+}
+
+unsafe fn query_caps_lock() -> bool {
+    GetAsyncKeyState(VK_CAPITAL as i32) as u16 & 1 != 0
+}
+
 unsafe fn query_buttons() -> u8 {
     let mut buttons = 0u8;
     if GetAsyncKeyState(VK_LBUTTON) as u16 & 0x8000 != 0 {
@@ -359,6 +477,19 @@ unsafe extern "system" fn low_level_mouse_proc(
     match action {
         HookAction::Swallow => 1,
         HookAction::Pass => CallNextHookEx(HOOK.with(|h| h.get()), code, wparam, lparam),
+    }
+}
+
+unsafe extern "system" fn low_level_keyboard_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let action =
+        with_state(|state| state.handle_key_hook(code, wparam, lparam)).unwrap_or(HookAction::Pass);
+    match action {
+        HookAction::Swallow => 1,
+        HookAction::Pass => CallNextHookEx(HOOK_KEYBOARD.with(|h| h.get()), code, wparam, lparam),
     }
 }
 
@@ -425,7 +556,7 @@ pub fn open_permissions() -> Result<(), String> {
 
 pub fn start_capture(
     shared: Arc<CaptureShared>,
-    tx: Sender<RemoteInput>,
+    tx: Sender<CaptureMsg>,
     edge: Edge,
     offset: f32,
 ) -> Result<CaptureHandle, String> {
@@ -453,7 +584,7 @@ pub fn start_capture(
 
 fn run_capture_thread(
     shared: Arc<CaptureShared>,
-    tx: Sender<RemoteInput>,
+    tx: Sender<CaptureMsg>,
     edge: Edge,
     offset: f32,
     ready_tx: mpsc::Sender<Result<(), String>>,
@@ -539,11 +670,29 @@ fn run_capture_thread(
     }
     HOOK.with(|h| h.set(hook));
 
-    let timer = unsafe { SetTimer(hwnd, TIMER_ID, TIMER_INTERVAL_MS, None) };
-    if timer == 0 {
+    let keyboard_hook =
+        unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), hinstance, 0) };
+    if keyboard_hook.is_null() {
         HOOK.with(|h| h.set(null_mut()));
         unsafe {
             let _ = UnhookWindowsHookEx(hook);
+            DestroyWindow(hwnd);
+        }
+        let _ = ready_tx.send(Err(error::detail(
+            "E_KEYBOARD_HOOK",
+            std::io::Error::last_os_error(),
+        )));
+        return;
+    }
+    HOOK_KEYBOARD.with(|h| h.set(keyboard_hook));
+
+    let timer = unsafe { SetTimer(hwnd, TIMER_ID, TIMER_INTERVAL_MS, None) };
+    if timer == 0 {
+        HOOK.with(|h| h.set(null_mut()));
+        HOOK_KEYBOARD.with(|h| h.set(null_mut()));
+        unsafe {
+            let _ = UnhookWindowsHookEx(hook);
+            let _ = UnhookWindowsHookEx(keyboard_hook);
             DestroyWindow(hwnd);
         }
         let _ = ready_tx.send(Err(error::code("E_CAPTURE_TIMER")));
@@ -570,6 +719,9 @@ fn run_capture_thread(
         buttons: 0,
         point: NormPoint::default(),
         cooldown_until: Instant::now(),
+        keys: KeyOwnership::default(),
+        caps_lock: false,
+        caps_down: false,
     };
     CAPTURE.with(|slot| {
         *slot.borrow_mut() = Some(state);
@@ -604,9 +756,11 @@ fn run_capture_thread(
         slot.borrow_mut().take();
     });
     HOOK.with(|h| h.set(null_mut()));
+    HOOK_KEYBOARD.with(|h| h.set(null_mut()));
     unsafe {
         let _ = KillTimer(hwnd, TIMER_ID);
         let _ = UnhookWindowsHookEx(hook);
+        let _ = UnhookWindowsHookEx(keyboard_hook);
         let _ = DestroyWindow(hwnd);
     }
 }
@@ -637,6 +791,8 @@ fn injector_loop(
     crate::sched::boost_current_thread();
     let _ = ready_tx.send(Ok(()));
     let mut applied_buttons = 0u8;
+    let mut applied_keys = KeyState::default();
+    let mut caps_actual = unsafe { GetAsyncKeyState(VK_CAPITAL as i32) as u16 & 1 != 0 };
     let mut cursor = InjectCursor::default();
     let mut batch = Vec::with_capacity(16);
     let mut steps = Vec::with_capacity(16);
@@ -677,14 +833,41 @@ fn injector_loop(
                 InjectStep::Wheel(delta) => unsafe {
                     mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta as i32 * WHEEL_DELTA, 0);
                 },
+                InjectStep::KeyPress(hid) => {
+                    if !applied_keys.contains(hid) {
+                        applied_keys.insert(hid);
+                        send_key_hid(hid, true);
+                    }
+                }
+                InjectStep::KeyRelease(hid) => {
+                    if applied_keys.contains(hid) {
+                        applied_keys.remove(hid);
+                        send_key_hid(hid, false);
+                    }
+                }
+                InjectStep::KeyRepeat(hid) => {
+                    if applied_keys.contains(hid) {
+                        send_key_hid(hid, true);
+                    }
+                }
+                InjectStep::CapsLock(desired) => {
+                    if desired != caps_actual {
+                        send_key_hid(CAPS_LOCK, true);
+                        send_key_hid(CAPS_LOCK, false);
+                        caps_actual = desired;
+                    }
+                }
                 InjectStep::Reset => {
+                    release_keys(&mut applied_keys);
                     apply_button_transitions(applied_buttons, 0);
                     applied_buttons = 0;
+                    caps_actual = unsafe { query_caps_lock() };
                 }
             }
         }
     }
 
+    release_keys(&mut applied_keys);
     if applied_buttons != 0 {
         apply_button_transitions(applied_buttons, 0);
     }
@@ -692,6 +875,45 @@ fn injector_loop(
         s.last_error_code = None;
         s.last_error_detail = None;
     });
+}
+
+fn send_key_hid(hid: u8, down: bool) -> bool {
+    let Some((scan, extended)) = hid_to_scan(hid) else {
+        return false;
+    };
+    let mut flags = KEYEVENTF_SCANCODE;
+    if extended {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    if !down {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: 0,
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) == 1 }
+}
+
+fn release_keys(keys: &mut KeyState) {
+    let mut hids: Vec<u8> = keys.iter().collect();
+    hids.sort_unstable();
+    for hid in hids.iter().copied().filter(|hid| !is_modifier(*hid)) {
+        keys.remove(hid);
+        send_key_hid(hid, false);
+    }
+    for hid in hids.iter().copied().filter(|hid| is_modifier(*hid)) {
+        keys.remove(hid);
+        send_key_hid(hid, false);
+    }
 }
 
 fn apply_button_transitions(previous: u8, current: u8) {

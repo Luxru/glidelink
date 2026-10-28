@@ -474,6 +474,18 @@ input {
   flex: 0 0 auto;
 }
 
+.toggle-input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.toggle-input:disabled {
+  cursor: default;
+}
+
 .setting-row .value {
   display: inline-flex;
   align-items: center;
