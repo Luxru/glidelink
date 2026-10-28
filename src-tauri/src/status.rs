@@ -35,6 +35,10 @@ pub struct RuntimeStatus {
     pub packets_received: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub jitter_ms: Option<f64>,
+    pub input_interval_ms: Option<f64>,
+    pub packet_loss_percent: Option<f64>,
+    pub pairing_code: Option<String>,
 }
 
 #[derive(Default)]

@@ -11,7 +11,8 @@ GlideLink is a software KVM built with Rust and Tauri. It lets one mouse move se
 - One physical mouse controlling two computers.
 - Mouse movement, left/right/middle buttons, X1/X2, and wheel.
 - Four screen-edge directions with an adjustable offset along the shared edge; drag the peer screen to arrange it like a second display.
-- Low-latency LAN UDP transport with encryption, heartbeats, and automatic reconnection.
+- Pick a network interface and get a self-contained code containing the local IPv4, an automatically chosen port, and a one-time token; SPAKE2 PAKE establishes the session.
+- Low-latency LAN UDP with RTT/jitter-adaptive input pacing.
 - Chinese / English UI.
 - Windows and macOS support.
 
@@ -53,20 +54,18 @@ cargo run --config 'source.crates-io.replace-with="ustc"' \
 
 ### 1. Start the controlled computer
 
-1. Select **Controlled PC**.
-2. Set the listening port (default: `45890`).
-3. Enter a pairing code, or click **Regenerate**.
-4. Click **Start listening**.
-5. Allow the UDP port on private networks in the system firewall.
-6. Note this computer's LAN IP address.
+1. Select **Controlled PC** and choose a network interface; the app immediately generates a 20-character code (5 groups of 4).
+2. Click **Start listening**; the app listens on the port carried by the code.
+3. Allow the app's UDP traffic on private networks in the system firewall.
 
 ### 2. Start the controller
 
 1. Select **Controller**.
-2. Enter the peer address, for example `192.168.1.42:45890`.
-3. Enter exactly the same pairing code.
-4. Open **Display layout** and drag the peer screen to the side of this device; slide it along the edge to set the offset.
-5. Click **Start controlling**.
+2. Enter or paste the 20-character code shown on the controlled computer (whole-code paste is supported).
+3. Open **Display layout** and drag the peer screen to the side of this device; slide it along the edge to set the offset.
+4. Click **Start controlling**.
+
+The code carries the peer IP, port, and verification token, so no address or port needs to be entered separately.
 
 Once connected, move the mouse across the shared edge to control the peer. Cross the same edge in the opposite direction to return.
 
@@ -81,7 +80,7 @@ macOS requires:
 - System Settings → Privacy & Security → Accessibility
 - System Settings → Privacy & Security → Input Monitoring
 
-Click **Open System Settings** in the app to show the system prompt and open the pane for the permission that is still missing. Relaunch the app after granting permissions. macOS associates these grants with the built executable, so an unsigned development build may need to be granted again after it is rebuilt. On Windows, GlideLink must also run as administrator if you need to control elevated windows.
+Click **Open System Settings** in the app to show the system prompt and open the pane for the permission that is still missing. After granting permissions, click **Reopen** to restart the app. macOS associates these grants with the built executable, so an unsigned development build may need to be granted again after it is rebuilt. On Windows, GlideLink must also run as administrator if you need to control elevated windows.
 
 ## Configuration
 
@@ -90,18 +89,23 @@ Configuration file locations:
 - Windows: `%APPDATA%\io.glidelink.desktop\config.json`
 - macOS: `~/Library/Application Support/io.glidelink.desktop/config.json`
 
-The file contains the pairing code. Keep it readable only by your user account.
+The file stores the role, selected interface IP, and layout; the one-time pairing code is never written to disk.
 
 ## Security and latency
 
-- PBKDF2-HMAC-SHA256 derives keys; ChaCha20-Poly1305 encrypts traffic with directional keys and a replay window.
-- The pairing code is the only authentication secret. Use it only on a trusted LAN and never expose the UDP port to the internet.
-- No cloud or accounts. The target is 3–8ms of input feedback on a healthy LAN; the in-app RTT is network round-trip time only.
-- The protocol has not had an independent security audit. See the architecture document for details.
+- A 20-character code carries IPv4, port, a 4-byte random token, and a checksum; SPAKE2 PAKE derives session keys, and ChaCha20-Poly1305 encrypts traffic with directional keys and a replay window.
+- The code is LAN-only and handshake attempts are rate-limited. Never expose the UDP port to the internet.
+- No cloud or accounts. The target is 3–8ms of input feedback on a healthy LAN. The controller heartbeats every 100ms, estimates RTT/jitter with RFC 6298, and shows RFC 3550-style receiver packet loss.
+- Mouse movement is coalesced at a fixed 2ms; buttons and wheel are sent immediately. The agent collapses backlogged pure moves while preserving every button, wheel, and reset transition.
+- The controller lets the OS choose its egress path. During a session, Windows raises timer resolution and input-thread priority, macOS prevents App Nap and raises QoS, and UDP is marked DSCP EF on a best-effort basis.
+- The PAKE exchange and protocol have not had an independent security audit. See the architecture document for details.
 
 ## Status and limitations
 
 - The Windows backend type-checks for `x86_64-pc-windows-msvc`; macOS capture and injection pass `--self-test` on macOS 13.6 (Intel). A real Windows ↔ macOS pair, Apple Silicon, signing, and notarization are still unverified.
+- Protocol v2 does not support older builds; both computers must run the same version.
+- The automatic port range is `45890–45999`; the controller never needs to enter a port.
+- IPv4 only. The code is always 20 characters because it carries the address, port, and token.
 - Mouse only; keyboard forwarding is not implemented.
 - One peer; the peer snaps to one of four edges with an offset along that edge. Arbitrary 2D placement, gaps, and overlap are not implemented.
 - Display placement is configured manually; there is no automatic discovery yet.
@@ -116,15 +120,17 @@ cargo test
 cargo build
 ```
 
-Tests cover the protocol, encryption, replay protection, coordinate mapping, and a real UDP loopback handshake and input-forwarding path.
+Tests cover the SPAKE2 handshake, encryption, replay protection, coordinate mapping, and a real UDP loopback handshake and input-forwarding path.
 
-On macOS, after granting permissions, verify the input backend without starting the UI:
+On macOS, after granting permissions, run the self-test through the signed app bundle so TCC is attributed to GlideLink:
 
 ```bash
-cargo run -- --self-test
+open -n -W -o /tmp/glidelink-selftest.out --stderr /tmp/glidelink-selftest.err \
+  src-tauri/target/release/bundle/macos/GlideLink.app --args --self-test
+cat /tmp/glidelink-selftest.out
 ```
 
-It reports displays and TCC permissions, exercises a synthetic edge crossing (capture), moves the cursor to a known point (injection), and restores the cursor. Run it from the terminal or app that holds the permissions.
+It reports displays and TCC permissions, exercises a synthetic edge crossing (capture), moves the cursor to a known point (injection), and restores the cursor. Running `cargo run -- --self-test` directly may attribute TCC to the terminal instead of GlideLink and report missing permissions.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) / [ARCHITECTURE.en.md](ARCHITECTURE.en.md) for more details.
 

@@ -351,6 +351,14 @@ input {
   border: 0.5px solid rgba(255, 159, 10, 0.26);
 }
 
+.permission-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .permission-card strong {
   color: #6d4200;
   font-size: 11.5px;
@@ -366,6 +374,10 @@ input {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   padding: 4px 36px 32px;
   scrollbar-width: thin;
   scrollbar-color: rgba(60, 60, 67, 0.22) transparent;
@@ -383,8 +395,13 @@ input {
 }
 
 .page {
+  width: 100%;
   max-width: 720px;
   animation: page-in 140ms ease-out;
+}
+
+.page[data-page="layout"] {
+  max-width: none;
 }
 
 @keyframes page-in {
@@ -682,12 +699,60 @@ input[type="number"]::-webkit-outer-spin-button {
   margin: 0;
 }
 
-#passcode {
-  width: 210px;
-  max-width: 42vw;
+.code-cells {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.code-cell {
+  width: 50px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text);
   font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
-  font-size: 12px;
+  font-size: 11px;
   letter-spacing: 0.04em;
+  text-align: center;
+  text-transform: uppercase;
+  outline: none;
+  box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.02);
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.code-cell:focus {
+  border-color: rgba(0, 122, 255, 0.65);
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.14);
+}
+
+.code-cell[readonly] {
+  background: #f7f7f9;
+}
+
+.interface-select {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 300px;
+  max-width: 56%;
+  padding-right: 30px;
+  background-color: #fff;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M1 1l4 4 4-4' fill='none' stroke='%238e8e93' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.interface-select:hover {
+  border-color: rgba(0, 0, 0, 0.2);
+}
+
+.interface-select:focus {
+  border-color: rgba(0, 122, 255, 0.65);
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.14);
 }
 
 .input-with-actions {
@@ -871,7 +936,7 @@ input[type="number"]::-webkit-outer-spin-button {
 
 .layout-stage {
   position: relative;
-  height: 360px;
+  height: clamp(540px, 65vh, 650px);
   margin: 10px;
   border-radius: 9px;
   border: 0.5px solid var(--separator);
@@ -890,10 +955,12 @@ input[type="number"]::-webkit-outer-spin-button {
 
 .screen {
   position: absolute;
+  -webkit-user-select: none;
+  user-select: none;
   left: 50%;
   top: 50%;
-  width: 250px;
-  height: 150px;
+  width: clamp(230px, 28vw, 420px);
+  aspect-ratio: 5 / 3;
   border: 1.5px solid #c7c7cc;
   border-radius: 8px;
   background: linear-gradient(180deg, #ffffff 0%, #f4f8ff 100%);
@@ -926,6 +993,11 @@ input[type="number"]::-webkit-outer-spin-button {
   border-radius: 2px;
   background: #e4e4e9;
   transform: translateX(-50%);
+}
+
+.screen * {
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .screen-topline {
@@ -993,13 +1065,6 @@ input[type="number"]::-webkit-outer-spin-button {
 .remote-screen:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
-}
-
-.layout-hint {
-  margin: 10px 16px 14px;
-  color: var(--text-secondary);
-  font-size: 11.5px;
-  line-height: 1.45;
 }
 
 .host-screen .screen-kicker {

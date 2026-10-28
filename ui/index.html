@@ -75,7 +75,10 @@
           <strong data-i18n="permission.title">macOS permissions required</strong>
           <p data-i18n="permission.text">Allow GlideLink to listen for and inject mouse events, then relaunch the app.</p>
         </div>
-        <button id="permissionBtn" type="button" class="button secondary small" data-i18n="permission.open">Open System Settings</button>
+        <div class="permission-actions">
+          <button id="permissionBtn" type="button" class="button secondary small" data-i18n="permission.open">Open System Settings</button>
+          <button id="reopenBtn" type="button" class="button primary small" data-i18n="permission.reopen">Reopen</button>
+        </div>
       </div>
 
       <div class="page-scroll">
@@ -114,18 +117,15 @@
             <div class="group">
               <div class="group-header"><h2 data-i18n="connection.group">Connection</h2></div>
               <div class="group-card">
-                <div id="controllerFields">
-                  <div class="setting-row">
-                    <label for="peerAddr" data-i18n="connection.peerAddress">Peer address</label>
-                    <input id="peerAddr" name="peerAddr" class="control-input" type="text" placeholder="192.168.1.42:45890" spellcheck="false" />
-                  </div>
-                  <div class="separator"></div>
-                </div>
-
                 <div id="agentFields" hidden>
                   <div class="setting-row">
-                    <label for="listenPort" data-i18n="connection.listenPort">Listening port</label>
-                    <input id="listenPort" name="listenPort" class="control-input narrow" type="number" min="1024" max="65535" value="45890" />
+                    <label for="interfaceSelect" data-i18n="connection.interface">Network interface</label>
+                    <select id="interfaceSelect" class="control-input interface-select"></select>
+                  </div>
+                  <div class="separator"></div>
+                  <div class="setting-row">
+                    <span data-i18n="connection.localIp">Local IP</span>
+                    <span class="value" id="selectedIp">—</span>
                   </div>
                   <div class="separator"></div>
                 </div>
@@ -142,14 +142,16 @@
                 <div class="setting-row passcode-row">
                   <label for="passcode" data-i18n="connection.passcode">Pairing code</label>
                   <div class="input-with-actions">
-                    <input id="passcode" name="passcode" type="password" spellcheck="false" placeholder="At least 8 characters" data-i18n-placeholder="connection.passcodePlaceholder" />
+                    <div id="pairingCells" class="code-cells" role="group" data-i18n-aria-label="connection.passcode">
+                      <input class="code-cell" type="text" maxlength="4" inputmode="text" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="1" />
+                      <input class="code-cell" type="text" maxlength="4" inputmode="text" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="2" />
+                      <input class="code-cell" type="text" maxlength="4" inputmode="text" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="3" />
+                      <input class="code-cell" type="text" maxlength="4" inputmode="text" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="4" />
+                      <input class="code-cell" type="text" maxlength="4" inputmode="text" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="5" />
+                    </div>
                     <button id="copyPasscode" type="button" class="icon-button" data-i18n-title="common.copyPasscode" data-i18n-aria-label="common.copyPasscode" title="Copy pairing code" aria-label="Copy pairing code">
                       <svg viewBox="0 0 20 20" fill="none"><rect x="7" y="7" width="9" height="9" rx="1.7" stroke="currentColor" stroke-width="1.35"/><path d="M13 7V5.4A1.4 1.4 0 0011.6 4H5.4A1.4 1.4 0 004 5.4v6.2A1.4 1.4 0 005.4 13H7" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/></svg>
                     </button>
-                    <button id="togglePasscode" type="button" class="icon-button" data-i18n-title="common.showPasscode" data-i18n-aria-label="common.showPasscode" title="Show or hide pairing code" aria-label="Show or hide pairing code" aria-pressed="false">
-                      <svg viewBox="0 0 20 20" fill="none"><path d="M2.1 10s2.9-5 7.9-5 7.9 5 7.9 5-2.9 5-7.9 5-7.9-5-7.9-5z" stroke="currentColor" stroke-width="1.35"/><circle cx="10" cy="10" r="2.3" stroke="currentColor" stroke-width="1.35"/></svg>
-                    </button>
-                    <button id="generatePasscode" type="button" class="link-button" data-i18n="common.regenerate">Regenerate</button>
                   </div>
                 </div>
               </div>
@@ -204,8 +206,7 @@
                 </div>
 
                 <div class="screen remote-screen" id="remoteScreen" tabindex="0" role="button"
-                     data-i18n-aria-label="layout.peerAriaLabel"
-                     aria-describedby="layoutDragHint">
+                     data-i18n-aria-label="layout.peerAriaLabel">
                   <div class="screen-topline" aria-hidden="true"></div>
                   <div class="screen-content">
                     <strong id="remoteScreenLabel" data-i18n="common.peerControlled">Controlled PC</strong>
@@ -220,9 +221,6 @@
                 <span id="linkChipText" data-i18n="layout.previewWaiting">Waiting for connection</span>
               </div>
 
-              <p class="layout-hint" id="layoutDragHint" data-i18n="layout.dragHint">
-                Drag the peer screen to any side of this device. Arrow keys choose a side; Shift + arrows adjust the offset.
-              </p>
             </div>
           </div>
         </section>
@@ -271,6 +269,21 @@
               <div class="setting-row">
                 <span data-i18n="about.rtt">Round-trip time</span>
                 <span class="value" id="aboutRtt">—</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="about.jitter">Jitter</span>
+                <span class="value" id="aboutJitter">—</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="about.loss">Packet loss</span>
+                <span class="value" id="aboutLoss">—</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="about.inputRate">Input interval</span>
+                <span class="value" id="aboutRate">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">

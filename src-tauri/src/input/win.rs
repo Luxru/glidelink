@@ -1,6 +1,6 @@
 use super::{
-    CaptureHandle, CaptureShared, InjectMsg, RemoteInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT,
-    BUTTON_X1, BUTTON_X2,
+    plan_injection_batch, CaptureHandle, CaptureShared, InjectCursor, InjectMsg, InjectStep,
+    RemoteInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
 };
 use crate::error;
 use crate::layout::{
@@ -458,6 +458,7 @@ fn run_capture_thread(
     offset: f32,
     ready_tx: mpsc::Sender<Result<(), String>>,
 ) {
+    crate::sched::boost_current_thread();
     let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
     let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
     let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
@@ -633,51 +634,59 @@ fn injector_loop(
     status: Status,
     ready_tx: mpsc::Sender<Result<(), String>>,
 ) {
+    crate::sched::boost_current_thread();
     let _ = ready_tx.send(Ok(()));
-    let mut previous_buttons = 0u8;
-    let mut previous_position: Option<(u16, u16)> = None;
+    let mut applied_buttons = 0u8;
+    let mut cursor = InjectCursor::default();
+    let mut batch = Vec::with_capacity(16);
+    let mut steps = Vec::with_capacity(16);
 
     while !stop.load(Ordering::Acquire) {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(InjectMsg::State(input)) => {
-                let x = (input.x.clamp(0.0, 1.0) * 65535.0).round() as u16;
-                let y = (input.y.clamp(0.0, 1.0) * 65535.0).round() as u16;
-                if previous_position != Some((x, y)) {
-                    unsafe {
-                        mouse_event(
-                            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                            x as i32,
-                            y as i32,
-                            0,
-                            0,
-                        );
-                    }
-                    previous_position = Some((x, y));
-                }
-
-                apply_button_transitions(previous_buttons, input.buttons);
-                previous_buttons = input.buttons;
-
-                if input.wheel != 0 {
-                    unsafe {
-                        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, input.wheel as i32 * WHEEL_DELTA, 0);
-                    }
-                }
-            }
-            Ok(InjectMsg::Reset) => {
-                if previous_buttons != 0 {
-                    apply_button_transitions(previous_buttons, 0);
-                    previous_buttons = 0;
-                }
-                previous_position = None;
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+        let first = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(msg) => msg,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+
+        batch.clear();
+        batch.push(first);
+        while batch.len() < 64 {
+            match rx.try_recv() {
+                Ok(msg) => batch.push(msg),
+                Err(_) => break,
+            }
+        }
+
+        steps.clear();
+        plan_injection_batch(&batch, &mut cursor, &mut steps);
+        for step in steps.iter().copied() {
+            match step {
+                InjectStep::Move { x, y, .. } => unsafe {
+                    mouse_event(
+                        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                        x as i32,
+                        y as i32,
+                        0,
+                        0,
+                    );
+                },
+                InjectStep::Buttons { from, to } => {
+                    apply_button_transitions(from, to);
+                    applied_buttons = to;
+                }
+                InjectStep::Wheel(delta) => unsafe {
+                    mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta as i32 * WHEEL_DELTA, 0);
+                },
+                InjectStep::Reset => {
+                    apply_button_transitions(applied_buttons, 0);
+                    applied_buttons = 0;
+                }
+            }
         }
     }
 
-    if previous_buttons != 0 {
-        apply_button_transitions(previous_buttons, 0);
+    if applied_buttons != 0 {
+        apply_button_transitions(applied_buttons, 0);
     }
     status.update(|s| {
         s.last_error_code = None;

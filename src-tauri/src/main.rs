@@ -3,13 +3,17 @@
 mod config;
 mod error;
 mod input;
+mod invite;
 mod layout;
 mod net;
+mod sched;
 mod state;
 mod status;
 
-use config::AppConfig;
+use config::{AppConfig, Role};
+use invite::Invite;
 use state::{AppState, StateView};
+use std::net::Ipv4Addr;
 use tauri::Manager;
 
 #[tauri::command]
@@ -18,10 +22,18 @@ fn get_state(state: tauri::State<'_, AppState>) -> StateView {
 }
 
 #[tauri::command]
-fn start_session(mut config: AppConfig, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    config.passcode = config.passcode.trim().to_string();
-    config.peer_addr = config.peer_addr.trim().to_string();
+fn start_session(
+    mut config: AppConfig,
+    pairing_code: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let pairing_code = invite::normalize_code(&pairing_code);
+    let invite = Invite::decode(&pairing_code).map_err(|_| error::code("E_PAIRING_CODE"))?;
+    config.local_ip = config.local_ip.trim().to_string();
     config.validate()?;
+    if config.role == Role::Agent && config.local_ipv4()? != invite.ip {
+        return Err(error::code("E_LOCAL_IP"));
+    }
 
     if state.engine.is_running() {
         return Err(error::code("E_SESSION_RUNNING"));
@@ -32,17 +44,32 @@ fn start_session(mut config: AppConfig, state: tauri::State<'_, AppState>) -> Re
         *current = config.clone();
     }
     log::info!(
-        "starting {} session (peer={}, port={}, passcode={})",
+        "starting {} session (local_ip={})",
         config.role.as_str(),
-        if config.peer_addr.is_empty() {
+        if config.local_ip.is_empty() {
             "-"
         } else {
-            &config.peer_addr
-        },
-        config.listen_port,
-        config.redacted_passcode()
+            &config.local_ip
+        }
     );
-    state.engine.start(&config)
+    state.engine.start(&config, &pairing_code)
+}
+
+#[tauri::command]
+fn preview_invite(local_ip: String) -> Result<String, String> {
+    let ip = local_ip
+        .trim()
+        .parse::<Ipv4Addr>()
+        .map_err(|_| error::code("E_LOCAL_IP"))?;
+    if ip.is_loopback() || ip.is_unspecified() {
+        return Err(error::code("E_LOCAL_IP"));
+    }
+    net::preview_invite(ip)
+}
+
+#[tauri::command]
+fn reopen_app(app: tauri::AppHandle) {
+    app.restart()
 }
 
 #[tauri::command]
@@ -100,7 +127,9 @@ fn main() {
             get_state,
             start_session,
             stop_session,
-            open_permissions
+            open_permissions,
+            preview_invite,
+            reopen_app
         ])
         .build(tauri::generate_context!())
         .expect("failed to build GlideLink");

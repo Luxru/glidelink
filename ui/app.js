@@ -9,11 +9,10 @@ const els = {
   navItems: [...document.querySelectorAll(".nav-item")],
   languageSelect: document.getElementById("languageSelect"),
   roleOptions: [...document.querySelectorAll(".role-option")],
-  controllerFields: document.getElementById("controllerFields"),
   agentFields: document.getElementById("agentFields"),
-  peerAddr: document.getElementById("peerAddr"),
-  listenPort: document.getElementById("listenPort"),
-  passcode: document.getElementById("passcode"),
+  interfaceSelect: document.getElementById("interfaceSelect"),
+  selectedIp: document.getElementById("selectedIp"),
+  codeCells: [...document.querySelectorAll(".code-cell")],
   startBtn: document.getElementById("startBtn"),
   startLabel: document.getElementById("startLabel"),
   stopBtn: document.getElementById("stopBtn"),
@@ -35,20 +34,21 @@ const els = {
   peerText: document.getElementById("peerText"),
   permissionCard: document.getElementById("permissionCard"),
   permissionBtn: document.getElementById("permissionBtn"),
-  togglePasscode: document.getElementById("togglePasscode"),
+  reopenBtn: document.getElementById("reopenBtn"),
   copyPasscode: document.getElementById("copyPasscode"),
-  generatePasscode: document.getElementById("generatePasscode"),
   sessionState: document.getElementById("sessionState"),
   layoutSummary: document.getElementById("layoutSummary"),
   editLayout: document.getElementById("editLayout"),
   remoteScreen: document.getElementById("remoteScreen"),
-  layoutDragHint: document.getElementById("layoutDragHint"),
   aboutRole: document.getElementById("aboutRole"),
   aboutState: document.getElementById("aboutState"),
   aboutDuration: document.getElementById("aboutDuration"),
   aboutPeer: document.getElementById("aboutPeer"),
   aboutLinkState: document.getElementById("aboutLinkState"),
   aboutRtt: document.getElementById("aboutRtt"),
+  aboutJitter: document.getElementById("aboutJitter"),
+  aboutLoss: document.getElementById("aboutLoss"),
+  aboutRate: document.getElementById("aboutRate"),
   aboutLocalScreen: document.getElementById("aboutLocalScreen"),
   aboutRemoteScreen: document.getElementById("aboutRemoteScreen"),
   aboutPacketsSent: document.getElementById("aboutPacketsSent"),
@@ -69,6 +69,12 @@ const ui = {
   lastStatus: null,
   lastState: null,
   startError: null,
+  interfaces: [],
+  interfaceSignature: "",
+  selectedIp: "",
+  configLocalIp: "",
+  previewIp: "",
+  previewPromise: null,
 };
 
 const SCREEN_W = 250;
@@ -93,19 +99,29 @@ const EDGE_SUMMARIES = {
   bottom: "layout.summaryBottom",
 };
 
-const PASSCODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+const PAIRING_CODE_LENGTH = 20;
 const COMMAND_TIMEOUT_MS = 12000;
 
 let toastTimer;
 
-function generatePasscode(length = 12) {
-  const bytes = new Uint8Array(length);
-  crypto.getRandomValues(bytes);
-  let code = "";
-  for (let i = 0; i < length; i += 1) {
-    code += PASSCODE_ALPHABET[bytes[i] % PASSCODE_ALPHABET.length];
-  }
-  return code;
+function normalizeCodePart(value, limit = PAIRING_CODE_LENGTH) {
+  return String(value || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .replace(/O/g, "0")
+    .replace(/[IL]/g, "1")
+    .slice(0, limit);
+}
+
+function getPairingCode() {
+  return normalizeCodePart(els.codeCells.map((cell) => cell.value).join(""));
+}
+
+function setPairingCode(value) {
+  const code = normalizeCodePart(value);
+  els.codeCells.forEach((cell, index) => {
+    cell.value = code.slice(index * 4, index * 4 + 4);
+  });
 }
 
 function formatScreen(screen) {
@@ -166,6 +182,15 @@ function updateAboutStats(status) {
       ? t("status.waiting")
       : t("status.notRunning");
   els.aboutRtt.textContent = latency == null ? "—" : `${latency.toFixed(1)} ms`;
+  els.aboutJitter.textContent = status?.jitterMs == null
+    ? "—"
+    : `${Number(status.jitterMs).toFixed(1)} ms`;
+  els.aboutLoss.textContent = status?.packetLossPercent == null
+    ? "—"
+    : `${Number(status.packetLossPercent).toFixed(1)} %`;
+  els.aboutRate.textContent = status?.inputIntervalMs == null
+    ? "—"
+    : `${Number(status.inputIntervalMs).toFixed(1)} ms`;
   els.aboutLocalScreen.textContent = formatScreen(status?.localScreen);
   els.aboutRemoteScreen.textContent = formatScreen(status?.remoteScreen);
   els.aboutPacketsSent.textContent = formatCount(status?.packetsSent);
@@ -227,6 +252,7 @@ function updatePageChrome() {
   els.pageTitle.textContent = t(PAGES[ui.page] || PAGES.session);
 }
 
+
 function setPage(page) {
   if (!PAGES[page]) return;
   ui.page = page;
@@ -241,6 +267,7 @@ function setPage(page) {
   }
   updatePageChrome();
   els.pageScroll.scrollTop = 0;
+  if (page === "layout") requestAnimationFrame(renderLayout);
 }
 
 function updateStartLabel() {
@@ -261,23 +288,49 @@ function layoutDisabled() {
   return ui.running || ui.loading || ui.role === "agent";
 }
 
+function screenMetrics() {
+  const hostW = els.hostScreen.offsetWidth || SCREEN_W;
+  const hostH = els.hostScreen.offsetHeight || SCREEN_H;
+  const peerW = els.remoteScreen.offsetWidth || SCREEN_W;
+  const peerH = els.remoteScreen.offsetHeight || SCREEN_H;
+  return { hostW, hostH, peerW, peerH };
+}
+
+function maxOffsetFor(metrics) {
+  const stage = els.layoutStage.getBoundingClientRect();
+  if (stage.width <= 0 || stage.height <= 0) return MAX_OFFSET;
+  const horizontal = ui.edge === "left" || ui.edge === "right";
+  const max = horizontal
+    ? (stage.height / 2 - metrics.peerH / 2 - 8) / metrics.hostH
+    : (stage.width / 2 - metrics.peerW / 2 - 8) / metrics.hostW;
+  return Math.max(0, Math.min(MAX_OFFSET, max));
+}
+
+function clampedOffset(metrics = screenMetrics()) {
+  const max = maxOffsetFor(metrics);
+  return Math.max(-max, Math.min(max, ui.offset));
+}
+
 function peerPosition() {
+  const metrics = screenMetrics();
   const edge = ui.role === "agent" ? "right" : ui.edge;
-  const offset = ui.role === "agent" ? 0 : ui.offset;
+  const offset = ui.role === "agent" ? 0 : clampedOffset(metrics);
   let hostDx = 0;
   let hostDy = 0;
   let peerDx = 0;
   let peerDy = 0;
   if (edge === "left" || edge === "right") {
-    const half = (SCREEN_W + SCREEN_GAP) / 2;
-    hostDx = edge === "right" ? -half : half;
-    peerDx = -hostDx;
-    peerDy = offset * SCREEN_H;
+    const hostHalf = (metrics.peerW + SCREEN_GAP) / 2;
+    const peerHalf = (metrics.hostW + SCREEN_GAP) / 2;
+    hostDx = edge === "right" ? -hostHalf : hostHalf;
+    peerDx = edge === "right" ? peerHalf : -peerHalf;
+    peerDy = offset * metrics.hostH;
   } else {
-    const half = (SCREEN_H + SCREEN_GAP) / 2;
-    hostDy = edge === "bottom" ? -half : half;
-    peerDy = -hostDy;
-    peerDx = offset * SCREEN_W;
+    const hostHalf = (metrics.peerH + SCREEN_GAP) / 2;
+    const peerHalf = (metrics.hostH + SCREEN_GAP) / 2;
+    hostDy = edge === "bottom" ? -hostHalf : hostHalf;
+    peerDy = edge === "bottom" ? peerHalf : -peerHalf;
+    peerDx = offset * metrics.hostW;
   }
   return { hostDx, hostDy, peerDx, peerDy };
 }
@@ -301,7 +354,6 @@ function updateLayoutSummary() {
   els.layoutSummary.textContent = ui.role === "agent"
     ? t("layout.summaryAgent")
     : t(EDGE_SUMMARIES[ui.edge]);
-  els.layoutDragHint.hidden = layoutDisabled();
   renderLayout();
 }
 
@@ -326,12 +378,17 @@ function dominantEdge(dx, dy) {
 function onPeerPointerDown(event) {
   if (layoutDisabled() || event.button !== 0) return;
   const { peerDx, peerDy } = peerPosition();
+  const metrics = screenMetrics();
   dragState = {
     pointerId: event.pointerId,
     startX: event.clientX,
     startY: event.clientY,
     peerDx,
     peerDy,
+    hostW: metrics.hostW,
+    hostH: metrics.hostH,
+    peerW: metrics.peerW,
+    peerH: metrics.peerH,
   };
   lastDrag = null;
   els.layoutStage.classList.add("is-dragging");
@@ -345,8 +402,8 @@ function onPeerPointerMove(event) {
   const stageRect = els.layoutStage.getBoundingClientRect();
   let dx = dragState.peerDx + (event.clientX - dragState.startX);
   let dy = dragState.peerDy + (event.clientY - dragState.startY);
-  const limitX = Math.max(0, stageRect.width / 2 - SCREEN_W / 2 - 6);
-  const limitY = Math.max(0, stageRect.height / 2 - SCREEN_H / 2 - 6);
+  const limitX = Math.max(0, stageRect.width / 2 - dragState.peerW / 2 - 6);
+  const limitY = Math.max(0, stageRect.height / 2 - dragState.peerH / 2 - 6);
   dx = Math.max(-limitX, Math.min(limitX, dx));
   dy = Math.max(-limitY, Math.min(limitY, dy));
   const pointerDx = event.clientX - (stageRect.left + stageRect.width / 2);
@@ -365,8 +422,8 @@ function onPeerPointerUp(event) {
   if (moved >= 6 && lastDrag) {
     const edge = dominantEdge(lastDrag.pointerDx, lastDrag.pointerDy);
     const rawOffset = edge === "left" || edge === "right"
-      ? lastDrag.dy / SCREEN_H
-      : lastDrag.dx / SCREEN_W;
+      ? lastDrag.dy / dragState.hostH
+      : lastDrag.dx / dragState.hostW;
     ui.edge = edge;
     ui.offset = Math.max(-MAX_OFFSET, Math.min(MAX_OFFSET, rawOffset));
   }
@@ -412,6 +469,70 @@ function onPeerKeyDown(event) {
   }
 }
 
+const INTERFACE_STORAGE_KEY = "glidelink.interface";
+
+function updateInterfaces(interfaces, preferredIp) {
+  const list = Array.isArray(interfaces) ? interfaces : [];
+  const signature = list.map((item) => `${item.name}|${item.ip}`).join(";");
+  if (signature !== ui.interfaceSignature) {
+    ui.interfaceSignature = signature;
+    ui.interfaces = list;
+    const previous = els.interfaceSelect.value;
+    els.interfaceSelect.innerHTML = "";
+    for (const item of list) {
+      const option = document.createElement("option");
+      option.value = item.ip;
+      option.textContent = `${item.name} — ${item.ip}`;
+      els.interfaceSelect.append(option);
+    }
+    let saved = "";
+    try {
+      saved = localStorage.getItem(INTERFACE_STORAGE_KEY) || "";
+    } catch {
+      // ignore storage failures
+    }
+    const candidates = [previous, ui.selectedIp, preferredIp, saved].filter(Boolean);
+    const chosen = candidates.find((ip) => list.some((item) => item.ip === ip))
+      || list[0]?.ip
+      || "";
+    els.interfaceSelect.value = chosen;
+    ui.selectedIp = chosen;
+  } else if (!list.some((item) => item.ip === els.interfaceSelect.value)) {
+    els.interfaceSelect.value = list[0]?.ip || "";
+    ui.selectedIp = els.interfaceSelect.value;
+  } else {
+    ui.selectedIp = els.interfaceSelect.value;
+  }
+  els.selectedIp.textContent = ui.selectedIp || "—";
+  els.interfaceSelect.disabled = ui.running || ui.loading || ui.role === "controller";
+}
+
+async function refreshInvitePreview() {
+  if (!invoke || ui.role !== "agent" || ui.running) return;
+  if (ui.previewPromise) return ui.previewPromise;
+  const ip = ui.selectedIp;
+  if (!ip) {
+    if (ui.previewIp) setPairingCode("");
+    ui.previewIp = "";
+    return;
+  }
+  if (ui.previewIp === ip && getPairingCode().length === PAIRING_CODE_LENGTH) return;
+  ui.previewPromise = (async () => {
+    try {
+      const code = await withTimeout(invoke("preview_invite", { localIp: ip }));
+      if (ui.role === "agent" && !ui.running && ui.selectedIp === ip) {
+        setPairingCode(code);
+        ui.previewIp = ip;
+      }
+    } catch (error) {
+      setError(errorToRaw(error));
+    } finally {
+      ui.previewPromise = null;
+    }
+  })();
+  return ui.previewPromise;
+}
+
 function setLoading(loading) {
   ui.loading = loading;
   els.startBtn.classList.toggle("loading", loading);
@@ -422,18 +543,25 @@ function setLoading(loading) {
 }
 
 function setRole(role, syncControls = true) {
+  const previousRole = ui.role;
   ui.role = role === "agent" ? "agent" : "controller";
   for (const option of els.roleOptions) {
     const active = option.dataset.role === ui.role;
     option.classList.toggle("active", active);
     option.setAttribute("aria-checked", String(active));
   }
-  els.controllerFields.hidden = ui.role !== "controller";
   els.agentFields.hidden = ui.role !== "agent";
   els.hostScreenLabel.textContent = t("common.thisDevice");
   els.remoteScreenLabel.textContent = ui.role === "controller"
     ? t("common.peerControlled")
     : t("common.peerController");
+  for (const cell of els.codeCells) cell.readOnly = ui.role === "agent";
+  if (previousRole !== ui.role) {
+    setPairingCode("");
+    ui.previewIp = "";
+  }
+  updateInterfaces(ui.interfaces, ui.configLocalIp);
+  if (ui.role === "agent" && !ui.running) refreshInvitePreview();
   updateLayoutSummary();
   updateStartLabel();
   if (syncControls && !ui.running) setDisabledControls(false);
@@ -442,8 +570,7 @@ function setRole(role, syncControls = true) {
 function setDisabledControls(disabled) {
   for (const input of els.form.querySelectorAll("input")) input.disabled = disabled;
   for (const option of els.roleOptions) option.disabled = disabled;
-  els.generatePasscode.disabled = disabled;
-  els.togglePasscode.disabled = disabled;
+  els.interfaceSelect.disabled = disabled;
   els.editLayout.disabled = disabled;
   els.startBtn.disabled = disabled || ui.loading;
   els.stopBtn.hidden = !disabled;
@@ -468,17 +595,35 @@ function applyState(state) {
   ui.lastStatus = incomingStatus || null;
 
   if (config && !ui.initialized) {
-    els.peerAddr.value = config.peerAddr || "";
-    els.listenPort.value = config.listenPort || 45890;
-    els.passcode.value = config.passcode || "";
+    ui.configLocalIp = config.localIp || "";
+    ui.interfaces = Array.isArray(state.localInterfaces) ? state.localInterfaces : [];
     setRole(config.role, false);
     setEdge(config.edge);
     setOffset(config.peerOffset ?? 0);
+    updateInterfaces(ui.interfaces, ui.configLocalIp);
     setDisabledControls(ui.running);
     ui.initialized = true;
   } else if (config && !ui.running && wasRunning) {
     setDisabledControls(false);
+    setPairingCode("");
+    ui.previewIp = "";
+    refreshInvitePreview();
   }
+
+  if (Array.isArray(state.localInterfaces)) {
+    ui.interfaces = state.localInterfaces;
+    updateInterfaces(ui.interfaces, ui.configLocalIp);
+  }
+
+  if (ui.role === "agent") {
+    if (incomingStatus?.running && incomingStatus.pairingCode) {
+      setPairingCode(incomingStatus.pairingCode);
+      ui.previewIp = ui.selectedIp;
+    } else if (!incomingStatus?.running) {
+      refreshInvitePreview();
+    }
+  }
+
 
   if (ui.running) setDisabledControls(true);
 
@@ -580,23 +725,17 @@ async function startSession(event) {
   }
   if (ui.page !== "session") setPage("session");
 
-  const passcode = els.passcode.value.trim();
-  const peerAddr = els.peerAddr.value.trim();
-  const listenPort = Number(els.listenPort.value);
-
-  if (passcode.length < 8) {
-    setError("validation.passcodeLength");
-    els.passcode.focus();
+  if (ui.role === "agent" && !ui.selectedIp) {
+    setError("validation.interface");
     return;
   }
-  if (ui.role === "controller" && !/^[^\s:]+:\d{1,5}$/.test(peerAddr)) {
-    setError("validation.peerAddress");
-    els.peerAddr.focus();
-    return;
+  if (ui.role === "agent" && getPairingCode().length !== PAIRING_CODE_LENGTH) {
+    await refreshInvitePreview();
   }
-  if (ui.role === "agent" && (!Number.isInteger(listenPort) || listenPort < 1024 || listenPort > 65535)) {
-    setError("validation.port");
-    els.listenPort.focus();
+  const pairingCode = getPairingCode();
+  if (pairingCode.length !== PAIRING_CODE_LENGTH) {
+    setError("validation.pairingCode");
+    els.codeCells[0]?.focus();
     return;
   }
 
@@ -606,16 +745,19 @@ async function startSession(event) {
     await withTimeout(invoke("start_session", {
       config: {
         role: ui.role,
-        peerAddr,
-        listenPort,
-        passcode,
+        localIp: ui.role === "agent" ? ui.selectedIp : "",
         edge: ui.edge,
-        peerOffset: ui.offset,
+        peerOffset: ui.role === "agent" ? 0 : clampedOffset(),
       },
+      pairingCode,
     }));
     showToast(ui.role === "controller" ? t("toast.startedController") : t("toast.startedAgent"));
     await refresh();
   } catch (error) {
+    if (ui.role === "agent") {
+      ui.previewIp = "";
+      await refreshInvitePreview();
+    }
     setError(errorToRaw(error));
   } finally {
     setLoading(false);
@@ -624,7 +766,7 @@ async function startSession(event) {
 }
 
 async function copyPasscode() {
-  const code = els.passcode.value.trim();
+  const code = getPairingCode();
   if (!code) {
     showToast(t("toast.passcodeEmpty"));
     return;
@@ -634,17 +776,18 @@ async function copyPasscode() {
     await navigator.clipboard.writeText(code);
     copied = true;
   } catch {
-    const previousType = els.passcode.type;
+    const temporary = document.createElement("textarea");
+    temporary.value = code;
+    temporary.style.position = "fixed";
+    temporary.style.opacity = "0";
+    document.body.appendChild(temporary);
+    temporary.select();
     try {
-      els.passcode.type = "text";
-      els.passcode.focus();
-      els.passcode.select();
       copied = document.execCommand("copy");
     } catch {
       copied = false;
     } finally {
-      els.passcode.type = previousType;
-      window.getSelection()?.removeAllRanges();
+      temporary.remove();
     }
   }
   showToast(copied ? t("toast.passcodeCopied") : t("toast.passcodeCopyFailed"));
@@ -677,6 +820,7 @@ function initEvents() {
     });
   }
 
+  window.addEventListener("resize", () => renderLayout());
   els.remoteScreen.addEventListener("pointerdown", onPeerPointerDown);
   els.remoteScreen.addEventListener("pointermove", onPeerPointerMove);
   els.remoteScreen.addEventListener("pointerup", onPeerPointerUp);
@@ -690,19 +834,59 @@ function initEvents() {
   });
   els.remoteScreen.addEventListener("keydown", onPeerKeyDown);
 
-  els.togglePasscode.addEventListener("click", () => {
-    const visible = els.passcode.type === "password";
-    els.passcode.type = visible ? "text" : "password";
-    els.togglePasscode.setAttribute("aria-pressed", String(visible));
-  });
-
   els.copyPasscode.addEventListener("click", copyPasscode);
 
-  els.generatePasscode.addEventListener("click", () => {
-    els.passcode.value = generatePasscode();
-    els.passcode.type = "text";
-    els.togglePasscode.setAttribute("aria-pressed", "true");
-    showToast(t("toast.passcodeGenerated"));
+  els.codeCells.forEach((cell, index) => {
+    cell.addEventListener("input", () => {
+      if (ui.role === "agent") return;
+      const normalized = normalizeCodePart(cell.value, 4);
+      if (cell.value !== normalized) cell.value = normalized;
+      ui.previewIp = "";
+      if (normalized.length === 4 && index < els.codeCells.length - 1) {
+        els.codeCells[index + 1].focus();
+      }
+    });
+    cell.addEventListener("keydown", (event) => {
+      if (ui.role === "agent") return;
+      if (event.key === "Backspace" && !cell.value && index > 0) {
+        els.codeCells[index - 1].focus();
+        event.preventDefault();
+      } else if (event.key === "ArrowLeft" && index > 0 && cell.selectionStart === 0) {
+        els.codeCells[index - 1].focus();
+        event.preventDefault();
+      } else if (
+        event.key === "ArrowRight"
+        && index < els.codeCells.length - 1
+        && cell.selectionStart === cell.value.length
+      ) {
+        els.codeCells[index + 1].focus();
+        event.preventDefault();
+      }
+    });
+    cell.addEventListener("paste", (event) => {
+      if (ui.role === "agent") return;
+      event.preventDefault();
+      const text = normalizeCodePart(event.clipboardData?.getData("text") || "");
+      if (!text) return;
+      setPairingCode(text);
+      ui.previewIp = "";
+      const filled = Math.min(Math.ceil(text.length / 4), els.codeCells.length);
+      els.codeCells[Math.max(0, filled - 1)]?.focus();
+    });
+  });
+
+  els.interfaceSelect.addEventListener("change", () => {
+    if (ui.running) return;
+    ui.selectedIp = els.interfaceSelect.value;
+    els.selectedIp.textContent = ui.selectedIp || "—";
+    try {
+      localStorage.setItem(INTERFACE_STORAGE_KEY, ui.selectedIp);
+    } catch {
+      // ignore storage failures
+    }
+    setPairingCode("");
+    ui.previewIp = "";
+    refreshInvitePreview();
   });
 
   els.editLayout.addEventListener("click", () => setPage("layout"));
@@ -711,6 +895,14 @@ function initEvents() {
   els.permissionBtn.addEventListener("click", async () => {
     try {
       await invoke("open_permissions");
+    } catch (error) {
+      setError(errorToRaw(error));
+    }
+  });
+
+  els.reopenBtn.addEventListener("click", async () => {
+    try {
+      await invoke("reopen_app");
     } catch (error) {
       setError(errorToRaw(error));
     }
@@ -750,9 +942,6 @@ async function boot() {
   }
   try {
     const state = await withTimeout(invoke("get_state"));
-    if (state?.config && !state.config.passcode) {
-      state.config.passcode = generatePasscode();
-    }
     applyState(state);
   } catch (error) {
     setError(errorToRaw(error));

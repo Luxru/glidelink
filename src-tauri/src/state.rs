@@ -59,7 +59,7 @@ impl Engine {
             .unwrap_or(false)
     }
 
-    pub fn start(&self, config: &AppConfig) -> Result<(), String> {
+    pub fn start(&self, config: &AppConfig, pairing_code: &str) -> Result<(), String> {
         let mut slot = self.inner.lock().map_err(|_| error::code("E_INTERNAL"))?;
         if slot.is_some() {
             return Err(error::code("E_SESSION_RUNNING"));
@@ -75,6 +75,7 @@ impl Engine {
                 let (tx, rx) = unbounded::<crate::input::RemoteInput>();
                 let net_handle = match net::start_controller(
                     config,
+                    pairing_code,
                     rx,
                     Arc::clone(&shared),
                     Arc::clone(&stop),
@@ -112,16 +113,21 @@ impl Engine {
                             return Err(e);
                         }
                     };
-                let net_handle =
-                    match net::start_agent(config, inject_tx, Arc::clone(&stop), status.clone()) {
-                        Ok(handle) => handle,
-                        Err(e) => {
-                            stop.store(true, Ordering::Release);
-                            let _ = injector.join();
-                            status.reset();
-                            return Err(e);
-                        }
-                    };
+                let net_handle = match net::start_agent(
+                    config,
+                    pairing_code,
+                    inject_tx,
+                    Arc::clone(&stop),
+                    status.clone(),
+                ) {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        stop.store(true, Ordering::Release);
+                        let _ = injector.join();
+                        status.reset();
+                        return Err(e);
+                    }
+                };
                 *slot = Some(Running {
                     stop,
                     capture: None,
@@ -173,6 +179,7 @@ pub struct StateView {
     pub status: crate::status::RuntimeStatus,
     pub platform: &'static str,
     pub permissions_ok: bool,
+    pub local_interfaces: Vec<net::NetworkInterface>,
 }
 
 impl StateView {
@@ -191,6 +198,7 @@ impl StateView {
             status,
             platform: input::platform_name(),
             permissions_ok: input::permissions_ok(),
+            local_interfaces: net::local_interfaces(),
         }
     }
 }

@@ -3,14 +3,13 @@ use crate::status::ScreenInfo;
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, Tag};
 use hmac::{Hmac, Mac};
-use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const MAGIC: &[u8; 4] = b"GLNK";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 pub const TYPE_HELLO: u8 = 1;
 pub const TYPE_ACCEPT: u8 = 2;
@@ -18,17 +17,21 @@ pub const TYPE_INPUT: u8 = 3;
 pub const TYPE_PING: u8 = 4;
 pub const TYPE_PONG: u8 = 5;
 pub const TYPE_BYE: u8 = 6;
+pub const TYPE_CONFIRM: u8 = 7;
+pub const TYPE_CONFIRM_ACK: u8 = 8;
 
 pub const SID_LEN: usize = 8;
 pub const TAG_LEN: usize = 16;
 pub const HEADER_LEN: usize = 4 + 1 + 1 + SID_LEN + 8;
-pub const HELLO_LEN: usize = 4 + 1 + 1 + SID_LEN + 4 + 4 + 8 + 32;
-pub const ACCEPT_LEN: usize = 4 + 1 + 1 + SID_LEN + 4 + 4 + 8 + 32;
+pub const PAKE_MSG_LEN: usize = 33;
+pub const HELLO_LEN: usize = HEADER_LEN + 4 + 4 + 8 + PAKE_MSG_LEN;
+pub const ACCEPT_LEN: usize = HELLO_LEN;
 pub const INPUT_LEN: usize = 8;
+pub const PONG_STATS_LEN: usize = 24;
+pub const CONFIRM_PAYLOAD: &[u8] = b"GlideLink/v2/confirm";
 
-const KDF_ROUNDS: u32 = 100_000;
-const C2A_LABEL: &[u8] = b"GlideLink/v1/controller-to-agent";
-const A2C_LABEL: &[u8] = b"GlideLink/v1/agent-to-controller";
+const C2A_LABEL: &[u8] = b"GlideLink/v2/controller-to-agent";
+const A2C_LABEL: &[u8] = b"GlideLink/v2/agent-to-controller";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Side {
@@ -68,41 +71,40 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// PBKDF2 keeps an offline guess expensive. Online guessing is additionally
-/// bounded by the handshake rate and packet authentication failures.
-pub fn derive_master(passcode: &str, sid: &[u8; SID_LEN]) -> [u8; 32] {
-    let mut salt = Vec::with_capacity(24 + SID_LEN);
-    salt.extend_from_slice(b"GlideLink/v1/pairing/");
-    salt.extend_from_slice(sid);
-    let mut out = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(passcode.as_bytes(), &salt, KDF_ROUNDS, &mut out);
-    out
+/// Hash the full HELLO/ACCEPT exchange so the session keys are bound to both
+/// PAKE messages, the session id, and the advertised screens.
+pub fn transcript_hash(hello: &[u8], accept: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(hello);
+    hasher.update(accept);
+    hasher.finalize().into()
 }
 
-fn directional_key(master: &[u8; 32], sid: &[u8; SID_LEN], label: &[u8]) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(master).expect("HMAC accepts any key size");
+fn directional_key(
+    shared: &[u8],
+    sid: &[u8; SID_LEN],
+    transcript: &[u8; 32],
+    label: &[u8],
+) -> [u8; 32] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(shared).expect("HMAC accepts any key size");
     mac.update(label);
     mac.update(sid);
+    mac.update(transcript);
     let bytes = mac.finalize().into_bytes();
     let mut key = [0u8; 32];
     key.copy_from_slice(&bytes);
     key
 }
 
-fn handshake_mac(master: &[u8; 32], data: &[u8]) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(master).expect("HMAC accepts any key size");
-    mac.update(data);
-    let bytes = mac.finalize().into_bytes();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    out
-}
-
-fn verify_handshake_mac(master: &[u8; 32], data: &[u8], tag: &[u8]) -> Result<(), ProtocolError> {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(master).expect("HMAC accepts any key size");
-    mac.update(data);
-    mac.verify_slice(tag)
-        .map_err(|_| ProtocolError::Authentication)
+pub fn derive_session_keys(
+    shared: &[u8],
+    sid: &[u8; SID_LEN],
+    transcript: &[u8; 32],
+) -> ([u8; 32], [u8; 32]) {
+    (
+        directional_key(shared, sid, transcript, C2A_LABEL),
+        directional_key(shared, sid, transcript, A2C_LABEL),
+    )
 }
 
 fn header_prefix(kind: u8, sid: &[u8; SID_LEN], len: usize) -> Vec<u8> {
@@ -111,6 +113,8 @@ fn header_prefix(kind: u8, sid: &[u8; SID_LEN], len: usize) -> Vec<u8> {
     out.push(VERSION);
     out.push(kind);
     out.extend_from_slice(sid);
+    out.extend_from_slice(&0u64.to_be_bytes());
+    debug_assert_eq!(out.len(), HEADER_LEN);
     out
 }
 
@@ -132,15 +136,42 @@ fn validate_prefix(
     Ok((kind, sid))
 }
 
-pub fn build_hello(master: &[u8; 32], hello: &Handshake) -> Vec<u8> {
-    let mut out = header_prefix(TYPE_HELLO, &hello.sid, HELLO_LEN);
-    out.extend_from_slice(&hello.screen.width.to_le_bytes());
-    out.extend_from_slice(&hello.screen.height.to_le_bytes());
-    out.extend_from_slice(&hello.timestamp_ms.to_le_bytes());
-    let mac = handshake_mac(master, &out);
-    out.extend_from_slice(&mac);
+fn build_pake_packet(kind: u8, handshake: &Handshake, pake_msg: &[u8]) -> Vec<u8> {
+    debug_assert_eq!(pake_msg.len(), PAKE_MSG_LEN);
+    let mut out = header_prefix(kind, &handshake.sid, HELLO_LEN);
+    out.extend_from_slice(&handshake.screen.width.to_le_bytes());
+    out.extend_from_slice(&handshake.screen.height.to_le_bytes());
+    out.extend_from_slice(&handshake.timestamp_ms.to_le_bytes());
+    out.extend_from_slice(pake_msg);
     debug_assert_eq!(out.len(), HELLO_LEN);
     out
+}
+
+fn parse_pake_packet(packet: &[u8], kind: u8) -> Result<(Handshake, Vec<u8>), ProtocolError> {
+    let (actual_kind, sid) = validate_prefix(packet, Some(HELLO_LEN))?;
+    if actual_kind != kind {
+        return Err(ProtocolError::Malformed);
+    }
+    let width = u32::from_le_bytes(packet[HEADER_LEN..HEADER_LEN + 4].try_into().unwrap());
+    let height = u32::from_le_bytes(packet[HEADER_LEN + 4..HEADER_LEN + 8].try_into().unwrap());
+    let timestamp_ms =
+        u64::from_le_bytes(packet[HEADER_LEN + 8..HEADER_LEN + 16].try_into().unwrap());
+    Ok((
+        Handshake {
+            sid,
+            screen: ScreenInfo { width, height },
+            timestamp_ms,
+        },
+        packet[HEADER_LEN + 16..].to_vec(),
+    ))
+}
+
+pub fn build_pake_hello(hello: &Handshake, pake_msg: &[u8]) -> Vec<u8> {
+    build_pake_packet(TYPE_HELLO, hello, pake_msg)
+}
+
+pub fn build_pake_accept(accept: &Handshake, pake_msg: &[u8]) -> Vec<u8> {
+    build_pake_packet(TYPE_ACCEPT, accept, pake_msg)
 }
 
 pub fn hello_sid(packet: &[u8]) -> Result<[u8; SID_LEN], ProtocolError> {
@@ -151,56 +182,19 @@ pub fn hello_sid(packet: &[u8]) -> Result<[u8; SID_LEN], ProtocolError> {
     Ok(sid)
 }
 
-pub fn parse_hello(packet: &[u8], master: &[u8; 32]) -> Result<Handshake, ProtocolError> {
-    let (kind, sid) = validate_prefix(packet, Some(HELLO_LEN))?;
-    if kind != TYPE_HELLO {
-        return Err(ProtocolError::Malformed);
-    }
-    let mac_at = HELLO_LEN - 32;
-    verify_handshake_mac(master, &packet[..mac_at], &packet[mac_at..])?;
-    let width = u32::from_le_bytes(packet[14..18].try_into().unwrap());
-    let height = u32::from_le_bytes(packet[18..22].try_into().unwrap());
-    let timestamp_ms = u64::from_le_bytes(packet[22..30].try_into().unwrap());
-    Ok(Handshake {
-        sid,
-        screen: ScreenInfo { width, height },
-        timestamp_ms,
-    })
+pub fn parse_pake_hello(packet: &[u8]) -> Result<(Handshake, Vec<u8>), ProtocolError> {
+    parse_pake_packet(packet, TYPE_HELLO)
 }
 
-pub fn build_accept(master: &[u8; 32], accept: &Handshake) -> Vec<u8> {
-    let mut out = header_prefix(TYPE_ACCEPT, &accept.sid, ACCEPT_LEN);
-    out.extend_from_slice(&accept.screen.width.to_le_bytes());
-    out.extend_from_slice(&accept.screen.height.to_le_bytes());
-    out.extend_from_slice(&accept.timestamp_ms.to_le_bytes());
-    let mac = handshake_mac(master, &out);
-    out.extend_from_slice(&mac);
-    debug_assert_eq!(out.len(), ACCEPT_LEN);
-    out
-}
-
-pub fn parse_accept(
+pub fn parse_pake_accept(
     packet: &[u8],
-    master: &[u8; 32],
     expected_sid: &[u8; SID_LEN],
-) -> Result<Handshake, ProtocolError> {
-    let (kind, sid) = validate_prefix(packet, Some(ACCEPT_LEN))?;
-    if kind != TYPE_ACCEPT {
-        return Err(ProtocolError::Malformed);
-    }
-    if &sid != expected_sid {
+) -> Result<(Handshake, Vec<u8>), ProtocolError> {
+    let (accept, pake_msg) = parse_pake_packet(packet, TYPE_ACCEPT)?;
+    if &accept.sid != expected_sid {
         return Err(ProtocolError::SessionMismatch);
     }
-    let mac_at = ACCEPT_LEN - 32;
-    verify_handshake_mac(master, &packet[..mac_at], &packet[mac_at..])?;
-    let width = u32::from_le_bytes(packet[14..18].try_into().unwrap());
-    let height = u32::from_le_bytes(packet[18..22].try_into().unwrap());
-    let timestamp_ms = u64::from_le_bytes(packet[22..30].try_into().unwrap());
-    Ok(Handshake {
-        sid,
-        screen: ScreenInfo { width, height },
-        timestamp_ms,
-    })
+    Ok((accept, pake_msg))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -245,17 +239,20 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn from_master(master: &[u8; 32], sid: [u8; SID_LEN], side: Side) -> Self {
-        let controller_key = directional_key(master, &sid, C2A_LABEL);
-        let agent_key = directional_key(master, &sid, A2C_LABEL);
+    pub fn from_keys(
+        controller_key: &[u8; 32],
+        agent_key: &[u8; 32],
+        sid: [u8; SID_LEN],
+        side: Side,
+    ) -> Self {
         let (tx_key, rx_key) = match side {
             Side::Controller => (controller_key, agent_key),
             Side::Agent => (agent_key, controller_key),
         };
         Self {
             sid,
-            tx: ChaCha20Poly1305::new(Key::from_slice(&tx_key)),
-            rx: ChaCha20Poly1305::new(Key::from_slice(&rx_key)),
+            tx: ChaCha20Poly1305::new(Key::from_slice(tx_key)),
+            rx: ChaCha20Poly1305::new(Key::from_slice(rx_key)),
             tx_seq: 0,
             replay: ReplayWindow::default(),
         }
@@ -298,6 +295,16 @@ impl Session {
     }
 
     pub fn decrypt_packet(&mut self, packet: &[u8]) -> Result<(u8, Vec<u8>), ProtocolError> {
+        self.decrypt_packet_with_seq(packet)
+            .map(|(kind, payload, _)| (kind, payload))
+    }
+
+    /// Like `decrypt_packet`, but also returns the accepted packet's own
+    /// sequence number for RFC 3550-style loss accounting.
+    pub fn decrypt_packet_with_seq(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<(u8, Vec<u8>, u64), ProtocolError> {
         if packet.len() < HEADER_LEN + TAG_LEN {
             return Err(ProtocolError::Malformed);
         }
@@ -330,7 +337,7 @@ impl Session {
         if !self.replay.accept(seq) {
             return Err(ProtocolError::Replay);
         }
-        Ok((kind, payload))
+        Ok((kind, payload, seq))
     }
 }
 
@@ -373,6 +380,33 @@ pub fn decode_u64(payload: &[u8]) -> Result<u64, ProtocolError> {
     Ok(u64::from_le_bytes(payload.try_into().unwrap()))
 }
 
+/// PONG carries the PING id plus the agent's receiver counts for the
+/// controller-to-agent direction. Apps must treat liveness separately from
+/// these optional statistics.
+pub fn encode_pong(id: u64, expected: u64, received: u64) -> [u8; PONG_STATS_LEN] {
+    let mut out = [0u8; PONG_STATS_LEN];
+    out[0..8].copy_from_slice(&id.to_le_bytes());
+    out[8..16].copy_from_slice(&expected.to_le_bytes());
+    out[16..24].copy_from_slice(&received.to_le_bytes());
+    out
+}
+
+/// Returns the PING id and, when present, `(expected, received)` counters.
+/// An 8-byte legacy payload, or any payload shorter than the full stats
+/// extension, is accepted without statistics.
+pub fn decode_pong(payload: &[u8]) -> Result<(u64, Option<(u64, u64)>), ProtocolError> {
+    if payload.len() < 8 {
+        return Err(ProtocolError::Malformed);
+    }
+    let id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    if payload.len() < PONG_STATS_LEN {
+        return Ok((id, None));
+    }
+    let expected = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    let received = u64::from_le_bytes(payload[16..24].try_into().unwrap());
+    Ok((id, Some((expected, received))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,41 +419,44 @@ mod tests {
     }
 
     #[test]
-    fn handshake_authenticates_and_parses() {
-        let code = "A7k2mQ9xLp4v";
+    fn pake_handshake_messages_and_session_keys() {
         let sid = random_sid();
-        let master = derive_master(code, &sid);
         let hello = Handshake {
             sid,
             screen: screen(2560, 1440),
             timestamp_ms: now_ms(),
         };
-        let hello_packet = build_hello(&master, &hello);
-        let agent_master = derive_master(code, &hello_sid(&hello_packet).unwrap());
-        let parsed = parse_hello(&hello_packet, &agent_master).unwrap();
-        assert_eq!(parsed, hello);
-
         let accept = Handshake {
             sid,
             screen: screen(1920, 1080),
             timestamp_ms: now_ms(),
         };
-        let accept_packet = build_accept(&agent_master, &accept);
-        let parsed_accept = parse_accept(&accept_packet, &master, &sid).unwrap();
-        assert_eq!(parsed_accept, accept);
+        let hello_packet = build_pake_hello(&hello, &[0x41; PAKE_MSG_LEN]);
+        let accept_packet = build_pake_accept(&accept, &[0x42; PAKE_MSG_LEN]);
+        assert_eq!(hello_packet.len(), HELLO_LEN);
+        assert_eq!(accept_packet.len(), ACCEPT_LEN);
+        assert_eq!(hello_sid(&hello_packet).unwrap(), sid);
 
-        let mut tampered = accept_packet;
-        let last = tampered.len() - 1;
-        tampered[last] ^= 1;
-        assert!(parse_accept(&tampered, &master, &sid).is_err());
+        let (parsed_hello, hello_pake) = parse_pake_hello(&hello_packet).unwrap();
+        assert_eq!(parsed_hello, hello);
+        assert_eq!(hello_pake, vec![0x41; PAKE_MSG_LEN]);
+        let (parsed_accept, accept_pake) = parse_pake_accept(&accept_packet, &sid).unwrap();
+        assert_eq!(parsed_accept, accept);
+        assert_eq!(accept_pake, vec![0x42; PAKE_MSG_LEN]);
+
+        let transcript = transcript_hash(&hello_packet, &accept_packet);
+        let (c2a, a2c) = derive_session_keys(&[7u8; 32], &sid, &transcript);
+        let (c2a_other, a2c_other) = derive_session_keys(&[7u8; 32], &sid, &transcript);
+        assert_eq!(c2a, c2a_other);
+        assert_eq!(a2c, a2c_other);
+        assert_ne!(c2a, a2c);
     }
 
     #[test]
     fn encrypted_input_round_trip_and_replay_rejection() {
-        let master = [7u8; 32];
         let sid = random_sid();
-        let mut controller = Session::from_master(&master, sid, Side::Controller);
-        let mut agent = Session::from_master(&master, sid, Side::Agent);
+        let mut controller = Session::from_keys(&[7u8; 32], &[9u8; 32], sid, Side::Controller);
+        let mut agent = Session::from_keys(&[7u8; 32], &[9u8; 32], sid, Side::Agent);
 
         let input = RemoteInput {
             x: 0.123,
@@ -428,8 +465,9 @@ mod tests {
             wheel: -2,
         };
         let packet = controller.encrypt_packet(TYPE_INPUT, &encode_input(&input));
-        let (kind, payload) = agent.decrypt_packet(&packet).unwrap();
+        let (kind, payload, seq) = agent.decrypt_packet_with_seq(&packet).unwrap();
         assert_eq!(kind, TYPE_INPUT);
+        assert_eq!(seq, 1);
         let decoded = decode_input(&payload).unwrap();
         assert!((decoded.x - input.x).abs() < 0.001);
         assert!((decoded.y - input.y).abs() < 0.001);
@@ -441,8 +479,7 @@ mod tests {
             Err(ProtocolError::Replay)
         ));
 
-        let wrong = Session::from_master(&[8u8; 32], sid, Side::Agent);
-        let mut wrong = wrong;
+        let mut wrong = Session::from_keys(&[8u8; 32], &[9u8; 32], sid, Side::Agent);
         let second = controller.encrypt_packet(TYPE_INPUT, &encode_input(&input));
         assert!(matches!(
             wrong.decrypt_packet(&second),
@@ -472,18 +509,55 @@ mod tests {
     }
 
     #[test]
-    fn handshake_rejects_wrong_passcode() {
+    fn pong_stats_round_trip_and_legacy_length() {
+        let stats = decode_pong(&encode_pong(42, 100, 97)).unwrap();
+        assert_eq!(stats, (42, Some((100, 97))));
+
+        let legacy = decode_pong(&42u64.to_le_bytes()).unwrap();
+        assert_eq!(legacy, (42, None));
+
+        assert!(decode_pong(&[0u8; 7]).is_err());
+
+        let mut extended = encode_pong(7, 8, 9).to_vec();
+        extended.push(0xff);
+        assert_eq!(decode_pong(&extended).unwrap(), (7, Some((8, 9))));
+    }
+
+    #[test]
+    fn decrypt_with_seq_reports_accepted_order() {
         let sid = random_sid();
-        let hello = Handshake {
-            sid,
-            screen: screen(800, 600),
-            timestamp_ms: now_ms(),
-        };
-        let packet = build_hello(&derive_master("the-right-code", &sid), &hello);
-        let wrong = derive_master("the-wrong-code", &sid);
+        let mut controller = Session::from_keys(&[7u8; 32], &[9u8; 32], sid, Side::Controller);
+        let mut agent = Session::from_keys(&[7u8; 32], &[9u8; 32], sid, Side::Agent);
+        let payload = encode_input(&RemoteInput::default());
+        let first = controller.encrypt_packet(TYPE_INPUT, &payload);
+        let second = controller.encrypt_packet(TYPE_INPUT, &payload);
+        let third = controller.encrypt_packet(TYPE_INPUT, &payload);
+
+        assert_eq!(agent.decrypt_packet_with_seq(&first).unwrap().2, 1);
+        assert_eq!(agent.decrypt_packet_with_seq(&third).unwrap().2, 3);
+        assert_eq!(agent.decrypt_packet_with_seq(&second).unwrap().2, 2);
         assert!(matches!(
-            parse_hello(&packet, &wrong),
-            Err(ProtocolError::Authentication)
+            agent.decrypt_packet_with_seq(&second),
+            Err(ProtocolError::Replay)
         ));
+    }
+
+    #[test]
+    fn wrong_pairing_code_derives_different_pake_keys() {
+        use spake2::{Ed25519Group, Identity, Password, Spake2};
+
+        let (controller, controller_msg) = Spake2::<Ed25519Group>::start_a(
+            &Password::new(b"AAAAAA"),
+            &Identity::new(b"controller"),
+            &Identity::new(b"agent"),
+        );
+        let (agent, agent_msg) = Spake2::<Ed25519Group>::start_b(
+            &Password::new(b"BBBBBB"),
+            &Identity::new(b"controller"),
+            &Identity::new(b"agent"),
+        );
+        let controller_key = controller.finish(&agent_msg).unwrap();
+        let agent_key = agent.finish(&controller_msg).unwrap();
+        assert_ne!(controller_key, agent_key);
     }
 }

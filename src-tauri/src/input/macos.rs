@@ -1,6 +1,6 @@
 use super::{
-    CaptureHandle, CaptureShared, InjectMsg, RemoteInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT,
-    BUTTON_X1, BUTTON_X2,
+    plan_injection_batch, CaptureHandle, CaptureShared, InjectCursor, InjectMsg, InjectStep,
+    RemoteInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
 };
 use crate::error;
 use crate::layout::{
@@ -623,6 +623,7 @@ fn run_capture_thread(
     bounds: CGRect,
     ready_tx: mpsc::Sender<Result<(), String>>,
 ) {
+    crate::sched::boost_current_thread();
     let mut state = Box::new(CaptureState {
         shared,
         tx,
@@ -747,77 +748,90 @@ fn injector_loop(
     bounds: CGRect,
     ready_tx: mpsc::Sender<Result<(), String>>,
 ) {
+    crate::sched::boost_current_thread();
     let _ = ready_tx.send(Ok(()));
-    let mut previous_buttons = 0u8;
-    let mut previous_position: Option<(u16, u16)> = None;
+    let mut applied_buttons = 0u8;
+    let mut applied_position: Option<(u16, u16)> = None;
+    let mut cursor = InjectCursor::default();
+    let mut batch = Vec::with_capacity(16);
+    let mut steps = Vec::with_capacity(16);
 
     while !stop.load(Ordering::Acquire) {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(InjectMsg::State(input)) => {
-                let x = (input.x.clamp(0.0, 1.0) * 65535.0).round() as u16;
-                let y = (input.y.clamp(0.0, 1.0) * 65535.0).round() as u16;
-                let point = CGPoint {
-                    x: bounds.min_x() + x as f64 / 65535.0 * (bounds.size.width - 1.0).max(1.0),
-                    y: bounds.min_y() + y as f64 / 65535.0 * (bounds.size.height - 1.0).max(1.0),
-                };
+        let first = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(msg) => msg,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
 
-                if previous_position != Some((x, y)) {
-                    let (event_type, button) = drag_event(previous_buttons)
-                        .unwrap_or((CG_EVENT_MOUSE_MOVED, CG_MOUSE_BUTTON_LEFT));
-                    post_mouse_event(event_type, point, button);
-                    previous_position = Some((x, y));
-                }
+        batch.clear();
+        batch.push(first);
+        while batch.len() < 64 {
+            match rx.try_recv() {
+                Ok(msg) => batch.push(msg),
+                Err(_) => break,
+            }
+        }
 
-                apply_button_transitions(previous_buttons, input.buttons, point);
-                previous_buttons = input.buttons;
-
-                if input.wheel != 0 {
-                    unsafe {
-                        let event = CGEventCreateScrollWheelEvent(
-                            null_mut(),
-                            CG_SCROLL_EVENT_UNIT_LINE,
-                            1,
-                            input.wheel as i32,
-                        );
-                        if !event.is_null() {
-                            CGEventPost(CG_TAP_LOCATION_HID, event);
-                            CFRelease(event as *const c_void);
-                        }
+        steps.clear();
+        plan_injection_batch(&batch, &mut cursor, &mut steps);
+        for step in steps.iter().copied() {
+            match step {
+                InjectStep::Move { x, y, buttons } => {
+                    if applied_position != Some((x, y)) {
+                        let point = point_from_normalized(x, y, bounds);
+                        let (event_type, button) = drag_event(buttons)
+                            .unwrap_or((CG_EVENT_MOUSE_MOVED, CG_MOUSE_BUTTON_LEFT));
+                        post_mouse_event(event_type, point, button);
+                        applied_position = Some((x, y));
                     }
                 }
+                InjectStep::Buttons { from, to } => {
+                    let point = applied_point_or_origin(applied_position, bounds);
+                    apply_button_transitions(from, to, point);
+                    applied_buttons = to;
+                }
+                InjectStep::Wheel(delta) => unsafe {
+                    let event = CGEventCreateScrollWheelEvent(
+                        null_mut(),
+                        CG_SCROLL_EVENT_UNIT_LINE,
+                        1,
+                        delta as i32,
+                    );
+                    if !event.is_null() {
+                        CGEventPost(CG_TAP_LOCATION_HID, event);
+                        CFRelease(event as *const c_void);
+                    }
+                },
+                InjectStep::Reset => {
+                    let point = applied_point_or_origin(applied_position, bounds);
+                    apply_button_transitions(applied_buttons, 0, point);
+                    applied_buttons = 0;
+                    applied_position = None;
+                }
             }
-            Ok(InjectMsg::Reset) => {
-                let point = previous_position
-                    .map(|(x, y)| CGPoint {
-                        x: bounds.min_x() + x as f64 / 65535.0 * (bounds.size.width - 1.0).max(1.0),
-                        y: bounds.min_y()
-                            + y as f64 / 65535.0 * (bounds.size.height - 1.0).max(1.0),
-                    })
-                    .unwrap_or(CGPoint {
-                        x: bounds.origin.x,
-                        y: bounds.origin.y,
-                    });
-                apply_button_transitions(previous_buttons, 0, point);
-                previous_buttons = 0;
-                previous_position = None;
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    if previous_buttons != 0 {
-        let point = previous_position
-            .map(|(x, y)| CGPoint {
-                x: bounds.min_x() + x as f64 / 65535.0 * (bounds.size.width - 1.0).max(1.0),
-                y: bounds.min_y() + y as f64 / 65535.0 * (bounds.size.height - 1.0).max(1.0),
-            })
-            .unwrap_or(CGPoint {
-                x: bounds.origin.x,
-                y: bounds.origin.y,
-            });
-        apply_button_transitions(previous_buttons, 0, point);
+    if applied_buttons != 0 {
+        let point = applied_point_or_origin(applied_position, bounds);
+        apply_button_transitions(applied_buttons, 0, point);
     }
+}
+
+fn point_from_normalized(x: u16, y: u16, bounds: CGRect) -> CGPoint {
+    CGPoint {
+        x: bounds.min_x() + x as f64 / 65535.0 * (bounds.size.width - 1.0).max(1.0),
+        y: bounds.min_y() + y as f64 / 65535.0 * (bounds.size.height - 1.0).max(1.0),
+    }
+}
+
+fn applied_point_or_origin(position: Option<(u16, u16)>, bounds: CGRect) -> CGPoint {
+    position
+        .map(|(x, y)| point_from_normalized(x, y, bounds))
+        .unwrap_or(CGPoint {
+            x: bounds.origin.x,
+            y: bounds.origin.y,
+        })
 }
 
 fn post_mouse_event(event_type: u32, point: CGPoint, button: u32) {
