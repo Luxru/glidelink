@@ -90,7 +90,7 @@
       "layout.peerAriaLabel": "被控端屏幕，可拖动排列。方向键选择方位，Shift 加方向键调整偏移。",
 
       "about.tagline": "低延迟软件 KVM",
-      "about.version": "版本 0.1.0 · Alpha",
+      "about.version": "版本 1.0.0",
       "about.sessionGroup": "会话",
       "about.role": "角色",
       "about.state": "状态",
@@ -246,7 +246,7 @@
       "layout.peerAriaLabel": "Peer screen. Drag to arrange it. Arrow keys choose a side; Shift plus arrows adjust the offset.",
 
       "about.tagline": "Low-latency software KVM",
-      "about.version": "Version 0.1.0 · Alpha",
+      "about.version": "Version 1.0.0",
       "about.sessionGroup": "Session",
       "about.role": "Role",
       "about.state": "State",

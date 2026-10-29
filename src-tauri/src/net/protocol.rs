@@ -1,5 +1,5 @@
-use crate::input::keymap::{KeyEvent, KeyPacket, KeyState};
-use crate::input::RemoteInput;
+use crate::input::keymap::{KeyState, CAPS_LOCK};
+use crate::input::{InputEvent, ReconcileState, RemoteInput};
 use crate::status::ScreenInfo;
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, Tag};
@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const MAGIC: &[u8; 4] = b"GLNK";
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 1;
 
 pub const TYPE_HELLO: u8 = 1;
 pub const TYPE_ACCEPT: u8 = 2;
@@ -20,7 +20,8 @@ pub const TYPE_PONG: u8 = 5;
 pub const TYPE_BYE: u8 = 6;
 pub const TYPE_CONFIRM: u8 = 7;
 pub const TYPE_CONFIRM_ACK: u8 = 8;
-pub const TYPE_KEY: u8 = 9;
+pub const TYPE_EVENT: u8 = 9;
+pub const TYPE_RECONCILE: u8 = 10;
 
 pub const SID_LEN: usize = 8;
 pub const TAG_LEN: usize = 16;
@@ -28,17 +29,21 @@ pub const HEADER_LEN: usize = 4 + 1 + 1 + SID_LEN + 8;
 pub const PAKE_MSG_LEN: usize = 33;
 pub const HELLO_LEN: usize = HEADER_LEN + 4 + 4 + 8 + 1 + PAKE_MSG_LEN;
 pub const ACCEPT_LEN: usize = HELLO_LEN;
-pub const INPUT_LEN: usize = 8;
-pub const KEY_LEN: usize = 34;
+pub const INPUT_LEN: usize = 4;
+pub const EVENT_LEN: usize = 16;
+pub const RECONCILE_LEN: usize = 36;
 pub const PONG_STATS_LEN: usize = 24;
-pub const CONFIRM_PAYLOAD: &[u8] = b"GlideLink/v2/confirm";
+pub const CONFIRM_PAYLOAD: &[u8] = b"GlideLink/v1/confirm";
 
-const KEY_FLAG_ACTIVE: u8 = 1 << 0;
-const KEY_FLAG_CAPS_LOCK: u8 = 1 << 1;
-const KEY_EVENT_SHIFT: u8 = 2;
-const KEY_EVENT_MASK: u8 = 0b11 << KEY_EVENT_SHIFT;
-const KEY_EVENT_STATE: u8 = 0;
-const KEY_EVENT_REPEAT: u8 = 1;
+const EVENT_BUTTON: u8 = 1;
+const EVENT_WHEEL: u8 = 2;
+const EVENT_KEY: u8 = 3;
+const EVENT_CAPS: u8 = 4;
+const EVENT_RELEASE_ALL: u8 = 5;
+const EVENT_FLAG_DOWN_OR_LOCKED: u8 = 1 << 0;
+const RECONCILE_FLAG_ACTIVE: u8 = 1 << 0;
+const RECONCILE_FLAG_CAPS_LOCK: u8 = 1 << 1;
+const BUTTON_MASK: u8 = 0b0001_1111;
 
 pub const PLATFORM_UNKNOWN: u8 = 0;
 #[allow(dead_code)]
@@ -46,8 +51,8 @@ pub const PLATFORM_MACOS: u8 = 1;
 #[allow(dead_code)]
 pub const PLATFORM_WINDOWS: u8 = 2;
 
-const C2A_LABEL: &[u8] = b"GlideLink/v2/controller-to-agent";
-const A2C_LABEL: &[u8] = b"GlideLink/v2/agent-to-controller";
+const C2A_LABEL: &[u8] = b"GlideLink/v1/controller-to-agent";
+const A2C_LABEL: &[u8] = b"GlideLink/v1/agent-to-controller";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Side {
@@ -367,9 +372,6 @@ pub fn encode_input(input: &RemoteInput) -> [u8; INPUT_LEN] {
     let mut out = [0u8; INPUT_LEN];
     out[0..2].copy_from_slice(&x.to_le_bytes());
     out[2..4].copy_from_slice(&y.to_le_bytes());
-    out[4] = input.buttons;
-    out[5] = 0;
-    out[6..8].copy_from_slice(&input.wheel.to_le_bytes());
     out
 }
 
@@ -379,64 +381,128 @@ pub fn decode_input(payload: &[u8]) -> Result<RemoteInput, ProtocolError> {
     }
     let x = u16::from_le_bytes(payload[0..2].try_into().unwrap()) as f32 / u16::MAX as f32;
     let y = u16::from_le_bytes(payload[2..4].try_into().unwrap()) as f32 / u16::MAX as f32;
-    let buttons = payload[4];
-    let wheel = i16::from_le_bytes(payload[6..8].try_into().unwrap());
-    Ok(RemoteInput {
-        x,
-        y,
-        buttons,
-        wheel,
-    })
+    Ok(RemoteInput { x, y })
 }
 
-pub fn encode_key(packet: &KeyPacket) -> [u8; KEY_LEN] {
-    let mut out = [0u8; KEY_LEN];
-    out[..KeyState::BITS].copy_from_slice(packet.state.bits());
-    let mut flags = 0u8;
-    if packet.active {
-        flags |= KEY_FLAG_ACTIVE;
+fn valid_button(button: u8) -> bool {
+    button != 0 && button & !BUTTON_MASK == 0 && button.count_ones() == 1
+}
+
+pub fn encode_event(event: &InputEvent) -> [u8; EVENT_LEN] {
+    let mut out = [0u8; EVENT_LEN];
+    match *event {
+        InputEvent::Button { button, down } => {
+            out[0] = EVENT_BUTTON;
+            out[1] = u8::from(down);
+            out[2] = button;
+        }
+        InputEvent::Wheel { delta } => {
+            out[0] = EVENT_WHEEL;
+            out[4..6].copy_from_slice(&delta.to_le_bytes());
+        }
+        InputEvent::Key { hid, down } => {
+            out[0] = EVENT_KEY;
+            out[1] = u8::from(down);
+            out[2] = hid;
+        }
+        InputEvent::CapsLock { locked } => {
+            out[0] = EVENT_CAPS;
+            out[1] = u8::from(locked);
+        }
+        InputEvent::ReleaseAll => {
+            out[0] = EVENT_RELEASE_ALL;
+        }
     }
-    if packet.caps_lock {
-        flags |= KEY_FLAG_CAPS_LOCK;
-    }
-    if let KeyEvent::Repeat(hid) = packet.event {
-        flags |= KEY_EVENT_REPEAT << KEY_EVENT_SHIFT;
-        out[33] = hid;
-    }
-    out[32] = flags;
     out
 }
 
-pub fn decode_key(payload: &[u8]) -> Result<KeyPacket, ProtocolError> {
-    if payload.len() != KEY_LEN {
+pub fn decode_event(payload: &[u8]) -> Result<InputEvent, ProtocolError> {
+    if payload.len() != EVENT_LEN {
         return Err(ProtocolError::Malformed);
     }
-    let flags = payload[32];
-    if flags & 0b1111_0000 != 0 {
+    if payload[3] != 0 || payload[6..].iter().any(|byte| *byte != 0) {
+        return Err(ProtocolError::Malformed);
+    }
+    let flags = payload[1];
+    if flags & !EVENT_FLAG_DOWN_OR_LOCKED != 0 {
+        return Err(ProtocolError::Malformed);
+    }
+    let code = payload[2];
+    let delta = i16::from_le_bytes(payload[4..6].try_into().unwrap());
+    match payload[0] {
+        EVENT_BUTTON => {
+            if !valid_button(code) || delta != 0 {
+                return Err(ProtocolError::Malformed);
+            }
+            Ok(InputEvent::Button {
+                button: code,
+                down: flags & EVENT_FLAG_DOWN_OR_LOCKED != 0,
+            })
+        }
+        EVENT_WHEEL => {
+            if flags != 0 || code != 0 || delta == 0 {
+                return Err(ProtocolError::Malformed);
+            }
+            Ok(InputEvent::Wheel { delta })
+        }
+        EVENT_KEY => {
+            if code == 0 || code == CAPS_LOCK || delta != 0 {
+                return Err(ProtocolError::Malformed);
+            }
+            Ok(InputEvent::Key {
+                hid: code,
+                down: flags & EVENT_FLAG_DOWN_OR_LOCKED != 0,
+            })
+        }
+        EVENT_CAPS => {
+            if code != 0 || delta != 0 {
+                return Err(ProtocolError::Malformed);
+            }
+            Ok(InputEvent::CapsLock {
+                locked: flags & EVENT_FLAG_DOWN_OR_LOCKED != 0,
+            })
+        }
+        EVENT_RELEASE_ALL => {
+            if flags != 0 || code != 0 || delta != 0 {
+                return Err(ProtocolError::Malformed);
+            }
+            Ok(InputEvent::ReleaseAll)
+        }
+        _ => Err(ProtocolError::Malformed),
+    }
+}
+
+pub fn encode_reconcile(state: &ReconcileState) -> [u8; RECONCILE_LEN] {
+    let mut out = [0u8; RECONCILE_LEN];
+    if state.active {
+        out[0] |= RECONCILE_FLAG_ACTIVE;
+    }
+    if state.caps_lock {
+        out[0] |= RECONCILE_FLAG_CAPS_LOCK;
+    }
+    out[1] = state.buttons;
+    out[2..34].copy_from_slice(state.keys.bits());
+    out
+}
+
+pub fn decode_reconcile(payload: &[u8]) -> Result<ReconcileState, ProtocolError> {
+    if payload.len() != RECONCILE_LEN {
+        return Err(ProtocolError::Malformed);
+    }
+    let flags = payload[0];
+    if flags & !(RECONCILE_FLAG_ACTIVE | RECONCILE_FLAG_CAPS_LOCK) != 0
+        || payload[1] & !BUTTON_MASK != 0
+        || payload[34..].iter().any(|byte| *byte != 0)
+    {
         return Err(ProtocolError::Malformed);
     }
     let mut bits = [0u8; KeyState::BITS];
-    bits.copy_from_slice(&payload[..KeyState::BITS]);
-    let event = match (flags & KEY_EVENT_MASK) >> KEY_EVENT_SHIFT {
-        KEY_EVENT_STATE => {
-            if payload[33] != 0 {
-                return Err(ProtocolError::Malformed);
-            }
-            KeyEvent::None
-        }
-        KEY_EVENT_REPEAT => {
-            if payload[33] == 0 {
-                return Err(ProtocolError::Malformed);
-            }
-            KeyEvent::Repeat(payload[33])
-        }
-        _ => return Err(ProtocolError::Malformed),
-    };
-    Ok(KeyPacket {
-        active: flags & KEY_FLAG_ACTIVE != 0,
-        caps_lock: flags & KEY_FLAG_CAPS_LOCK != 0,
-        state: KeyState::from_bits(bits),
-        event,
+    bits.copy_from_slice(&payload[2..34]);
+    Ok(ReconcileState {
+        active: flags & RECONCILE_FLAG_ACTIVE != 0,
+        caps_lock: flags & RECONCILE_FLAG_CAPS_LOCK != 0,
+        buttons: payload[1],
+        keys: KeyState::from_bits(bits),
     })
 }
 
@@ -531,12 +597,7 @@ mod tests {
         let mut controller = Session::from_keys(&[7u8; 32], &[9u8; 32], sid, Side::Controller);
         let mut agent = Session::from_keys(&[7u8; 32], &[9u8; 32], sid, Side::Agent);
 
-        let input = RemoteInput {
-            x: 0.123,
-            y: 0.987,
-            buttons: 0b0000_0101,
-            wheel: -2,
-        };
+        let input = RemoteInput { x: 0.123, y: 0.987 };
         let packet = controller.encrypt_packet(TYPE_INPUT, &encode_input(&input));
         let (kind, payload, seq) = agent.decrypt_packet_with_seq(&packet).unwrap();
         assert_eq!(kind, TYPE_INPUT);
@@ -544,8 +605,6 @@ mod tests {
         let decoded = decode_input(&payload).unwrap();
         assert!((decoded.x - input.x).abs() < 0.001);
         assert!((decoded.y - input.y).abs() < 0.001);
-        assert_eq!(decoded.buttons, input.buttons);
-        assert_eq!(decoded.wheel, input.wheel);
 
         assert!(matches!(
             agent.decrypt_packet(&packet),
@@ -582,47 +641,101 @@ mod tests {
     }
 
     #[test]
-    fn key_packet_round_trip_and_validation() {
-        let mut state = KeyState::default();
-        for hid in [0x04, 0xE3, 0xE1] {
-            state.insert(hid);
+    fn event_round_trip_and_validation() {
+        for event in [
+            InputEvent::Button {
+                button: 1,
+                down: true,
+            },
+            InputEvent::Button {
+                button: 16,
+                down: false,
+            },
+            InputEvent::Wheel { delta: -3 },
+            InputEvent::Key {
+                hid: 0x04,
+                down: true,
+            },
+            InputEvent::Key {
+                hid: 0xE3,
+                down: false,
+            },
+            InputEvent::CapsLock { locked: true },
+            InputEvent::ReleaseAll,
+        ] {
+            let encoded = encode_event(&event);
+            assert_eq!(encoded.len(), EVENT_LEN);
+            assert_eq!(decode_event(&encoded).unwrap(), event);
         }
-        let packet = KeyPacket {
+
+        assert!(decode_event(&[0u8; EVENT_LEN - 1]).is_err());
+        assert!(decode_event(&[0u8; EVENT_LEN + 1]).is_err());
+
+        let mut bad_reserved = encode_event(&InputEvent::Wheel { delta: 1 });
+        bad_reserved[6] = 1;
+        assert!(decode_event(&bad_reserved).is_err());
+
+        let mut bad_button = encode_event(&InputEvent::Button {
+            button: 1,
+            down: true,
+        });
+        bad_button[2] = 3;
+        assert!(decode_event(&bad_button).is_err());
+
+        let mut bad_key = encode_event(&InputEvent::Key {
+            hid: 0x04,
+            down: true,
+        });
+        bad_key[2] = 0;
+        assert!(decode_event(&bad_key).is_err());
+
+        let mut caps_as_key = encode_event(&InputEvent::Key {
+            hid: CAPS_LOCK,
+            down: true,
+        });
+        caps_as_key[2] = CAPS_LOCK;
+        assert!(decode_event(&caps_as_key).is_err());
+
+        let mut zero_wheel = encode_event(&InputEvent::Wheel { delta: 1 });
+        zero_wheel[4..6].copy_from_slice(&0i16.to_le_bytes());
+        assert!(decode_event(&zero_wheel).is_err());
+    }
+
+    #[test]
+    fn reconcile_round_trip_and_validation() {
+        let mut keys = KeyState::default();
+        for hid in [0x04, 0xE3, 0xE1] {
+            keys.insert(hid);
+        }
+        let state = ReconcileState {
             active: true,
             caps_lock: true,
-            state,
-            event: KeyEvent::Repeat(0x04),
+            buttons: 0b0000_0101,
+            keys,
         };
-        let encoded = encode_key(&packet);
-        assert_eq!(encoded.len(), KEY_LEN);
-        assert_eq!(decode_key(&encoded).unwrap(), packet);
+        let encoded = encode_reconcile(&state);
+        assert_eq!(encoded.len(), RECONCILE_LEN);
+        assert_eq!(decode_reconcile(&encoded).unwrap(), state);
 
-        let inactive = KeyPacket {
-            active: false,
-            caps_lock: false,
-            state: KeyState::default(),
-            event: KeyEvent::None,
-        };
-        assert_eq!(decode_key(&encode_key(&inactive)).unwrap(), inactive);
+        let inactive = ReconcileState::INACTIVE;
+        assert_eq!(
+            decode_reconcile(&encode_reconcile(&inactive)).unwrap(),
+            inactive
+        );
 
-        assert!(decode_key(&[]).is_err());
-        assert!(decode_key(&[0u8; KEY_LEN - 1]).is_err());
+        assert!(decode_reconcile(&[0u8; RECONCILE_LEN - 1]).is_err());
 
-        let mut reserved = encoded;
-        reserved[32] |= 0b1000_0000;
-        assert!(decode_key(&reserved).is_err());
+        let mut reserved_flags = encoded;
+        reserved_flags[0] |= 0b1000_0000;
+        assert!(decode_reconcile(&reserved_flags).is_err());
 
-        let mut bad_event = encoded;
-        bad_event[32] = KEY_EVENT_REPEAT << KEY_EVENT_SHIFT;
-        bad_event[33] = 0;
-        assert!(decode_key(&bad_event).is_err());
+        let mut reserved_buttons = encoded;
+        reserved_buttons[1] |= 0b1000_0000;
+        assert!(decode_reconcile(&reserved_buttons).is_err());
 
-        let mut state_with_key = inactive;
-        state_with_key.event = KeyEvent::Repeat(0x04);
-        let mut encoded_state = encode_key(&state_with_key);
-        encoded_state[32] = 0;
-        encoded_state[33] = 0x04;
-        assert!(decode_key(&encoded_state).is_err());
+        let mut reserved_tail = encoded;
+        reserved_tail[35] = 1;
+        assert!(decode_reconcile(&reserved_tail).is_err());
     }
 
     #[test]

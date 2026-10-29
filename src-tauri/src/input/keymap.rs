@@ -168,22 +168,12 @@ pub fn adapt_modifier_hid(hid: u8) -> u8 {
     }
 }
 
-pub fn adapt_key_packet(packet: &mut KeyPacket) {
-    let mut state = KeyState::default();
-    for hid in packet.state.iter() {
-        state.insert(adapt_modifier_hid(hid));
-    }
-    packet.state = state;
-    if let KeyEvent::Repeat(hid) = packet.event {
-        packet.event = KeyEvent::Repeat(adapt_modifier_hid(hid));
-    }
-}
-
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct KeyState([u8; 32]);
 
 impl KeyState {
     pub const BITS: usize = 32;
+    pub const EMPTY: Self = Self([0u8; 32]);
 
     pub fn contains(&self, hid: u8) -> bool {
         self.0[hid as usize / 8] & (1 << (hid % 8)) != 0
@@ -221,29 +211,6 @@ impl fmt::Debug for KeyState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KeyEvent {
-    None,
-    Repeat(u8),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeyPacket {
-    pub active: bool,
-    pub caps_lock: bool,
-    pub state: KeyState,
-    pub event: KeyEvent,
-}
-
-impl KeyPacket {
-    pub const INACTIVE: Self = Self {
-        active: false,
-        caps_lock: false,
-        state: KeyState([0u8; 32]),
-        event: KeyEvent::None,
-    };
 }
 
 #[cfg(test)]
@@ -286,24 +253,6 @@ mod tests {
         for unchanged in [0xE1, 0xE2, 0xE5, 0xE6, 0x04, 0x39] {
             assert_eq!(adapt_modifier_hid(unchanged), unchanged);
         }
-
-        let mut state = KeyState::default();
-        for hid in [0xE0, 0xE3, 0xE4, 0xE7, 0xE1, 0x04] {
-            state.insert(hid);
-        }
-        let mut packet = KeyPacket {
-            active: true,
-            caps_lock: true,
-            state,
-            event: KeyEvent::Repeat(0xE3),
-        };
-        adapt_key_packet(&mut packet);
-        for hid in [0xE3, 0xE0, 0xE7, 0xE4, 0xE1, 0x04] {
-            assert!(packet.state.contains(hid), "missing {hid:#x}");
-        }
-        assert_eq!(packet.event, KeyEvent::Repeat(0xE0));
-        assert!(packet.active);
-        assert!(packet.caps_lock);
     }
 
     #[test]

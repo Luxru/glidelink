@@ -1,11 +1,8 @@
 use super::{
-    keymap::{
-        hid_to_scan, is_caps, is_modifier, scan_to_hid, KeyEvent, KeyPacket, KeyState, CAPS_LOCK,
-        KEY_DEFS,
-    },
+    keymap::{hid_to_scan, is_caps, is_modifier, scan_to_hid, KeyState, CAPS_LOCK, KEY_DEFS},
     plan_injection_batch, CaptureHandle, CaptureMsg, CaptureShared, InjectCursor, InjectMsg,
-    InjectStep, KeyAction, KeyOwnership, RemoteInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT,
-    BUTTON_X1, BUTTON_X2,
+    InjectStep, InputEvent, KeyAction, KeyOwnership, KeyRepeater, ReconcileState, RemoteInput,
+    BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
 };
 use crate::error;
 use crate::layout::{
@@ -138,34 +135,30 @@ fn with_state<R>(f: impl FnOnce(&mut CaptureState) -> R) -> Option<R> {
 }
 
 impl CaptureState {
-    fn send(&self, wheel: i16) {
+    fn send_move(&self) {
         let input = RemoteInput {
             x: self.point.x,
             y: self.point.y,
-            buttons: self.buttons,
-            wheel,
         };
-        let _ = self.tx.try_send(CaptureMsg::Mouse(input));
+        let _ = self.tx.try_send(CaptureMsg::Move(input));
     }
 
-    fn send_keys(&self, event: KeyEvent) {
-        let packet = KeyPacket {
-            active: true,
-            caps_lock: self.caps_lock,
-            state: self.keys.remote,
-            event,
-        };
-        let _ = self.tx.try_send(CaptureMsg::Keys(packet));
+    fn send_event(&self, event: InputEvent) {
+        let _ = self.tx.try_send(CaptureMsg::Event(event));
     }
 
-    fn send_inactive_keys(&self) {
-        let packet = KeyPacket {
-            active: false,
+    fn send_reconcile(&self, active: bool) {
+        let state = ReconcileState {
+            active,
             caps_lock: self.caps_lock,
-            state: KeyState::default(),
-            event: KeyEvent::None,
+            buttons: if active { self.buttons } else { 0 },
+            keys: if active {
+                self.keys.remote
+            } else {
+                KeyState::default()
+            },
         };
-        let _ = self.tx.try_send(CaptureMsg::Keys(packet));
+        let _ = self.tx.try_send(CaptureMsg::Reconcile(state));
     }
 
     fn at_edge(&self) -> bool {
@@ -187,27 +180,45 @@ impl CaptureState {
             match message {
                 WM_LBUTTONDOWN => {
                     self.buttons |= BUTTON_LEFT;
-                    self.send(0);
+                    self.send_event(InputEvent::Button {
+                        button: BUTTON_LEFT,
+                        down: true,
+                    });
                 }
                 WM_LBUTTONUP => {
                     self.buttons &= !BUTTON_LEFT;
-                    self.send(0);
+                    self.send_event(InputEvent::Button {
+                        button: BUTTON_LEFT,
+                        down: false,
+                    });
                 }
                 WM_RBUTTONDOWN => {
                     self.buttons |= BUTTON_RIGHT;
-                    self.send(0);
+                    self.send_event(InputEvent::Button {
+                        button: BUTTON_RIGHT,
+                        down: true,
+                    });
                 }
                 WM_RBUTTONUP => {
                     self.buttons &= !BUTTON_RIGHT;
-                    self.send(0);
+                    self.send_event(InputEvent::Button {
+                        button: BUTTON_RIGHT,
+                        down: false,
+                    });
                 }
                 WM_MBUTTONDOWN => {
                     self.buttons |= BUTTON_MIDDLE;
-                    self.send(0);
+                    self.send_event(InputEvent::Button {
+                        button: BUTTON_MIDDLE,
+                        down: true,
+                    });
                 }
                 WM_MBUTTONUP => {
                     self.buttons &= !BUTTON_MIDDLE;
-                    self.send(0);
+                    self.send_event(InputEvent::Button {
+                        button: BUTTON_MIDDLE,
+                        down: false,
+                    });
                 }
                 WM_XBUTTONDOWN | WM_XBUTTONUP => {
                     let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
@@ -217,12 +228,13 @@ impl CaptureState {
                     } else {
                         BUTTON_X2
                     };
-                    if message == WM_XBUTTONDOWN {
+                    let down = message == WM_XBUTTONDOWN;
+                    if down {
                         self.buttons |= bit;
                     } else {
                         self.buttons &= !bit;
                     }
-                    self.send(0);
+                    self.send_event(InputEvent::Button { button: bit, down });
                 }
                 WM_MOUSEWHEEL => {
                     let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
@@ -235,7 +247,7 @@ impl CaptureState {
                         0
                     };
                     if notches != 0 {
-                        self.send(notches);
+                        self.send_event(InputEvent::Wheel { delta: notches });
                     }
                 }
                 WM_MOUSEHWHEEL => {}
@@ -287,7 +299,9 @@ impl CaptureState {
                 if !self.caps_down {
                     self.caps_down = true;
                     self.caps_lock = !self.caps_lock;
-                    self.send_keys(KeyEvent::None);
+                    self.send_event(InputEvent::CapsLock {
+                        locked: self.caps_lock,
+                    });
                 }
             } else {
                 self.caps_down = false;
@@ -298,19 +312,17 @@ impl CaptureState {
         if down {
             match self.keys.key_down(true, hid) {
                 KeyAction::Down => {
-                    self.send_keys(KeyEvent::None);
+                    self.send_event(InputEvent::Key { hid, down: true });
                     HookAction::Swallow
                 }
-                KeyAction::Repeat => {
-                    self.send_keys(KeyEvent::Repeat(hid));
-                    HookAction::Swallow
-                }
+                // The receiver owns repeat timing.
+                KeyAction::Repeat => HookAction::Swallow,
                 _ => HookAction::Swallow,
             }
         } else {
             match self.keys.key_up(true, hid) {
                 KeyAction::Up => {
-                    self.send_keys(KeyEvent::None);
+                    self.send_event(InputEvent::Key { hid, down: false });
                     HookAction::Swallow
                 }
                 KeyAction::Passthrough => HookAction::Pass,
@@ -326,7 +338,7 @@ impl CaptureState {
                 self.deactivate(true);
             } else {
                 self.point = clamp_for_edge(self.edge, self.point);
-                self.send(0);
+                self.send_move();
             }
             return;
         }
@@ -372,8 +384,8 @@ impl CaptureState {
             }
             self.hidden = true;
         }
-        self.send_keys(KeyEvent::None);
-        self.send(0);
+        self.send_move();
+        self.send_reconcile(true);
     }
 
     fn deactivate(&mut self, warp_cursor: bool) {
@@ -389,10 +401,10 @@ impl CaptureState {
         self.active = false;
         self.buttons = 0;
         self.point = self.point.clamped();
-        self.send_inactive_keys();
+        self.send_event(InputEvent::ReleaseAll);
+        self.send_reconcile(false);
         self.keys.deactivate();
         self.caps_down = false;
-        self.send(0);
         self.shared.set_active(false);
 
         if warp_cursor {
@@ -798,12 +810,24 @@ fn injector_loop(
     let mut applied_buttons = 0u8;
     let mut applied_keys = KeyState::default();
     let mut caps_actual = unsafe { GetAsyncKeyState(VK_CAPITAL as i32) as u16 & 1 != 0 };
-    let mut cursor = InjectCursor::default();
+    let mut repeater = KeyRepeater::default();
+    let mut cursor = InjectCursor {
+        caps_lock: caps_actual,
+        ..InjectCursor::default()
+    };
     let mut batch = Vec::with_capacity(16);
     let mut steps = Vec::with_capacity(16);
 
     while !stop.load(Ordering::Acquire) {
-        let first = match rx.recv_timeout(Duration::from_millis(100)) {
+        let now = Instant::now();
+        if let Some(hid) = repeater.poll(now) {
+            if applied_keys.contains(hid) && !is_modifier(hid) {
+                send_key_hid(hid, true);
+            }
+        }
+
+        let timeout = repeater.timeout(now, Duration::from_millis(100));
+        let first = match rx.recv_timeout(timeout) {
             Ok(msg) => msg,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -841,18 +865,15 @@ fn injector_loop(
                 InjectStep::KeyPress(hid) => {
                     if !applied_keys.contains(hid) {
                         applied_keys.insert(hid);
+                        repeater.press(hid, Instant::now());
                         send_key_hid(hid, true);
                     }
                 }
                 InjectStep::KeyRelease(hid) => {
+                    repeater.release(hid);
                     if applied_keys.contains(hid) {
                         applied_keys.remove(hid);
                         send_key_hid(hid, false);
-                    }
-                }
-                InjectStep::KeyRepeat(hid) => {
-                    if applied_keys.contains(hid) {
-                        send_key_hid(hid, true);
                     }
                 }
                 InjectStep::CapsLock(desired) => {
@@ -864,6 +885,7 @@ fn injector_loop(
                 }
                 InjectStep::Reset => {
                     release_keys(&mut applied_keys);
+                    repeater.release_all();
                     apply_button_transitions(applied_buttons, 0);
                     applied_buttons = 0;
                     caps_actual = unsafe { query_caps_lock() };

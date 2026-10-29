@@ -1,6 +1,6 @@
 [package]
 name = "glidelink"
-version = "0.1.0"
+version = "1.0.0"
 description = "Low-latency software KVM for sharing one mouse across machines"
 authors = ["GlideLink contributors"]
 edition = "2021"

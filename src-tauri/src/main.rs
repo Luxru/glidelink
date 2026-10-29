@@ -72,10 +72,7 @@ fn save_settings(
 }
 
 #[tauri::command]
-fn preview_invite(
-    local_ip: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
+fn preview_invite(local_ip: String, state: tauri::State<'_, AppState>) -> Result<String, String> {
     let ip = local_ip
         .trim()
         .parse::<Ipv4Addr>()

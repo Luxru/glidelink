@@ -29,11 +29,17 @@ ui/ ──commands──► Engine
 
 ## Input flow
 
-The controller captures mouse and keyboard at the system level. When the pointer reaches the configured edge and keeps moving outward, forwarding starts: mouse movement is coalesced to the latest position, while buttons, wheel, and keyboard state are sent immediately. The agent decrypts and injects the input. Crossing the return threshold restores local control and releases all remote keys.
+The controller captures mouse and keyboard at the system level. When the pointer reaches the configured edge and keeps moving outward, forwarding starts:
+
+- Mouse movement is coalesced to the latest position (`TYPE_INPUT`, absolute normalized coordinates).
+- Mouse buttons, wheel, key down/up, and Caps Lock are discrete events sent immediately (`TYPE_EVENT`), so coalescing a move cannot drop a click or key edge.
+- The agent owns key repeat (500 ms delay, 32 ms interval) and double-click counting; the controller does not forward OS autorepeat.
+- Every 500 ms the controller sends `TYPE_RECONCILE` with held keys, held buttons, Caps Lock, and whether the pointer is remote. A lost event heals within one period; disconnect or timeout releases everything.
+- Crossing the return threshold restores local control and sends release-all plus an inactive state.
 
 Coordinates are normalized to 0–1 on each virtual desktop, so movement stays proportional across resolutions. The peer can sit to the left, right, above, or below, and can slide along the shared edge.
 
-Input uses UDP: pointer position is replaceable state, so old packets need no retransmission. Button state travels with every packet and resets after reconnect.
+Input uses UDP: pointer position is replaceable state, so old packets need no retransmission. Discrete events are not retransmitted; the 500 ms reconciliation repairs recoverable state. A very short tap can still be lost on an extreme lossy link.
 
 ## Platform backends
 

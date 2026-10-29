@@ -3,18 +3,21 @@ pub mod protocol;
 
 use crate::config::AppConfig;
 use crate::error;
-use crate::input::keymap::{adapt_key_packet, KeyEvent, KeyPacket};
-use crate::input::{self, CaptureMsg, CaptureShared, InjectMsg, RemoteInput};
+use crate::input::{
+    self, adapt_event, adapt_reconcile, CaptureMsg, CaptureShared, InjectMsg, InputEvent,
+    ReconcileState, RemoteInput,
+};
 use crate::invite::{self, Invite, PORT_RANGE_END, PORT_RANGE_START};
 use crate::status::{ScreenInfo, Status};
 use crossbeam_channel::{bounded, never, tick, Receiver, Sender, TrySendError};
 use metrics::{LossTracker, RttEstimator};
 use protocol::{
-    build_pake_accept, build_pake_hello, decode_input, decode_key, decode_pong, decode_u64,
-    derive_session_keys, encode_input, encode_key, encode_pong, encode_u64, hello_sid, now_ms,
-    parse_pake_accept, parse_pake_hello, random_sid, transcript_hash, Handshake, ProtocolError,
-    Session, Side, CONFIRM_PAYLOAD, HELLO_LEN, PAKE_MSG_LEN, TYPE_BYE, TYPE_CONFIRM,
-    TYPE_CONFIRM_ACK, TYPE_HELLO, TYPE_INPUT, TYPE_KEY, TYPE_PING, TYPE_PONG,
+    build_pake_accept, build_pake_hello, decode_event, decode_input, decode_pong, decode_reconcile,
+    decode_u64, derive_session_keys, encode_event, encode_input, encode_pong, encode_reconcile,
+    encode_u64, hello_sid, now_ms, parse_pake_accept, parse_pake_hello, random_sid,
+    transcript_hash, Handshake, ProtocolError, Session, Side, CONFIRM_PAYLOAD, HELLO_LEN,
+    PAKE_MSG_LEN, TYPE_BYE, TYPE_CONFIRM, TYPE_CONFIRM_ACK, TYPE_EVENT, TYPE_HELLO, TYPE_INPUT,
+    TYPE_PING, TYPE_PONG, TYPE_RECONCILE,
 };
 use rand::RngCore;
 use serde::Serialize;
@@ -31,7 +34,7 @@ const CONTROLLER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROLLER_CONFIRM_RETRY: Duration = Duration::from_millis(500);
 const CONTROLLER_CONFIRM_TIMEOUT: Duration = Duration::from_millis(2_500);
 const CONTROLLER_PING_INTERVAL: Duration = Duration::from_millis(100);
-const CONTROLLER_KEY_INTERVAL: Duration = Duration::from_millis(100);
+const CONTROLLER_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const CONTROLLER_PONG_TIMEOUT: Duration = Duration::from_millis(2_500);
 const CONTROLLER_UNREACHABLE_HINT_AFTER: Duration = Duration::from_secs(8);
 const CONTROLLER_READER_TIMEOUT: Duration = Duration::from_millis(50);
@@ -44,8 +47,8 @@ const LINK_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 const INPUT_INTERVAL: Duration = Duration::from_millis(2);
 const DSCP_EF: u32 = 0xB8;
-const PAKE_ID_A: &[u8] = b"GlideLink v2 controller";
-const PAKE_ID_B: &[u8] = b"GlideLink v2 agent";
+const PAKE_ID_A: &[u8] = b"GlideLink v1 controller";
+const PAKE_ID_B: &[u8] = b"GlideLink v1 agent";
 
 type Datagram = (Vec<u8>, SocketAddr);
 
@@ -401,6 +404,36 @@ fn drop_controller_session(
     });
 }
 
+fn apply_event_to_reconcile(state: &mut ReconcileState, event: InputEvent) {
+    match event {
+        InputEvent::Button { button, down } => {
+            state.active = true;
+            if down {
+                state.buttons |= button;
+            } else {
+                state.buttons &= !button;
+            }
+        }
+        InputEvent::Wheel { .. } => state.active = true,
+        InputEvent::Key { hid, down } => {
+            state.active = true;
+            if down {
+                state.keys.insert(hid);
+            } else {
+                state.keys.remove(hid);
+            }
+        }
+        InputEvent::CapsLock { locked } => {
+            state.active = true;
+            state.caps_lock = locked;
+        }
+        InputEvent::ReleaseAll => {
+            state.buttons = 0;
+            state.keys = Default::default();
+        }
+    }
+}
+
 fn send_encrypted(
     session: &mut Session,
     kind: u8,
@@ -435,7 +468,7 @@ fn controller_loop(
     let mut pending: Option<PendingHandshake> = None;
     let mut active: Option<ControllerSession> = None;
     let mut pending_move: Option<RemoteInput> = None;
-    let mut last_sent_buttons = 0u8;
+    let mut reconcile = ReconcileState::INACTIVE;
     let mut last_hello = Instant::now()
         .checked_sub(CONTROLLER_HANDSHAKE_RETRY)
         .unwrap_or_else(Instant::now);
@@ -452,14 +485,17 @@ fn controller_loop(
     let mut max_lateness_ms = 0.0f64;
     let mut last_diag = Instant::now();
     let mut peer_platform = protocol::PLATFORM_UNKNOWN;
-    let mut last_key_packet: Option<KeyPacket> = None;
-    let mut last_key_send = Instant::now();
+    let mut last_reconcile_send = Instant::now();
+    let mut outgoing: Vec<(u8, Vec<u8>)> = Vec::with_capacity(8);
 
     while !stop.load(Ordering::Acquire) {
         let now = Instant::now();
+        if active.is_none() {
+            reconcile = ReconcileState::INACTIVE;
+        }
 
-        // Drain capture first, but keep only the latest move. Button and wheel
-        // changes are sent immediately so clicks are never delayed.
+        // Drain capture. Moves are latest-wins; every discrete event is sent
+        // immediately, after flushing the move that preceded it.
         loop {
             let message = if let Some(message) = pending_capture.take() {
                 message
@@ -469,132 +505,64 @@ fn controller_loop(
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         capture_source = never();
-                        last_key_packet = Some(KeyPacket::INACTIVE);
+                        reconcile = ReconcileState::INACTIVE;
+                        pending_move = None;
                         break;
                     }
                 }
             };
-            let input = match message {
-                CaptureMsg::Mouse(input) => input,
-                CaptureMsg::Keys(mut packet) => {
-                    let Some(current) = active.as_mut() else {
-                        continue;
-                    };
-                    if !current.confirmed {
-                        continue;
-                    }
+
+            let confirmed = active.as_ref().map(|c| c.confirmed).unwrap_or(false);
+            if !confirmed {
+                continue;
+            }
+
+            match message {
+                CaptureMsg::Move(input) => pending_move = Some(input),
+                CaptureMsg::Event(mut event) => {
                     if adapt_modifiers
                         && peer_platform != 0
                         && peer_platform != input::platform_id()
                     {
-                        adapt_key_packet(&mut packet);
+                        adapt_event(&mut event);
                     }
+                    apply_event_to_reconcile(&mut reconcile, event);
                     if let Some(queued) = pending_move.take() {
-                        if let Err(e) = send_encrypted(
-                            &mut current.session,
-                            TYPE_INPUT,
-                            &encode_input(&queued),
-                            &socket,
-                            peer,
-                            &status,
-                        ) {
-                            log::warn!("input send failed: {e}");
-                            drop_controller_session(
-                                &mut active,
-                                &mut pending,
-                                &mut pending_move,
-                                &mut pending_pings,
-                                &mut last_hello,
-                                &capture_shared,
-                                &status,
-                                Some("NET_SEND_FAILED"),
-                                Some(e),
-                            );
-                            last_sent_buttons = 0;
-                            break;
-                        }
+                        outgoing.push((TYPE_INPUT, encode_input(&queued).to_vec()));
                     }
-                    if last_key_packet.map_or(true, |previous| previous != packet) {
-                        log::debug!(
-                            "send key active={} caps={} keys={:?}",
-                            packet.active,
-                            packet.caps_lock,
-                            packet.state
-                        );
+                    outgoing.push((TYPE_EVENT, encode_event(&event).to_vec()));
+                }
+                CaptureMsg::Reconcile(mut state) => {
+                    if adapt_modifiers
+                        && peer_platform != 0
+                        && peer_platform != input::platform_id()
+                    {
+                        adapt_reconcile(&mut state);
                     }
-                    if let Err(e) = send_encrypted(
-                        &mut current.session,
-                        TYPE_KEY,
-                        &encode_key(&packet),
-                        &socket,
-                        peer,
-                        &status,
-                    ) {
-                        log::warn!("key state send failed: {e}");
-                        drop_controller_session(
-                            &mut active,
-                            &mut pending,
-                            &mut pending_move,
-                            &mut pending_pings,
-                            &mut last_hello,
-                            &capture_shared,
-                            &status,
-                            Some("NET_SEND_FAILED"),
-                            Some(e),
-                        );
-                        last_sent_buttons = 0;
+                    reconcile = state;
+                    if let Some(queued) = pending_move.take() {
+                        outgoing.push((TYPE_INPUT, encode_input(&queued).to_vec()));
+                    }
+                    outgoing.push((TYPE_RECONCILE, encode_reconcile(&state).to_vec()));
+                    last_reconcile_send = now;
+                }
+            }
+        }
+
+        if !outgoing.is_empty() {
+            let mut send_error = None;
+            if let Some(current) = active.as_mut() {
+                for (kind, payload) in outgoing.drain(..) {
+                    if let Err(e) =
+                        send_encrypted(&mut current.session, kind, &payload, &socket, peer, &status)
+                    {
+                        send_error = Some(e);
                         break;
                     }
-                    last_key_packet = Some(packet);
-                    last_key_send = now;
-                    continue;
-                }
-            };
-
-            let Some(current) = active.as_mut() else {
-                continue;
-            };
-            if !current.confirmed {
-                continue;
-            }
-            let must_send = input.buttons != last_sent_buttons || input.wheel != 0;
-            if !must_send {
-                pending_move = Some(input);
-                continue;
-            }
-            if let Some(queued) = pending_move.take() {
-                if let Err(e) = send_encrypted(
-                    &mut current.session,
-                    TYPE_INPUT,
-                    &encode_input(&queued),
-                    &socket,
-                    peer,
-                    &status,
-                ) {
-                    log::warn!("input send failed: {e}");
-                    drop_controller_session(
-                        &mut active,
-                        &mut pending,
-                        &mut pending_move,
-                        &mut pending_pings,
-                        &mut last_hello,
-                        &capture_shared,
-                        &status,
-                        Some("NET_SEND_FAILED"),
-                        Some(e),
-                    );
-                    last_sent_buttons = 0;
-                    break;
                 }
             }
-            if let Err(e) = send_encrypted(
-                &mut current.session,
-                TYPE_INPUT,
-                &encode_input(&input),
-                &socket,
-                peer,
-                &status,
-            ) {
+            outgoing.clear();
+            if let Some(e) = send_error {
                 log::warn!("input send failed: {e}");
                 drop_controller_session(
                     &mut active,
@@ -607,11 +575,9 @@ fn controller_loop(
                     Some("NET_SEND_FAILED"),
                     Some(e),
                 );
-                last_sent_buttons = 0;
-                break;
+                reconcile = ReconcileState::INACTIVE;
+                last_reconcile_send = now;
             }
-            last_sent_buttons = input.buttons;
-            current.pacer.last_move_send = now;
         }
 
         if let Some(current) = active.as_mut() {
@@ -643,7 +609,6 @@ fn controller_loop(
                                 Some("NET_SEND_FAILED"),
                                 Some(e),
                             );
-                            last_sent_buttons = 0;
                         } else {
                             pending_move = None;
                             current.pacer.last_move_send = now;
@@ -723,7 +688,6 @@ fn controller_loop(
                             Some("NET_SEND_FAILED"),
                             Some(e),
                         );
-                        last_sent_buttons = 0;
                         continue;
                     }
                     current.last_confirm = now;
@@ -741,7 +705,6 @@ fn controller_loop(
                         Some("NET_TIMEOUT"),
                         None,
                     );
-                    last_sent_buttons = 0;
                     continue;
                 }
             } else {
@@ -766,20 +729,20 @@ fn controller_loop(
                     last_ping = now;
                 }
 
-                if now.saturating_duration_since(last_key_send) >= CONTROLLER_KEY_INTERVAL {
-                    let mut packet = last_key_packet.unwrap_or(KeyPacket::INACTIVE);
-                    packet.event = KeyEvent::None;
+                if now.saturating_duration_since(last_reconcile_send)
+                    >= CONTROLLER_RECONCILE_INTERVAL
+                {
                     if let Err(e) = send_encrypted(
                         &mut current.session,
-                        TYPE_KEY,
-                        &encode_key(&packet),
+                        TYPE_RECONCILE,
+                        &encode_reconcile(&reconcile),
                         &socket,
                         peer,
                         &status,
                     ) {
-                        log::warn!("key state send failed: {e}");
+                        log::warn!("reconcile send failed: {e}");
                     }
-                    last_key_send = now;
+                    last_reconcile_send = now;
                 }
             }
         }
@@ -874,13 +837,14 @@ fn controller_loop(
                                 });
                                 last_pong = now;
                                 last_ping = now;
-                                last_sent_buttons = 0;
+                                reconcile = ReconcileState::INACTIVE;
+                                last_reconcile_send = now
+                                    .checked_sub(CONTROLLER_RECONCILE_INTERVAL)
+                                    .unwrap_or(now);
                                 pending_move = None;
                                 pending_pings.clear();
-                                last_key_packet = Some(KeyPacket::INACTIVE);
-                                last_key_send = now;
                                 log::info!(
-                                    "v2 session confirmed with {peer} ({}x{}, platform={})",
+                                    "v1 session confirmed with {peer} ({}x{}, platform={})",
                                     screen.width,
                                     screen.height,
                                     platform_label(peer_platform)
@@ -934,7 +898,6 @@ fn controller_loop(
                             None,
                             None,
                         );
-                        last_sent_buttons = 0;
                     }
                     Ok(_) => {
                         if current.confirmed {
@@ -971,7 +934,6 @@ fn controller_loop(
                 None,
             );
             unreachable_reported = false;
-            last_sent_buttons = 0;
             continue;
         }
 
@@ -1080,7 +1042,8 @@ struct AgentSession {
     controller: SocketAddr,
     last_packet: Instant,
     loss: LossTracker,
-    last_key_seq: u64,
+    last_semantic_seq: u64,
+    last_move_seq: u64,
 }
 
 struct PendingAgent {
@@ -1115,7 +1078,6 @@ fn agent_loop(
     let mut pending: Option<PendingAgent> = None;
     let mut last_input = Instant::now();
     let mut active_reported = false;
-    let mut last_logged_key: Option<KeyPacket> = None;
     let mut pake_limiter = PakeLimiter::new();
     let mut buf = [0u8; 2048];
 
@@ -1232,11 +1194,11 @@ fn agent_loop(
                             controller: from,
                             last_packet: now,
                             loss: LossTracker::new(base_seq),
-                            last_key_seq: 0,
+                            last_semantic_seq: 0,
+                            last_move_seq: 0,
                         });
                         last_input = now;
                         active_reported = false;
-                        last_logged_key = None;
                         status.update(|s| {
                             s.connected = true;
                             s.remote_active = false;
@@ -1248,7 +1210,7 @@ fn agent_loop(
                             s.packet_loss_percent = None;
                         });
                         log::info!(
-                            "v2 session confirmed with {from} (platform={})",
+                            "v1 session confirmed with {from} (platform={})",
                             platform_label(controller_platform)
                         );
                     }
@@ -1268,18 +1230,77 @@ fn agent_loop(
                         active.loss.observe(seq);
                         match kind {
                             TYPE_INPUT => {
-                                if let Ok(input) = decode_input(&payload) {
-                                    let _ = inject_tx.send(InjectMsg::State(input));
-                                    let now = Instant::now();
-                                    active.last_packet = now;
-                                    last_input = now;
-                                    if !active_reported {
-                                        active_reported = true;
-                                        status.update(|s| {
-                                            s.remote_active = true;
-                                            s.last_error_code = None;
-                                            s.last_error_detail = None;
-                                        });
+                                let now = Instant::now();
+                                active.last_packet = now;
+                                if seq > active.last_move_seq && seq > active.last_semantic_seq {
+                                    if let Ok(input) = decode_input(&payload) {
+                                        active.last_move_seq = seq;
+                                        let _ = inject_tx.send(InjectMsg::Move(input));
+                                        last_input = now;
+                                        if !active_reported {
+                                            active_reported = true;
+                                            status.update(|s| {
+                                                s.remote_active = true;
+                                                s.last_error_code = None;
+                                                s.last_error_detail = None;
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            TYPE_EVENT => {
+                                let now = Instant::now();
+                                active.last_packet = now;
+                                if seq > active.last_semantic_seq {
+                                    match decode_event(&payload) {
+                                        Ok(event) => {
+                                            active.last_semantic_seq = seq;
+                                            let _ = inject_tx.send(InjectMsg::Event(event));
+                                            if matches!(event, InputEvent::ReleaseAll) {
+                                                active_reported = false;
+                                                status.update(|s| s.remote_active = false);
+                                            } else {
+                                                last_input = now;
+                                                if !active_reported {
+                                                    active_reported = true;
+                                                    status.update(|s| {
+                                                        s.remote_active = true;
+                                                        s.last_error_code = None;
+                                                        s.last_error_detail = None;
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        Err(_) => log::warn!("rejected input event from {from}"),
+                                    }
+                                }
+                            }
+                            TYPE_RECONCILE => {
+                                let now = Instant::now();
+                                active.last_packet = now;
+                                if seq > active.last_semantic_seq {
+                                    match decode_reconcile(&payload) {
+                                        Ok(state) => {
+                                            active.last_semantic_seq = seq;
+                                            let _ = inject_tx.send(InjectMsg::Reconcile(state));
+                                            if state.active {
+                                                last_input = now;
+                                                if !active_reported {
+                                                    active_reported = true;
+                                                    status.update(|s| {
+                                                        s.remote_active = true;
+                                                        s.last_error_code = None;
+                                                        s.last_error_detail = None;
+                                                    });
+                                                }
+                                            } else {
+                                                active_reported = false;
+                                                status.update(|s| s.remote_active = false);
+                                            }
+                                        }
+                                        Err(_) => {
+                                            log::warn!("rejected reconcile state from {from}")
+                                        }
                                     }
                                 }
                             }
@@ -1295,43 +1316,6 @@ fn agent_loop(
                                     let _ = send_packet(&socket, &response, from, &status);
                                     let loss = active.loss.loss_percent();
                                     status.update(|s| s.packet_loss_percent = loss);
-                                }
-                            }
-                            TYPE_KEY => {
-                                let now = Instant::now();
-                                active.last_packet = now;
-                                if seq > active.last_key_seq {
-                                    if let Ok(packet) = decode_key(&payload) {
-                                        active.last_key_seq = seq;
-                                        if last_logged_key
-                                            .map_or(true, |previous| previous != packet)
-                                        {
-                                            log::debug!(
-                                                "recv key active={} caps={} keys={:?}",
-                                                packet.active,
-                                                packet.caps_lock,
-                                                packet.state
-                                            );
-                                            last_logged_key = Some(packet);
-                                        }
-                                        let _ = inject_tx.send(InjectMsg::Keys(packet));
-                                        if packet.active {
-                                            last_input = now;
-                                            if !active_reported {
-                                                active_reported = true;
-                                                status.update(|s| {
-                                                    s.remote_active = true;
-                                                    s.last_error_code = None;
-                                                    s.last_error_detail = None;
-                                                });
-                                            }
-                                        } else {
-                                            active_reported = false;
-                                            status.update(|s| s.remote_active = false);
-                                        }
-                                    } else {
-                                        log::warn!("rejected key state from {from}");
-                                    }
                                 }
                             }
                             TYPE_CONFIRM => {
@@ -1386,6 +1370,7 @@ fn agent_loop(
 
         if active_reported && now.saturating_duration_since(last_input) >= AGENT_ACTIVE_TIMEOUT {
             active_reported = false;
+            let _ = inject_tx.send(InjectMsg::Event(InputEvent::ReleaseAll));
             status.update(|s| s.remote_active = false);
         }
 
@@ -1428,7 +1413,8 @@ mod tests {
     #[test]
     fn constants_fit_in_udp_buffers() {
         assert!(protocol::HEADER_LEN + protocol::INPUT_LEN + protocol::TAG_LEN < 2048);
-        assert!(protocol::HEADER_LEN + protocol::KEY_LEN + protocol::TAG_LEN < 2048);
+        assert!(protocol::HEADER_LEN + protocol::EVENT_LEN + protocol::TAG_LEN < 2048);
+        assert!(protocol::HEADER_LEN + protocol::RECONCILE_LEN + protocol::TAG_LEN < 2048);
         assert_eq!(protocol::HELLO_LEN, 72);
     }
 
@@ -1510,89 +1496,99 @@ mod tests {
         }
 
         capture_tx
-            .send(CaptureMsg::Mouse(RemoteInput {
-                x: 0.25,
-                y: 0.75,
-                buttons: BUTTON_LEFT,
-                wheel: -1,
-            }))
-            .expect("send input");
-
+            .send(CaptureMsg::Move(RemoteInput { x: 0.25, y: 0.75 }))
+            .expect("send move");
         let received = loop {
             match inject_rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(InjectMsg::State(input)) => break input,
-                Ok(InjectMsg::Keys(_)) => continue,
-                Ok(InjectMsg::Reset) => continue,
-                Err(e) => panic!("agent did not forward input: {e}"),
+                Ok(InjectMsg::Move(input)) => break input,
+                Ok(_) => continue,
+                Err(e) => panic!("agent did not forward move: {e}"),
             }
         };
         assert!((received.x - 0.25).abs() < 0.001);
         assert!((received.y - 0.75).abs() < 0.001);
-        assert_eq!(received.buttons, BUTTON_LEFT);
-        assert_eq!(received.wheel, -1);
         assert!(agent_status.snapshot().connected);
 
-        // A move without a button/wheel change goes through the paced
-        // coalescing path instead of being sent immediately.
         capture_tx
-            .send(CaptureMsg::Mouse(RemoteInput {
-                x: 0.5,
-                y: 0.5,
-                buttons: 0,
-                wheel: 0,
+            .send(CaptureMsg::Event(InputEvent::Button {
+                button: BUTTON_LEFT,
+                down: true,
             }))
-            .expect("send move");
-        let moved = loop {
-            match inject_rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(InjectMsg::State(input)) => break input,
-                Ok(InjectMsg::Keys(_)) => continue,
-                Ok(InjectMsg::Reset) => continue,
-                Err(e) => panic!("agent did not forward move: {e}"),
-            }
-        };
-        assert!((moved.x - 0.5).abs() < 0.001);
-        assert!((moved.y - 0.5).abs() < 0.001);
-        assert!(controller_status.snapshot().packets_sent > 0);
-        assert!(controller_status.snapshot().bytes_sent > 0);
-
-        let mut keys = crate::input::keymap::KeyState::default();
-        keys.insert(0x04); // A
+            .expect("send button");
         capture_tx
-            .send(CaptureMsg::Keys(KeyPacket {
-                active: true,
-                caps_lock: false,
-                state: keys,
-                event: KeyEvent::None,
-            }))
-            .expect("send key state");
-        let forwarded_key = loop {
+            .send(CaptureMsg::Event(InputEvent::Wheel { delta: -1 }))
+            .expect("send wheel");
+        let mut saw_button = false;
+        let mut saw_wheel = false;
+        while !saw_button || !saw_wheel {
             match inject_rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(InjectMsg::Keys(packet)) if packet.state.contains(0x04) => break packet,
+                Ok(InjectMsg::Event(InputEvent::Button {
+                    button: BUTTON_LEFT,
+                    down: true,
+                })) => saw_button = true,
+                Ok(InjectMsg::Event(InputEvent::Wheel { delta: -1 })) => saw_wheel = true,
                 Ok(_) => continue,
-                Err(e) => panic!("agent did not forward key state: {e}"),
+                Err(e) => panic!("agent did not forward discrete events: {e}"),
             }
-        };
-        assert!(forwarded_key.active);
+        }
         assert!(agent_status.snapshot().remote_active);
 
         capture_tx
-            .send(CaptureMsg::Keys(KeyPacket {
-                active: false,
-                caps_lock: false,
-                state: crate::input::keymap::KeyState::default(),
-                event: KeyEvent::None,
+            .send(CaptureMsg::Event(InputEvent::Key {
+                hid: 0x04,
+                down: true,
             }))
-            .expect("send key release");
+            .expect("send key");
         loop {
             match inject_rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(InjectMsg::Keys(packet)) if !packet.active => {
-                    assert!(packet.state.is_empty());
-                    break;
-                }
+                Ok(InjectMsg::Event(InputEvent::Key {
+                    hid: 0x04,
+                    down: true,
+                })) => break,
                 Ok(_) => continue,
-                Err(e) => panic!("agent did not receive inactive key state: {e}"),
+                Err(e) => panic!("agent did not forward key edge: {e}"),
             }
         }
+
+        let mut keys = crate::input::keymap::KeyState::default();
+        keys.insert(0x04); // A
+        let reconcile = ReconcileState {
+            active: true,
+            caps_lock: true,
+            buttons: BUTTON_LEFT,
+            keys,
+        };
+        capture_tx
+            .send(CaptureMsg::Reconcile(reconcile))
+            .expect("send reconcile");
+        loop {
+            match inject_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(InjectMsg::Reconcile(state)) if state == reconcile => break,
+                Ok(_) => continue,
+                Err(e) => panic!("agent did not forward reconciliation: {e}"),
+            }
+        }
+        assert!(agent_status.snapshot().remote_active);
+
+        capture_tx
+            .send(CaptureMsg::Event(InputEvent::ReleaseAll))
+            .expect("send release-all");
+        capture_tx
+            .send(CaptureMsg::Reconcile(ReconcileState::INACTIVE))
+            .expect("send inactive reconcile");
+        let mut saw_release = false;
+        let mut saw_inactive = false;
+        while !saw_release || !saw_inactive {
+            match inject_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(InjectMsg::Event(InputEvent::ReleaseAll)) => saw_release = true,
+                Ok(InjectMsg::Reconcile(state)) if !state.active => saw_inactive = true,
+                Ok(_) => continue,
+                Err(e) => panic!("agent did not release input: {e}"),
+            }
+        }
+        assert!(!agent_status.snapshot().remote_active);
+        assert!(controller_status.snapshot().packets_sent > 0);
+        assert!(controller_status.snapshot().bytes_sent > 0);
 
         controller_stop.store(true, Ordering::Release);
         agent_stop.store(true, Ordering::Release);
