@@ -593,7 +593,11 @@ impl CaptureState {
         };
         let _ = self.tx.try_send(CaptureMsg::Move {
             device,
-            input: RemoteInput { dx, dy },
+            input: RemoteInput {
+                dx,
+                dy,
+                buttons: self.buttons,
+            },
         });
     }
 
@@ -913,6 +917,10 @@ impl CaptureState {
         self.target = Some(device);
         self.point = world;
         self.host_anchor = host_anchor;
+        log::info!(
+            "input target activate {}",
+            crate::layout::device_id_to_hex(&device)
+        );
         self.buttons = current_buttons();
         self.keys.begin(current_held_keys());
         self.caps_lock = current_caps_lock();
@@ -933,7 +941,8 @@ impl CaptureState {
         if self.target == Some(device) {
             return;
         }
-        if let Some(old) = self.target {
+        let old = self.target;
+        if let Some(old) = old {
             let _ = self.tx.try_send(CaptureMsg::Event {
                 device: old,
                 event: InputEvent::ReleaseAll,
@@ -948,6 +957,12 @@ impl CaptureState {
                 },
             });
         }
+        log::info!(
+            "input target switch {} -> {}",
+            old.map(|value| crate::layout::device_id_to_hex(&value))
+                .unwrap_or_else(|| "host".to_string()),
+            crate::layout::device_id_to_hex(&device)
+        );
         self.target = Some(device);
         self.point = world;
         self.buttons = current_buttons();
@@ -976,6 +991,12 @@ impl CaptureState {
                     keys: KeyState::EMPTY,
                 },
             });
+        }
+        if let Some(device) = old {
+            log::info!(
+                "input target leave {}",
+                crate::layout::device_id_to_hex(&device)
+            );
         }
         self.active = false;
         self.buttons = 0;
@@ -1300,6 +1321,11 @@ fn injector_loop(
                 }
                 InjectStep::Warp { x, y, buttons } => {
                     let point = point_from_normalized(x, y, bounds);
+                    log::debug!(
+                        "agent warp to ({:.1},{:.1}) buttons={buttons:#04x}",
+                        point.x,
+                        point.y
+                    );
                     let (event_type, button) =
                         drag_event(buttons).unwrap_or((CG_EVENT_MOUSE_MOVED, CG_MOUSE_BUTTON_LEFT));
                     post_mouse_event(event_type, point, button);
@@ -1644,6 +1670,9 @@ fn drag_event(buttons: u8) -> Option<(u32, u32)> {
 
 fn apply_button_transitions(previous: u8, current: u8, point: CGPoint, clicks: &mut ClickTracker) {
     let changed = previous ^ current;
+    if changed != 0 {
+        log::debug!("agent buttons {previous:#04x} -> {current:#04x}");
+    }
     post_transition(
         changed,
         current,
@@ -1999,7 +2028,11 @@ fn test_injection(bounds: CGRect) -> Result<(), String> {
     }
     let warped = (actual.x - target.x).abs() < 8.0 && (actual.y - target.y).abs() < 8.0;
 
-    let _ = tx.send(InjectMsg::Move(RemoteInput { dx: 8, dy: 4 }));
+    let _ = tx.send(InjectMsg::Move(RemoteInput {
+        dx: 8,
+        dy: 4,
+        buttons: 0,
+    }));
     thread::sleep(Duration::from_millis(100));
     let relative = cursor_location();
     let moved =

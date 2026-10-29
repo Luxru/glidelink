@@ -5,6 +5,7 @@ mod error;
 mod input;
 mod invite;
 mod layout;
+mod logging;
 mod net;
 mod sched;
 mod state;
@@ -16,6 +17,7 @@ use layout::DevicePlacement;
 use state::{AppState, StateView};
 use status::ScreenInfo;
 use std::collections::HashSet;
+use std::net::Ipv4Addr;
 use tauri::Manager;
 
 #[tauri::command]
@@ -66,6 +68,30 @@ fn start_session(
 }
 
 #[tauri::command]
+fn preview_pairing_code(
+    local_ip: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    if let Some(code) = state.status.snapshot().pairing_code {
+        return Ok(code);
+    }
+    let ip = local_ip
+        .trim()
+        .parse::<Ipv4Addr>()
+        .map_err(|_| error::code("E_LOCAL_IP"))?;
+    if ip.is_loopback() || ip.is_unspecified() {
+        return Err(error::code("E_LOCAL_IP"));
+    }
+    let last = state.config.snapshot()?.last_invite;
+    let code = net::preview_listen_code(ip, &last)?;
+    state.update_config(|config| {
+        config.last_invite = code.clone();
+        Ok(())
+    })?;
+    Ok(code)
+}
+
+#[tauri::command]
 fn save_layout(
     devices: Vec<DevicePlacement>,
     state: tauri::State<'_, AppState>,
@@ -111,7 +137,19 @@ fn save_settings(
     patch: config::SettingsPatch,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
-    state.update_config(|config| config.apply_patch(&patch))
+    let config = state.update_config(|config| config.apply_patch(&patch))?;
+    let _ = logging::set_level(&config.log_level);
+    Ok(config)
+}
+
+#[tauri::command]
+fn get_logs() -> Vec<logging::LogEntry> {
+    logging::snapshot()
+}
+
+#[tauri::command]
+fn clear_logs() {
+    logging::clear();
 }
 
 #[tauri::command]
@@ -131,10 +169,7 @@ fn open_permissions() -> Result<(), String> {
 }
 
 fn main() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("glidelink=info"),
-    )
-    .try_init();
+    logging::init("info");
 
     // Hardware smoke test used to validate the macOS input backend without
     // starting the UI. See README: Development and tests.
@@ -173,6 +208,7 @@ fn main() {
                 }
             };
 
+            let _ = logging::set_level(&config.log_level);
             app.manage(AppState::new(settings_path, config, status));
             Ok(())
         })
@@ -183,6 +219,9 @@ fn main() {
             open_permissions,
             save_settings,
             save_layout,
+            preview_pairing_code,
+            get_logs,
+            clear_logs,
             reopen_app
         ])
         .build(tauri::generate_context!())

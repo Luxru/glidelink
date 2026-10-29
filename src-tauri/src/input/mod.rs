@@ -28,6 +28,7 @@ pub const BUTTON_X2: u8 = 1 << 4;
 pub struct RemoteInput {
     pub dx: i32,
     pub dy: i32,
+    pub buttons: u8,
 }
 
 /// One absolute pointer position used to enter or re-synchronize a peer screen.
@@ -220,6 +221,13 @@ fn flush_pending_move(
 ) {
     if let Some(input) = pending_move.take() {
         if input.dx != 0 || input.dy != 0 {
+            if input.buttons != cursor.buttons {
+                out.push(InjectStep::Buttons {
+                    from: cursor.buttons,
+                    to: input.buttons,
+                });
+                cursor.buttons = input.buttons;
+            }
             out.push(InjectStep::Move {
                 dx: input.dx,
                 dy: input.dy,
@@ -373,6 +381,7 @@ pub(crate) fn plan_injection_batch(
                 let pending = pending_move.get_or_insert_with(RemoteInput::default);
                 pending.dx = pending.dx.saturating_add(input.dx);
                 pending.dy = pending.dy.saturating_add(input.dy);
+                pending.buttons = input.buttons;
             }
             InjectMsg::Warp(input) => {
                 flush_pending_move(cursor, &mut pending_move, out);
@@ -572,7 +581,11 @@ mod tests {
     use super::*;
 
     fn mv(dx: i32, dy: i32) -> InjectMsg {
-        InjectMsg::Move(RemoteInput { dx, dy })
+        InjectMsg::Move(RemoteInput { dx, dy, buttons: 0 })
+    }
+
+    fn mv_with_buttons(dx: i32, dy: i32, buttons: u8) -> InjectMsg {
+        InjectMsg::Move(RemoteInput { dx, dy, buttons })
     }
 
     fn px(value: f32) -> u16 {
@@ -690,7 +703,12 @@ mod tests {
 
     #[test]
     fn held_drag_moves_carry_the_button_state() {
-        let msgs = [mv(1, 1), down(BUTTON_LEFT), mv(2, 2), mv(3, 3)];
+        let msgs = [
+            mv(1, 1),
+            down(BUTTON_LEFT),
+            mv_with_buttons(2, 2, BUTTON_LEFT),
+            mv_with_buttons(3, 3, BUTTON_LEFT),
+        ];
         let mut cursor = InjectCursor::default();
         let steps = plan(&msgs, &mut cursor);
         assert_eq!(
@@ -731,6 +749,30 @@ mod tests {
                     x: px(0.25),
                     y: px(0.75),
                     buttons: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn button_state_carried_by_motion_can_start_a_drag() {
+        let msgs = [
+            mv_with_buttons(2, 2, BUTTON_LEFT),
+            mv_with_buttons(3, 3, BUTTON_LEFT),
+        ];
+        let mut cursor = InjectCursor::default();
+        let steps = plan(&msgs, &mut cursor);
+        assert_eq!(
+            steps,
+            vec![
+                InjectStep::Buttons {
+                    from: 0,
+                    to: BUTTON_LEFT,
+                },
+                InjectStep::Move {
+                    dx: 5,
+                    dy: 5,
+                    buttons: BUTTON_LEFT,
                 },
             ]
         );

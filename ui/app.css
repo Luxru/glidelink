@@ -1342,3 +1342,27 @@ input[type="number"]::-webkit-outer-spin-button {
   font-size: 11px;
   line-height: 1.5;
 }
+
+/* Logs -------------------------------------------------------------------- */
+
+.log-actions {
+  display: flex;
+  gap: 8px;
+  padding: 12px 0 4px;
+}
+
+.log-panel {
+  margin: 8px 0 0;
+  padding: 12px;
+  max-height: 52vh;
+  overflow: auto;
+  border-radius: 8px;
+  background: #1e1e22;
+  color: #e8e8ed;
+  font-family: "SF Mono", "Cascadia Mono", Menlo, monospace;
+  font-size: 10.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}

@@ -55,6 +55,11 @@ const els = {
   aboutBytesSent: document.getElementById("aboutBytesSent"),
   aboutBytesReceived: document.getElementById("aboutBytesReceived"),
   aboutBuild: document.getElementById("aboutBuild"),
+  logLevel: document.getElementById("logLevel"),
+  logPanel: document.getElementById("logPanel"),
+  logCount: document.getElementById("logCount"),
+  copyLogs: document.getElementById("copyLogs"),
+  clearLogs: document.getElementById("clearLogs"),
   toast: document.getElementById("toast"),
 };
 
@@ -73,6 +78,8 @@ const ui = {
   configLocalIp: "",
   lastPairingCode: "",
   lastListenCode: "",
+  previewListenIp: "",
+  previewListenPromise: null,
   devices: [],
   peers: [],
   targetDevice: null,
@@ -94,6 +101,7 @@ const PAGES = {
   session: "page.session.title",
   layout: "page.layout.title",
   settings: "page.settings.title",
+  logs: "page.logs.title",
   about: "page.about.title",
 };
 
@@ -273,6 +281,7 @@ function setPage(page) {
   updatePageChrome();
   els.pageScroll.scrollTop = 0;
   if (page === "layout") requestAnimationFrame(renderLayout);
+  if (page === "logs") refreshLogs();
 }
 
 function updateStartLabel() {
@@ -616,6 +625,33 @@ function updateInterfaces(interfaces, preferredIp) {
   updateSettingsControls();
 }
 
+async function refreshControllerCode() {
+  if (!invoke || ui.role !== "controller" || ui.running || ui.loading) return;
+  const ip = ui.selectedIp;
+  if (!ip) return;
+  if (ui.previewListenIp === ip && getPairingCode().length === PAIRING_CODE_LENGTH) return;
+  if (ui.previewListenPromise) return ui.previewListenPromise;
+  ui.previewListenPromise = (async () => {
+    try {
+      const code = await withTimeout(invoke("preview_pairing_code", { localIp: ip }));
+      if (
+        ui.role === "controller"
+        && !ui.running
+        && ui.selectedIp === ip
+      ) {
+        setPairingCode(code);
+        ui.lastListenCode = code;
+        ui.previewListenIp = ip;
+      }
+    } catch (error) {
+      setError(errorToRaw(error));
+    } finally {
+      ui.previewListenPromise = null;
+    }
+  })();
+  return ui.previewListenPromise;
+}
+
 function setLoading(loading) {
   ui.loading = loading;
   els.startBtn.classList.toggle("loading", loading);
@@ -644,6 +680,7 @@ function setRole(role, syncControls = true) {
     setPairingCode(code);
   }
   updateInterfaces(ui.interfaces, ui.configLocalIp);
+  if (ui.role === "controller" && !ui.running) refreshControllerCode();
   renderLayout();
   updateStartLabel();
   updateSettingsControls();
@@ -695,6 +732,7 @@ function revertSettingsFromSaved() {
   if (!config) return;
   els.adaptModifiers.checked = Boolean(config.adaptModifiers);
   ui.adaptModifiers = Boolean(config.adaptModifiers);
+  if (config.logLevel) els.logLevel.value = config.logLevel;
   ui.configLocalIp = config.localIp || "";
   const preferred = config.localIp || ui.selectedIp;
   updateInterfaces(ui.interfaces, preferred);
@@ -712,6 +750,7 @@ async function saveSettings(patch) {
       ui.savedConfig = config;
       ui.adaptModifiers = Boolean(config.adaptModifiers);
       els.adaptModifiers.checked = ui.adaptModifiers;
+      if (config.logLevel) els.logLevel.value = config.logLevel;
       ui.configLocalIp = config.localIp || "";
       if (config.language) {
         ui.language = config.language;
@@ -763,6 +802,7 @@ function applyState(state) {
     ui.interfaces = Array.isArray(state.localInterfaces) ? state.localInterfaces : [];
     ui.adaptModifiers = Boolean(config.adaptModifiers);
     els.adaptModifiers.checked = ui.adaptModifiers;
+    if (config.logLevel) els.logLevel.value = config.logLevel;
     setRole(config.role, false);
     setPairingCode(
       config.role === "controller"
@@ -770,6 +810,7 @@ function applyState(state) {
         : (config.lastPairingCode || ""),
     );
     updateInterfaces(ui.interfaces, ui.configLocalIp);
+    if (ui.role === "controller" && !ui.running) refreshControllerCode();
     setDisabledControls(ui.running);
     ui.initialized = true;
     syncLanguage(config.language);
@@ -782,6 +823,7 @@ function applyState(state) {
     setDisabledControls(false);
     if (ui.role === "controller") {
       setPairingCode(ui.lastListenCode || "");
+      ui.previewListenIp = ui.selectedIp;
     } else {
       setPairingCode(ui.lastPairingCode || "");
     }
@@ -794,7 +836,14 @@ function applyState(state) {
 
   if (ui.role === "controller" && incomingStatus?.running && incomingStatus.pairingCode) {
     ui.lastListenCode = incomingStatus.pairingCode;
+    ui.previewListenIp = ui.selectedIp;
     setPairingCode(incomingStatus.pairingCode);
+  } else if (
+    ui.role === "controller"
+    && !ui.running
+    && getPairingCode().length !== PAIRING_CODE_LENGTH
+  ) {
+    refreshControllerCode();
   }
 
   if (ui.running) setDisabledControls(true);
@@ -862,6 +911,25 @@ function applyState(state) {
   }
 
   updateAboutStats(status);
+}
+
+async function refreshLogs() {
+  if (!invoke || ui.page !== "logs") return;
+  try {
+    const entries = await withTimeout(invoke("get_logs"));
+    const panel = els.logPanel;
+    const atBottom = panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 8;
+    const lines = (Array.isArray(entries) ? entries : []).map((entry) => {
+      const seconds = (Number(entry.elapsedMs || 0) / 1000).toFixed(3).padStart(9, " ");
+      const level = String(entry.level || "").padEnd(5, " ");
+      return `[${seconds}s] ${level} ${entry.target || ""}: ${entry.message || ""}`;
+    });
+    panel.textContent = lines.length ? lines.join("\n") : t("logs.empty");
+    els.logCount.textContent = lines.length ? String(lines.length) : "";
+    if (atBottom) panel.scrollTop = panel.scrollHeight;
+  } catch (error) {
+    els.logPanel.textContent = errorToRaw(error);
+  }
 }
 
 async function refresh() {
@@ -984,6 +1052,26 @@ function initEvents() {
   });
 
   els.copyPasscode.addEventListener("click", copyPasscode);
+  els.logLevel.addEventListener("change", () => {
+    saveSettings({ logLevel: els.logLevel.value });
+    refreshLogs();
+  });
+  els.copyLogs.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(els.logPanel.textContent || "");
+      showToast(t("logs.copy"));
+    } catch (error) {
+      setError(errorToRaw(error));
+    }
+  });
+  els.clearLogs.addEventListener("click", async () => {
+    try {
+      await invoke("clear_logs");
+      refreshLogs();
+    } catch (error) {
+      setError(errorToRaw(error));
+    }
+  });
 
   els.codeCells.forEach((cell, index) => {
     cell.addEventListener("input", () => {
@@ -1027,8 +1115,10 @@ function initEvents() {
     ui.selectedIp = els.interfaceSelect.value;
     els.selectedIp.textContent = ui.selectedIp || "—";
     ui.lastListenCode = "";
+    ui.previewListenIp = "";
     setPairingCode("");
     saveSettings({ localIp: ui.selectedIp });
+    refreshControllerCode();
   });
 
   els.adaptModifiers.addEventListener("change", () => {
@@ -1097,6 +1187,9 @@ async function boot() {
     setError(errorToRaw(error));
   }
   setInterval(refresh, 500);
+  setInterval(() => {
+    if (ui.page === "logs") refreshLogs();
+  }, 1000);
 }
 
 boot();

@@ -321,7 +321,11 @@ fn scale_relative(input: RemoteInput, host: ScreenInfo, peer: ScreenInfo) -> Rem
     }
     let dx = (input.dx as f64 * peer.width as f64 / host.width as f64).round() as i32;
     let dy = (input.dy as f64 * peer.height as f64 / host.height as f64).round() as i32;
-    RemoteInput { dx, dy }
+    RemoteInput {
+        dx,
+        dy,
+        buttons: input.buttons,
+    }
 }
 
 fn flush_peer_move(
@@ -436,19 +440,34 @@ impl Hub {
                     {
                         log::warn!("input move send failed: {e}");
                     }
-                    let mut event = event;
+                    let mut wire_event = event;
                     if adapt {
-                        adapt_event(&mut event);
+                        adapt_event(&mut wire_event);
                     }
                     if let Err(e) = send_encrypted(
                         &self.socket,
                         &mut peer.session,
                         TYPE_EVENT,
-                        &encode_event(&event),
+                        &encode_event(&wire_event),
                         peer.addr,
                         &self.status,
                     ) {
                         log::warn!("event send failed: {e}");
+                    }
+                    // Critical edges are idempotent. Also send the resulting
+                    // state now so a lost button/key packet does not wait for
+                    // the 500ms periodic reconcile.
+                    if !matches!(event, InputEvent::Wheel { .. }) {
+                        let active = self.active_target == Some(device);
+                        let state = peer_reconcile(peer, active, adapt);
+                        let _ = send_encrypted(
+                            &self.socket,
+                            &mut peer.session,
+                            TYPE_RECONCILE,
+                            &encode_reconcile(&state),
+                            peer.addr,
+                            &self.status,
+                        );
                     }
                 }
             }
@@ -739,6 +758,13 @@ impl Hub {
                         }
                         false
                     }
+                    TYPE_PING => {
+                        if let Ok(id) = decode_u64(&payload) {
+                            let pong = peer.session.encrypt_packet(TYPE_PONG, &encode_u64(id));
+                            let _ = send_packet(&self.socket, &pong, from, &self.status);
+                        }
+                        false
+                    }
                     TYPE_CONFIRM => {
                         if payload == CONFIRM_PAYLOAD {
                             let ack = peer
@@ -959,6 +985,12 @@ impl PakeLimiter {
     }
 }
 
+pub fn preview_listen_code(ip: Ipv4Addr, last_code: &str) -> Result<String, String> {
+    let (socket, code) = bind_listener(ip, last_code)?;
+    drop(socket);
+    Ok(code)
+}
+
 pub fn start_controller(
     config: &AppConfig,
     config_handle: ConfigHandle,
@@ -1124,8 +1156,40 @@ struct AgentSession {
     session: Session,
     last_packet: Instant,
     loss: LossTracker,
-    last_semantic_seq: u64,
+    last_event_seq: u64,
+    last_reconcile_seq: u64,
     last_move_seq: u64,
+    inactive_seq: u64,
+    rtt: RttEstimator,
+    last_ping: Instant,
+    pending_pings: Vec<(u64, Instant)>,
+    next_ping_id: u64,
+}
+
+fn update_agent_link_status(
+    status: &Status,
+    latency: Option<f64>,
+    jitter: Option<f64>,
+    loss: Option<f64>,
+) {
+    status.update(|s| {
+        if latency.is_some() {
+            s.latency_ms = latency;
+        }
+        if jitter.is_some() {
+            s.jitter_ms = jitter;
+        }
+        s.packet_loss_percent = loss;
+        if let Some(peer) = s.devices.first_mut() {
+            if latency.is_some() {
+                peer.latency_ms = latency;
+            }
+            if jitter.is_some() {
+                peer.jitter_ms = jitter;
+            }
+            peer.packet_loss_percent = loss;
+        }
+    });
 }
 
 pub fn start_agent(
@@ -1365,8 +1429,16 @@ fn agent_attempt(
         session,
         last_packet: Instant::now(),
         loss: LossTracker::new(ack_seq),
-        last_semantic_seq: 0,
+        last_event_seq: 0,
+        last_reconcile_seq: 0,
         last_move_seq: 0,
+        inactive_seq: 0,
+        rtt: RttEstimator::new(),
+        last_ping: Instant::now()
+            .checked_sub(Duration::from_millis(500))
+            .unwrap_or_else(Instant::now),
+        pending_pings: Vec::new(),
+        next_ping_id: 1,
     };
     let mut last_input = Instant::now();
     let mut active_reported = false;
@@ -1387,6 +1459,22 @@ fn agent_attempt(
             let _ = inject_tx.send(InjectMsg::Event(InputEvent::ReleaseAll));
             status.update(|s| s.remote_active = false);
         }
+        let now = Instant::now();
+        if now.saturating_duration_since(active_session.last_ping) >= Duration::from_millis(500) {
+            let id = active_session.next_ping_id;
+            active_session.next_ping_id = active_session.next_ping_id.wrapping_add(1).max(1);
+            let packet = active_session
+                .session
+                .encrypt_packet(TYPE_PING, &encode_u64(id));
+            if send_packet(socket, &packet, controller, status).is_ok() {
+                active_session.pending_pings.push((id, now));
+                if active_session.pending_pings.len() > 32 {
+                    active_session.pending_pings.remove(0);
+                }
+            }
+            active_session.last_ping = now;
+        }
+
         match socket.recv_from(buf) {
             Ok((n, from)) if from == controller => {
                 let Ok((kind, payload, seq)) =
@@ -1399,13 +1487,15 @@ fn agent_attempt(
                     TYPE_WARP => {
                         let now = Instant::now();
                         active_session.last_packet = now;
-                        if let Ok(input) = decode_warp(&payload) {
-                            active_session.last_move_seq = seq;
-                            let _ = inject_tx.send(InjectMsg::Warp(input));
-                            last_input = now;
-                            if !active_reported {
-                                active_reported = true;
-                                status.update(|s| s.remote_active = true);
+                        if seq > active_session.inactive_seq {
+                            if let Ok(input) = decode_warp(&payload) {
+                                active_session.last_move_seq = seq;
+                                let _ = inject_tx.send(InjectMsg::Warp(input));
+                                last_input = now;
+                                if !active_reported {
+                                    active_reported = true;
+                                    status.update(|s| s.remote_active = true);
+                                }
                             }
                         }
                     }
@@ -1413,7 +1503,8 @@ fn agent_attempt(
                         let now = Instant::now();
                         active_session.last_packet = now;
                         if seq > active_session.last_move_seq
-                            && seq > active_session.last_semantic_seq
+                            && seq > active_session.last_event_seq
+                            && seq > active_session.inactive_seq
                         {
                             if let Ok(input) = decode_input(&payload) {
                                 active_session.last_move_seq = seq;
@@ -1429,12 +1520,29 @@ fn agent_attempt(
                     TYPE_EVENT => {
                         let now = Instant::now();
                         active_session.last_packet = now;
-                        if seq > active_session.last_semantic_seq {
+                        if seq > active_session.last_event_seq && seq > active_session.inactive_seq
+                        {
                             if let Ok(event) = decode_event(&payload) {
-                                active_session.last_semantic_seq = seq;
+                                active_session.last_event_seq = seq;
+                                match event {
+                                    InputEvent::Key { hid, down } => {
+                                        log::debug!("agent key {hid:#04x} down={down}")
+                                    }
+                                    InputEvent::Button { button, down } => {
+                                        log::debug!("agent button {button:#04x} down={down}")
+                                    }
+                                    InputEvent::CapsLock { locked } => {
+                                        log::debug!("agent caps locked={locked}")
+                                    }
+                                    InputEvent::ReleaseAll => log::debug!("agent release-all"),
+                                    InputEvent::Wheel { delta } => {
+                                        log::debug!("agent wheel {delta}")
+                                    }
+                                }
                                 let release = matches!(event, InputEvent::ReleaseAll);
                                 let _ = inject_tx.send(InjectMsg::Event(event));
                                 if release {
+                                    active_session.inactive_seq = seq;
                                     active_reported = false;
                                     status.update(|s| s.remote_active = false);
                                 } else {
@@ -1450,10 +1558,16 @@ fn agent_attempt(
                     TYPE_RECONCILE => {
                         let now = Instant::now();
                         active_session.last_packet = now;
-                        if seq > active_session.last_semantic_seq {
+                        if seq > active_session.last_reconcile_seq
+                            && seq > active_session.last_event_seq
+                            && seq > active_session.inactive_seq
+                        {
                             if let Ok(state) = decode_reconcile(&payload) {
-                                active_session.last_semantic_seq = seq;
+                                active_session.last_reconcile_seq = seq;
                                 let active = state.active;
+                                if !active {
+                                    active_session.inactive_seq = seq;
+                                }
                                 let _ = inject_tx.send(InjectMsg::Reconcile(state));
                                 if active {
                                     last_input = now;
@@ -1480,9 +1594,33 @@ fn agent_attempt(
                                 ),
                             );
                             let _ = send_packet(socket, &response, controller, status);
-                            status.update(|s| {
-                                s.packet_loss_percent = active_session.loss.loss_percent()
-                            });
+                            update_agent_link_status(
+                                status,
+                                None,
+                                None,
+                                active_session.loss.loss_percent(),
+                            );
+                        }
+                    }
+                    TYPE_PONG => {
+                        let now = Instant::now();
+                        active_session.last_packet = now;
+                        if let Ok((id, _stats)) = decode_pong(&payload) {
+                            if let Some(index) = active_session
+                                .pending_pings
+                                .iter()
+                                .position(|(pending_id, _)| *pending_id == id)
+                            {
+                                let (_, sent_at) = active_session.pending_pings.remove(index);
+                                let rtt = sent_at.elapsed().as_secs_f64() * 1000.0;
+                                active_session.rtt.observe(rtt);
+                                update_agent_link_status(
+                                    status,
+                                    Some(rtt),
+                                    Some(active_session.rtt.jitter_ms()),
+                                    active_session.loss.loss_percent(),
+                                );
+                            }
                         }
                     }
                     TYPE_BYE => return Err(error::code("NET_PEER_DISCONNECTED")),
@@ -1658,6 +1796,12 @@ mod tests {
             agent2_status.snapshot()
         );
 
+        assert!(
+            wait_until(|| agent1_status.snapshot().latency_ms.is_some()),
+            "agent did not receive RTT stats: {:?}",
+            agent1_status.snapshot()
+        );
+
         let id1 = device(0x21);
         let id2 = device(0x22);
         let active = ReconcileState {
@@ -1667,15 +1811,19 @@ mod tests {
             keys: crate::input::keymap::KeyState::EMPTY,
         };
         capture_tx
-            .send(CaptureMsg::Move {
-                device: id1,
-                input: RemoteInput { dx: 25, dy: -75 },
-            })
-            .unwrap();
-        capture_tx
             .send(CaptureMsg::Reconcile {
                 device: id1,
                 state: active,
+            })
+            .unwrap();
+        capture_tx
+            .send(CaptureMsg::Move {
+                device: id1,
+                input: RemoteInput {
+                    dx: 25,
+                    dy: -75,
+                    buttons: BUTTON_LEFT,
+                },
             })
             .unwrap();
         let moved = recv_move(&inject1_rx).expect("agent 1 did not receive move");
@@ -1719,15 +1867,19 @@ mod tests {
             })
             .unwrap();
         capture_tx
-            .send(CaptureMsg::Move {
-                device: id2,
-                input: RemoteInput { dx: 60, dy: 40 },
-            })
-            .unwrap();
-        capture_tx
             .send(CaptureMsg::Reconcile {
                 device: id2,
                 state: active,
+            })
+            .unwrap();
+        capture_tx
+            .send(CaptureMsg::Move {
+                device: id2,
+                input: RemoteInput {
+                    dx: 60,
+                    dy: 40,
+                    buttons: BUTTON_LEFT,
+                },
             })
             .unwrap();
         let moved2 = recv_move(&inject2_rx).expect("agent 2 did not receive move");
@@ -1757,7 +1909,11 @@ mod tests {
         capture_tx
             .send(CaptureMsg::Move {
                 device: device(0x99),
-                input: RemoteInput { dx: 10, dy: 10 },
+                input: RemoteInput {
+                    dx: 10,
+                    dy: 10,
+                    buttons: BUTTON_LEFT,
+                },
             })
             .unwrap();
         assert!(!has_motion_or_event(

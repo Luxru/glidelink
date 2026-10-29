@@ -32,7 +32,7 @@ pub const PAKE_MSG_LEN: usize = 33;
 pub const DEVICE_ID_LEN: usize = 16;
 pub const HELLO_LEN: usize = HEADER_LEN + 4 + 4 + 8 + 1 + DEVICE_ID_LEN + PAKE_MSG_LEN;
 pub const ACCEPT_LEN: usize = HELLO_LEN;
-pub const INPUT_LEN: usize = 8;
+pub const INPUT_LEN: usize = 12;
 pub const WARP_LEN: usize = 4;
 pub const EVENT_LEN: usize = 16;
 pub const RECONCILE_LEN: usize = 36;
@@ -389,6 +389,7 @@ pub fn encode_input(input: &RemoteInput) -> [u8; INPUT_LEN] {
     let mut out = [0u8; INPUT_LEN];
     out[0..4].copy_from_slice(&input.dx.to_le_bytes());
     out[4..8].copy_from_slice(&input.dy.to_le_bytes());
+    out[8] = input.buttons;
     out
 }
 
@@ -396,9 +397,13 @@ pub fn decode_input(payload: &[u8]) -> Result<RemoteInput, ProtocolError> {
     if payload.len() != INPUT_LEN {
         return Err(ProtocolError::Malformed);
     }
+    if payload[9..].iter().any(|byte| *byte != 0) {
+        return Err(ProtocolError::Malformed);
+    }
     Ok(RemoteInput {
         dx: i32::from_le_bytes(payload[0..4].try_into().unwrap()),
         dy: i32::from_le_bytes(payload[4..8].try_into().unwrap()),
+        buttons: payload[8],
     })
 }
 
@@ -642,6 +647,7 @@ mod tests {
         let input = RemoteInput {
             dx: -1234,
             dy: 5678,
+            buttons: 0b0000_0101,
         };
         let packet = controller.encrypt_packet(TYPE_INPUT, &encode_input(&input));
         let (kind, payload, seq) = agent.decrypt_packet_with_seq(&packet).unwrap();

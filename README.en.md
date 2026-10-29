@@ -14,6 +14,7 @@ Control multiple computers with one mouse and keyboard. The controller listens a
 - Keyboard follows the mouse; optional macOS ⌘ ↔ Windows Ctrl mapping.
 - Encrypted sessions via one 20-character controller pairing code over LAN UDP.
 - Keyboard & shortcuts settings are controller-only and include a fixed release shortcut.
+- A Logs page lets you choose Error/Warn/Info/Debug/Trace and copy the log buffer.
 - Chinese / English; Windows and macOS.
 
 ## Build
@@ -29,7 +30,7 @@ Node.js and a frontend build step are not required.
 
 ## Usage
 
-1. Controller: select **Controller**, pick the listening interface in **Settings**, click **Start listening**, and copy the generated 20-character pairing code.
+1. Controller: select **Controller** and pick the listening interface in **Settings**. The pairing code is generated automatically; click **Start listening** and copy it.
 2. Agent: select **Controlled PC**, enter that code, and click **Connect**. Multiple agents use the same code.
 3. In **Display Layout**, drag agent screens. When edges touch, the pointer can move directly from the host or from another agent.
 4. Press `Ctrl + Alt + Backspace` to force control back to the local machine.

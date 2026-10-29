@@ -47,7 +47,7 @@ ui/ ──命令──► Engine
 
 ## 输入事件
 
-- 鼠标移动：相对像素位移 `dx/dy`，2ms 内累加后发送（`TYPE_INPUT`，8 字节）。进入/切换屏幕时额外发送一次 `TYPE_WARP` 绝对位置用于对齐光标。
+- 鼠标移动：相对像素位移 `dx/dy`，2ms 内累加后发送，并携带当前鼠标按键状态（`TYPE_INPUT`，12 字节）。进入/切换屏幕时额外发送一次 `TYPE_WARP` 绝对位置用于对齐光标。
 - 位移按目标屏幕分辨率缩放，保持跨分辨率移动比例一致。
 - 鼠标按键、滚轮、键盘按下/抬起、Caps Lock：离散事件立即发送（`TYPE_EVENT`）。
 - 被控端负责按键重复（500ms 首延迟、32ms 间隔）和双击计数；控制端不转发系统 autorepeat。
@@ -61,10 +61,10 @@ ui/ ──命令──► Engine
 
 ## 通信与安全
 
-双方用 SPAKE2 协商每台设备的会话密钥，ChaCha20-Poly1305 加密每个包，序列号防重放。Controller 对活动目标 100ms、空闲 Agent 500ms 心跳；PONG 携带接收统计，用于测量 RTT 和丢包。
+双方用 SPAKE2 协商每台设备的会话密钥，ChaCha20-Poly1305 加密每个包，序列号防重放。Controller 对活动目标 100ms、空闲 Agent 500ms 心跳；Agent 也主动发送 500ms PING。双方 PONG 携带接收统计，Controller 和 Agent 都显示 RTT、抖动和丢包。
 
 端口在 45890–45999 中自动选择。Controller 必须允许局域网访问该 UDP 端口；Agent 只需主动连接。共享配对码是 bearer secret，只应在可信局域网使用；限制设备数量和 HELLO 速率，不记录配对码。
 
 ## 配置
 
-设置由 Rust 后端读写，保存在 `~/.glidelink/settings.json`：角色、监听接口、device id、布局、最近配对码、语言和键位映射。
+设置由 Rust 后端读写，保存在 `~/.glidelink/settings.json`：角色、监听接口、device id、布局、最近配对码、语言、键位映射和日志级别。运行时日志同时写入 stderr 和内存环形缓冲，供 UI 日志面板查看和复制。

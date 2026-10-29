@@ -47,7 +47,7 @@ World units use the controller screen width as 1. Every screen is 1.0 wide and i
 
 ## Input events
 
-- Mouse movement: relative pixel deltas `dx/dy`, accumulated over 2 ms (`TYPE_INPUT`, 8 bytes). A one-off `TYPE_WARP` absolute position aligns the cursor on entry or target switch.
+- Mouse movement: relative pixel deltas `dx/dy`, accumulated over 2 ms and carrying the current mouse button state (`TYPE_INPUT`, 12 bytes). A one-off `TYPE_WARP` absolute position aligns the cursor on entry or target switch.
 - Deltas are scaled to the target screen resolution so movement stays proportional across resolutions.
 - Mouse buttons, wheel, key down/up, and Caps Lock: discrete events (`TYPE_EVENT`).
 - The agent owns key repeat (500 ms / 32 ms) and double-click counting; the controller does not forward OS autorepeat.
@@ -61,10 +61,10 @@ World units use the controller screen width as 1. Every screen is 1.0 wide and i
 
 ## Transport and security
 
-Both sides run SPAKE2 per device; ChaCha20-Poly1305 encrypts every packet and sequence numbers reject replays. The controller pings the active target every 100 ms and idle agents every 500 ms; PONG carries receive statistics for RTT and loss.
+Both sides run SPAKE2 per device; ChaCha20-Poly1305 encrypts every packet and sequence numbers reject replays. The controller pings the active target every 100 ms and idle agents every 500 ms; agents also ping every 500 ms. PONG carries receive statistics, so both controller and agent show RTT, jitter, and loss.
 
 Ports are chosen from 45890–45999. The controller must allow LAN access to that UDP port; agents only connect outbound. The shared pairing code is a bearer secret; use it only on trusted LANs, keep the device count bounded, rate-limit HELLO, and never log the code.
 
 ## Configuration
 
-Settings are read and written by the Rust backend in `~/.glidelink/settings.json`: role, listening interface, device id, layout, last pairing code, language, and modifier mapping.
+Settings are read and written by the Rust backend in `~/.glidelink/settings.json`: role, listening interface, device id, layout, last pairing code, language, modifier mapping, and log level. Runtime logs go to stderr and an in-memory ring buffer for the UI Logs page.

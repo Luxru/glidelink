@@ -174,7 +174,11 @@ impl CaptureState {
         };
         let _ = self.tx.try_send(CaptureMsg::Move {
             device,
-            input: RemoteInput { dx, dy },
+            input: RemoteInput {
+                dx,
+                dy,
+                buttons: self.buttons,
+            },
         });
     }
 
@@ -471,6 +475,10 @@ impl CaptureState {
         self.target = Some(device);
         self.point = world;
         self.host_anchor = host_anchor;
+        log::info!(
+            "input target activate {}",
+            crate::layout::device_id_to_hex(&device)
+        );
         self.buttons = unsafe { query_buttons() };
         self.keys.begin(unsafe { query_held_keys() });
         self.caps_lock = unsafe { query_caps_lock() };
@@ -491,7 +499,8 @@ impl CaptureState {
         if self.target == Some(device) {
             return;
         }
-        if let Some(old) = self.target {
+        let old = self.target;
+        if let Some(old) = old {
             let _ = self.tx.try_send(CaptureMsg::Event {
                 device: old,
                 event: InputEvent::ReleaseAll,
@@ -506,6 +515,12 @@ impl CaptureState {
                 },
             });
         }
+        log::info!(
+            "input target switch {} -> {}",
+            old.map(|value| crate::layout::device_id_to_hex(&value))
+                .unwrap_or_else(|| "host".to_string()),
+            crate::layout::device_id_to_hex(&device)
+        );
         self.target = Some(device);
         self.point = world;
         self.buttons = unsafe { query_buttons() };
@@ -534,6 +549,12 @@ impl CaptureState {
                     keys: KeyState::EMPTY,
                 },
             });
+        }
+        if let Some(device) = old {
+            log::info!(
+                "input target leave {}",
+                crate::layout::device_id_to_hex(&device)
+            );
         }
         self.active = false;
         self.buttons = 0;
@@ -1092,6 +1113,9 @@ fn release_keys(keys: &mut KeyState) {
 
 fn apply_button_transitions(previous: u8, current: u8) {
     let changed = previous ^ current;
+    if changed != 0 {
+        log::debug!("agent buttons {previous:#04x} -> {current:#04x}");
+    }
     if changed & BUTTON_LEFT != 0 {
         unsafe {
             mouse_event(
