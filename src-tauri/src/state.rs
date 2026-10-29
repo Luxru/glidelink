@@ -1,6 +1,6 @@
 use crate::config::{AppConfig, ConfigHandle, Role};
 use crate::error;
-use crate::input::{self, CaptureHandle, CaptureMsg, CaptureShared, InjectMsg};
+use crate::input::{self, CaptureHandle, CaptureMsg, CaptureShared, InputMsg};
 use crate::layout::{DevicePlacement, LayoutStore};
 use crate::net;
 use crate::status::{ScreenInfo, Status};
@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 pub struct AppState {
     pub config: ConfigHandle,
@@ -118,7 +117,7 @@ impl Engine {
                 });
             }
             Role::Agent => {
-                let (inject_tx, inject_rx) = unbounded::<InjectMsg>();
+                let (inject_tx, inject_rx) = unbounded::<InputMsg>();
                 let injector =
                     match input::start_injector(inject_rx, Arc::clone(&stop), status.clone()) {
                         Ok(handle) => handle,
@@ -171,7 +170,7 @@ impl Engine {
             .screens
             .iter()
             .filter(|screen| screen.online)
-            .map(|screen| screen.id)
+            .map(|screen| (screen.id, screen.session))
             .collect();
         let world = crate::layout::world_from_placements(host, placements, &online);
         layout.replace(world);
@@ -186,11 +185,10 @@ impl Engine {
             return;
         };
 
-        // Capture must stop first so it can emit a final button-release state
-        // while the network thread is still draining input.
+        // Stop capture before closing links. Network shutdown and remote EOF
+        // both release state, without relying on a timed queue-drain delay.
         if let Some(capture) = running.capture.take() {
             capture.stop_and_join();
-            std::thread::sleep(Duration::from_millis(3));
         }
         running.stop.store(true, Ordering::Release);
         for handle in running.threads {

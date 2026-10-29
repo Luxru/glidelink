@@ -9,9 +9,7 @@ pub type DeviceId = [u8; 16];
 pub const MAX_DEVICES: usize = 8;
 pub const ENTRY_INSET: f32 = 0.006;
 pub const REENTRY_COOLDOWN_MS: u64 = 300;
-pub const ADJACENCY_EPSILON: f32 = 0.001;
 pub const OVERLAP_EPSILON: f32 = 0.0005;
-pub const MIN_OVERLAP_SPAN: f32 = 0.02;
 
 pub fn new_device_id() -> DeviceId {
     let mut id = [0u8; 16];
@@ -34,7 +32,7 @@ pub fn device_id_from_hex(value: &str) -> Option<DeviceId> {
         return None;
     }
     let mut id = [0u8; 16];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let text = std::str::from_utf8(chunk).ok()?;
         id[index] = u8::from_str_radix(text, 16).ok()?;
     }
@@ -125,17 +123,6 @@ impl Rect {
         let overlap_y = (self.bottom().min(other.bottom()) - self.y.max(other.y)).max(0.0);
         overlap_x > OVERLAP_EPSILON && overlap_y > OVERLAP_EPSILON
     }
-
-    pub fn adjacent(self, other: Rect) -> bool {
-        let vertical_span = (self.bottom().min(other.bottom()) - self.y.max(other.y)).max(0.0);
-        let horizontal_span = (self.right().min(other.right()) - self.x.max(other.x)).max(0.0);
-        let vertical_touch = (self.right() - other.x).abs() <= ADJACENCY_EPSILON
-            || (other.right() - self.x).abs() <= ADJACENCY_EPSILON;
-        let horizontal_touch = (self.bottom() - other.y).abs() <= ADJACENCY_EPSILON
-            || (other.bottom() - self.y).abs() <= ADJACENCY_EPSILON;
-        (vertical_touch && vertical_span >= MIN_OVERLAP_SPAN)
-            || (horizontal_touch && horizontal_span >= MIN_OVERLAP_SPAN)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -147,9 +134,10 @@ pub enum ScreenId {
 #[derive(Clone, Debug)]
 pub struct ScreenSpec {
     pub id: DeviceId,
-    pub label: String,
     pub rect: Rect,
     pub online: bool,
+    /// Connection lifetime, separate from persistent device identity.
+    pub session: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -188,16 +176,6 @@ impl WorldLayout {
         }
     }
 
-    pub fn is_online(&self, id: ScreenId) -> bool {
-        match id {
-            ScreenId::Host => true,
-            ScreenId::Device(device) => self
-                .screens
-                .iter()
-                .any(|screen| screen.id == device && screen.online),
-        }
-    }
-
     /// Return the screen containing `point`, excluding `exclude`.
     pub fn target_at(&self, point: WorldPoint, exclude: Option<ScreenId>) -> Option<ScreenId> {
         if exclude != Some(ScreenId::Host) && self.host.contains(point) {
@@ -213,7 +191,7 @@ impl WorldLayout {
             }
             let center = screen.rect.center();
             let distance = (point.x - center.x).powi(2) + (point.y - center.y).powi(2);
-            if best.map_or(true, |(_, best_distance)| distance < best_distance) {
+            if best.is_none_or(|(_, best_distance)| distance < best_distance) {
                 best = Some((ScreenId::Device(screen.id), distance));
             }
         }
@@ -250,7 +228,7 @@ impl WorldLayout {
                 (point.x - rect.x) / rect.w.max(f32::EPSILON),
                 (point.y - rect.y) / rect.h.max(f32::EPSILON),
             )
-            .inset(),
+            .clamped(),
         )
     }
 
@@ -260,10 +238,6 @@ impl WorldLayout {
             rect.x + local.x.clamp(0.0, 1.0) * rect.w,
             rect.y + local.y.clamp(0.0, 1.0) * rect.h,
         ))
-    }
-
-    pub fn clamp_to_screen(&self, id: ScreenId, point: WorldPoint) -> Option<WorldPoint> {
-        self.screen(id).map(|rect| rect.clamp(point))
     }
 
     pub fn has_overlaps(&self) -> bool {
@@ -283,38 +257,6 @@ impl WorldLayout {
             }
         }
         false
-    }
-
-    pub fn set_online(&mut self, device: DeviceId, online: bool) -> bool {
-        if let Some(screen) = self.screens.iter_mut().find(|screen| screen.id == device) {
-            if screen.online != online {
-                screen.online = online;
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn set_rect(&mut self, device: DeviceId, rect: Rect) -> bool {
-        if let Some(screen) = self.screens.iter_mut().find(|screen| screen.id == device) {
-            if screen.rect != rect {
-                screen.rect = rect;
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn adjacent_devices(&self) -> Vec<(DeviceId, DeviceId)> {
-        let mut out = Vec::new();
-        for (index, screen) in self.screens.iter().enumerate() {
-            for other in &self.screens[index + 1..] {
-                if screen.rect.adjacent(other.rect) {
-                    out.push((screen.id, other.id));
-                }
-            }
-        }
-        out
     }
 }
 
@@ -524,7 +466,7 @@ impl DevicePlacement {
 pub fn world_from_placements(
     host: ScreenInfo,
     placements: &[DevicePlacement],
-    online: &[DeviceId],
+    connections: &[(DeviceId, u64)],
 ) -> WorldLayout {
     let mut screens = Vec::new();
     for placement in placements {
@@ -543,9 +485,12 @@ pub fn world_from_placements(
         });
         screens.push(ScreenSpec {
             id: device,
-            label: placement.label.clone(),
             rect,
-            online: online.contains(&device),
+            online: connections.iter().any(|(id, _)| *id == device),
+            session: connections
+                .iter()
+                .find(|(id, _)| *id == device)
+                .map_or(0, |(_, session)| *session),
         });
     }
     WorldLayout::new(host, screens)
@@ -624,7 +569,6 @@ mod tests {
     fn screen(id: u8, x: f32, y: f32) -> ScreenSpec {
         ScreenSpec {
             id: [id; 16],
-            label: format!("agent-{id}"),
             rect: screen_rect(
                 ScreenInfo {
                     width: 1920,
@@ -634,6 +578,7 @@ mod tests {
                 y,
             ),
             online: true,
+            session: 1,
         }
     }
 
@@ -720,12 +665,55 @@ mod tests {
     }
 
     #[test]
+    fn absolute_mapping_preserves_subpixels_and_aspect_ratio() {
+        let host = ScreenInfo {
+            width: 2560,
+            height: 1600,
+        };
+        let peer = ScreenInfo {
+            width: 1920,
+            height: 1080,
+        };
+        let layout = WorldLayout::new(
+            host,
+            vec![ScreenSpec {
+                id: [1; 16],
+                rect: screen_rect(peer, 1.0, 0.0),
+                online: true,
+                session: 1,
+            }],
+        );
+        let id = ScreenId::Device([1; 16]);
+        let start = WorldPoint::new(1.2, 0.2);
+        let before = layout.world_to_local(id, start).unwrap();
+        let mut point = start;
+        for _ in 0..100 {
+            point = advance_world(point, 0.1, 0.1, host.width as i32);
+        }
+        let after = layout.world_to_local(id, point).unwrap();
+        let dx = (after.x - before.x) * peer.width as f32;
+        let dy = (after.y - before.y) * peer.height as f32;
+        let expected = 10.0 * peer.width as f32 / host.width as f32;
+        assert!((dx - expected).abs() < 0.05, "dx={dx}");
+        assert!((dy - expected).abs() < 0.05, "dy={dy}");
+        // Entry inset is a transition policy, not a limit on ordinary movement.
+        assert_eq!(
+            layout.world_to_local(id, WorldPoint::new(1.0, 0.0)),
+            Some(NormPoint::new(0.0, 0.0))
+        );
+        assert_eq!(
+            layout.world_to_local(id, WorldPoint::new(2.0, 1080.0 / 1920.0)),
+            Some(NormPoint::new(1.0, 1.0))
+        );
+    }
+
+    #[test]
     fn default_placement_avoids_overlap() {
         let host = host();
         let first = screen(1, 1.0, 0.0);
         let (x, y) = default_placement(
             host,
-            &[first.clone()],
+            std::slice::from_ref(&first),
             ScreenInfo {
                 width: 1920,
                 height: 1080,
@@ -741,36 +729,6 @@ mod tests {
         );
         assert!(!rect.overlaps(host));
         assert!(!rect.overlaps(first.rect));
-    }
-
-    #[test]
-    fn adjacency_requires_edge_contact_and_span() {
-        let a = screen_rect(
-            ScreenInfo {
-                width: 1920,
-                height: 1080,
-            },
-            0.0,
-            0.0,
-        );
-        let b = screen_rect(
-            ScreenInfo {
-                width: 1920,
-                height: 1080,
-            },
-            1.0,
-            0.0,
-        );
-        assert!(a.adjacent(b));
-        let gapped = screen_rect(
-            ScreenInfo {
-                width: 1920,
-                height: 1080,
-            },
-            1.1,
-            0.0,
-        );
-        assert!(!a.adjacent(gapped));
     }
 
     #[test]

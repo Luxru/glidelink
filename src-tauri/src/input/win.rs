@@ -1,8 +1,8 @@
 use super::{
     keymap::{hid_to_scan, is_caps, is_modifier, scan_to_hid, KeyState, CAPS_LOCK, KEY_DEFS},
-    plan_injection_batch, CaptureHandle, CaptureMsg, CaptureShared, InjectCursor, InjectMsg,
-    InjectStep, InputEvent, KeyAction, KeyOwnership, KeyRepeater, ReconcileState, RemoteInput,
-    WarpInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
+    plan_injection_batch, CaptureHandle, CaptureMsg, CaptureShared, InjectCursor, InjectStep,
+    InputEvent, InputMsg, KeyAction, KeyOwnership, KeyRepeater, PointerPosition, ReconcileState,
+    BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
 };
 use crate::error;
 use crate::layout::{
@@ -23,8 +23,11 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    mouse_event, GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, VK_CAPITAL,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+    MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VK_CAPITAL,
 };
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
@@ -33,8 +36,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetMessageW, GetSystemMetrics, KillTimer, PostQuitMessage, RegisterClassW, SetCursorPos,
     SetTimer, SetWindowsHookExW, ShowCursor, TranslateMessage, UnhookWindowsHookEx,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT,
+    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
 };
 
 const WH_MOUSE_LL: i32 = 14;
@@ -75,18 +78,6 @@ const VK_MBUTTON: i32 = 0x04;
 const VK_XBUTTON1: i32 = 0x05;
 const VK_XBUTTON2: i32 = 0x06;
 
-const MOUSEEVENTF_MOVE: u32 = 0x0001;
-const MOUSEEVENTF_LEFTUP: u32 = 0x0002;
-const MOUSEEVENTF_LEFTDOWN: u32 = 0x0004;
-const MOUSEEVENTF_RIGHTUP: u32 = 0x0008;
-const MOUSEEVENTF_RIGHTDOWN: u32 = 0x0010;
-const MOUSEEVENTF_MIDDLEUP: u32 = 0x0020;
-const MOUSEEVENTF_MIDDLEDOWN: u32 = 0x0040;
-const MOUSEEVENTF_XDOWN: u32 = 0x0080;
-const MOUSEEVENTF_XUP: u32 = 0x0100;
-const MOUSEEVENTF_WHEEL: u32 = 0x0800;
-const MOUSEEVENTF_ABSOLUTE: u32 = 0x8000;
-const MOUSEEVENTF_VIRTUALDESK: u32 = 0x4000;
 const XBUTTON1: u32 = 0x0001;
 const XBUTTON2: u32 = 0x0002;
 const WS_POPUP: u32 = 0x8000_0000;
@@ -110,6 +101,7 @@ struct CaptureState {
     layout_generation: u64,
     world_layout: Arc<WorldLayout>,
     target: Option<DeviceId>,
+    target_session: u64,
     armed: bool,
     active: bool,
     hidden: bool,
@@ -154,47 +146,29 @@ impl CaptureState {
         self.target
             .map(|device| {
                 self.world_layout
-                    .is_online(crate::layout::ScreenId::Device(device))
+                    .screen_spec(crate::layout::ScreenId::Device(device))
+                    .is_some_and(|screen| screen.online && screen.session == self.target_session)
             })
             .unwrap_or(false)
     }
 
-    fn local_point(&self) -> Option<NormPoint> {
-        let device = self.target?;
-        self.world_layout
-            .world_to_local(crate::layout::ScreenId::Device(device), self.point)
-    }
-
-    fn send_relative(&self, dx: i32, dy: i32) {
-        if dx == 0 && dy == 0 {
-            return;
-        }
+    fn send_position(&self, world: WorldPoint) {
         let Some(device) = self.target else {
             return;
         };
-        let _ = self.tx.try_send(CaptureMsg::Move {
-            device,
-            input: RemoteInput {
-                dx,
-                dy,
-                buttons: self.buttons,
-            },
-        });
-    }
-
-    fn send_warp(&self) {
-        let Some(device) = self.target else {
+        let Some(local) = self
+            .world_layout
+            .world_to_local(crate::layout::ScreenId::Device(device), world)
+        else {
             return;
         };
-        let Some(local) = self.local_point() else {
-            return;
-        };
-        let _ = self.tx.try_send(CaptureMsg::Warp {
+        let _ = self.tx.try_send(CaptureMsg {
             device,
-            input: WarpInput {
+            session: self.target_session,
+            input: InputMsg::Pointer(PointerPosition {
                 x: local.x,
                 y: local.y,
-            },
+            }),
         });
     }
 
@@ -202,7 +176,11 @@ impl CaptureState {
         let Some(device) = self.target else {
             return;
         };
-        let _ = self.tx.try_send(CaptureMsg::Event { device, event });
+        let _ = self.tx.try_send(CaptureMsg {
+            device,
+            session: self.target_session,
+            input: InputMsg::Event(event),
+        });
     }
 
     fn send_reconcile(&self, active: bool) {
@@ -219,7 +197,11 @@ impl CaptureState {
                 KeyState::EMPTY
             },
         };
-        let _ = self.tx.try_send(CaptureMsg::Reconcile { device, state });
+        let _ = self.tx.try_send(CaptureMsg {
+            device,
+            session: self.target_session,
+            input: InputMsg::Reconcile(state),
+        });
     }
 
     fn at_host_edge(&self) -> bool {
@@ -234,6 +216,10 @@ impl CaptureState {
             return HookAction::Pass;
         }
         let message = wparam as u32;
+        let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+        if info.flags & LLMHF_INJECTED != 0 {
+            return HookAction::Pass;
+        }
 
         if self.active {
             match message {
@@ -310,7 +296,15 @@ impl CaptureState {
                     }
                 }
                 WM_MOUSEHWHEEL => {}
-                WM_MOUSEMOVE => {}
+                WM_MOUSEMOVE => {
+                    // The hook supplies native desktop coordinates after the
+                    // controller's pointer-speed settings. The swallowed OS
+                    // cursor stays at its center anchor while we advance world.
+                    self.handle_motion(
+                        (info.pt.x - self.cursor.x) as f64,
+                        (info.pt.y - self.cursor.y) as f64,
+                    );
+                }
                 _ => {}
             }
             HookAction::Swallow
@@ -392,7 +386,7 @@ impl CaptureState {
         }
     }
 
-    fn handle_raw(&mut self, dx: f64, dy: f64) {
+    fn handle_motion(&mut self, dx: f64, dy: f64) {
         self.refresh_layout();
         if self.active && !self.target_online() {
             self.deactivate_to_host(true, None);
@@ -402,23 +396,15 @@ impl CaptureState {
             let Some(device) = self.target else {
                 return;
             };
-            let old = self.point;
-            let host_w = self.vw as f32;
             match step_active(&self.world_layout, device, self.point, dx, dy, self.vw) {
                 StepResult::Stay { world, .. } | StepResult::Wall { world, .. } => {
                     self.point = world;
-                    self.send_relative(
-                        ((world.x - old.x) * host_w).round() as i32,
-                        ((world.y - old.y) * host_w).round() as i32,
-                    );
+                    self.send_position(world);
                 }
                 StepResult::ReturnHost {
                     world, consumed, ..
                 } => {
-                    self.send_relative(
-                        ((consumed.x - old.x) * host_w).round() as i32,
-                        ((consumed.y - old.y) * host_w).round() as i32,
-                    );
+                    self.send_position(consumed);
                     self.point = world;
                     self.deactivate_to_host(true, Some(world));
                 }
@@ -428,16 +414,18 @@ impl CaptureState {
                     consumed,
                     ..
                 } => {
-                    self.send_relative(
-                        ((consumed.x - old.x) * host_w).round() as i32,
-                        ((consumed.y - old.y) * host_w).round() as i32,
-                    );
+                    self.send_position(consumed);
                     self.switch_target(target, world);
                 }
             }
+        }
+    }
+
+    fn handle_raw(&mut self, dx: f64, dy: f64) {
+        if self.active {
             return;
         }
-
+        self.refresh_layout();
         if !self.armed {
             let connected = self.world_layout.screens.iter().any(|screen| screen.online);
             if !connected || Instant::now() < self.cooldown_until || !self.at_host_edge() {
@@ -456,9 +444,13 @@ impl CaptureState {
             self.vy,
             self.vw,
         );
-        if let Some((device, _, world)) =
-            enter_from_host(&self.world_layout, host_world, dx, dy, self.vw)
-        {
+        if let Some((device, _, world)) = enter_from_host(
+            &self.world_layout,
+            host_world,
+            dx.signum() * 2.0,
+            dy.signum() * 2.0,
+            self.vw,
+        ) {
             self.activate_target(
                 device,
                 world,
@@ -473,6 +465,10 @@ impl CaptureState {
         }
         self.active = true;
         self.target = Some(device);
+        self.target_session = self
+            .world_layout
+            .screen_spec(crate::layout::ScreenId::Device(device))
+            .map_or(0, |screen| screen.session);
         self.point = world;
         self.host_anchor = host_anchor;
         log::info!(
@@ -484,6 +480,15 @@ impl CaptureState {
         self.caps_lock = unsafe { query_caps_lock() };
         self.caps_down = false;
         self.armed = false;
+        // Avoid clipping proposed hook coordinates at the host edge.
+        self.cursor = POINT {
+            x: self.vx + self.vw / 2,
+            y: self.vy + self.vh / 2,
+        };
+        unsafe {
+            SetCursorPos(self.cursor.x, self.cursor.y);
+            GetCursorPos(&mut self.cursor);
+        }
         self.shared.set_active(true);
         if !self.hidden {
             unsafe {
@@ -491,7 +496,7 @@ impl CaptureState {
             }
             self.hidden = true;
         }
-        self.send_warp();
+        self.send_position(self.point);
         self.send_reconcile(true);
     }
 
@@ -501,18 +506,15 @@ impl CaptureState {
         }
         let old = self.target;
         if let Some(old) = old {
-            let _ = self.tx.try_send(CaptureMsg::Event {
+            let _ = self.tx.try_send(CaptureMsg {
                 device: old,
-                event: InputEvent::ReleaseAll,
-            });
-            let _ = self.tx.try_send(CaptureMsg::Reconcile {
-                device: old,
-                state: ReconcileState {
+                session: self.target_session,
+                input: InputMsg::Reconcile(ReconcileState {
                     active: false,
                     caps_lock: self.caps_lock,
                     buttons: 0,
                     keys: KeyState::EMPTY,
-                },
+                }),
             });
         }
         log::info!(
@@ -522,6 +524,10 @@ impl CaptureState {
             crate::layout::device_id_to_hex(&device)
         );
         self.target = Some(device);
+        self.target_session = self
+            .world_layout
+            .screen_spec(crate::layout::ScreenId::Device(device))
+            .map_or(0, |screen| screen.session);
         self.point = world;
         self.buttons = unsafe { query_buttons() };
         self.keys.deactivate();
@@ -529,25 +535,22 @@ impl CaptureState {
         self.caps_lock = unsafe { query_caps_lock() };
         self.caps_down = false;
         self.shared.set_active(true);
-        self.send_warp();
+        self.send_position(self.point);
         self.send_reconcile(true);
     }
 
     fn deactivate_to_host(&mut self, warp_cursor: bool, world: Option<WorldPoint>) {
         let old = self.target.take();
         if let Some(device) = old {
-            let _ = self.tx.try_send(CaptureMsg::Event {
+            let _ = self.tx.try_send(CaptureMsg {
                 device,
-                event: InputEvent::ReleaseAll,
-            });
-            let _ = self.tx.try_send(CaptureMsg::Reconcile {
-                device,
-                state: ReconcileState {
+                session: self.target_session,
+                input: InputMsg::Reconcile(ReconcileState {
                     active: false,
                     caps_lock: self.caps_lock,
                     buttons: 0,
                     keys: KeyState::EMPTY,
-                },
+                }),
             });
         }
         if let Some(device) = old {
@@ -896,6 +899,7 @@ fn run_capture_thread(
         layout_generation,
         world_layout,
         target: None,
+        target_session: 0,
         armed: false,
         active: false,
         hidden: false,
@@ -950,7 +954,7 @@ fn run_capture_thread(
 }
 
 pub fn start_injector(
-    rx: Receiver<InjectMsg>,
+    rx: Receiver<InputMsg>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     status: Status,
 ) -> Result<JoinHandle<()>, String> {
@@ -967,7 +971,7 @@ pub fn start_injector(
 }
 
 fn injector_loop(
-    rx: Receiver<InjectMsg>,
+    rx: Receiver<InputMsg>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     status: Status,
     ready_tx: mpsc::Sender<Result<(), String>>,
@@ -1009,29 +1013,26 @@ fn injector_loop(
             }
         }
 
+        let batch_started = Instant::now();
         steps.clear();
         plan_injection_batch(&batch, &mut cursor, &mut steps);
         for step in steps.iter().copied() {
             match step {
-                InjectStep::Move { dx, dy, .. } => unsafe {
-                    mouse_event(MOUSEEVENTF_MOVE, dx, dy, 0, 0);
-                },
-                InjectStep::Warp { x, y, .. } => unsafe {
-                    mouse_event(
+                InjectStep::Pointer { x, y, .. } => {
+                    send_mouse(
                         MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                         x as i32,
                         y as i32,
                         0,
-                        0,
                     );
-                },
+                }
                 InjectStep::Buttons { from, to } => {
                     apply_button_transitions(from, to);
                     applied_buttons = to;
                 }
-                InjectStep::Wheel(delta) => unsafe {
-                    mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta as i32 * WHEEL_DELTA, 0);
-                },
+                InjectStep::Wheel(delta) => {
+                    send_mouse(MOUSEEVENTF_WHEEL, 0, 0, (delta as i32 * WHEEL_DELTA) as u32);
+                }
                 InjectStep::KeyPress(hid) => {
                     if !applied_keys.contains(hid) {
                         applied_keys.insert(hid);
@@ -1059,6 +1060,15 @@ fn injector_loop(
                     applied_buttons = 0;
                 }
             }
+        }
+        let elapsed = batch_started.elapsed();
+        if elapsed >= Duration::from_millis(4) || rx.len() > 64 {
+            log::debug!(
+                "injection batch inputs={} queue={} elapsed_ms={:.1}",
+                batch.len(),
+                rx.len(),
+                elapsed.as_secs_f64() * 1000.0
+            );
         }
     }
 
@@ -1111,84 +1121,43 @@ fn release_keys(keys: &mut KeyState) {
     }
 }
 
+fn send_mouse(flags: u32, x: i32, y: i32, data: u32) {
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: x,
+                dy: y,
+                mouseData: data,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    if unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } != 1 {
+        log::warn!(
+            "mouse SendInput failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 fn apply_button_transitions(previous: u8, current: u8) {
-    let changed = previous ^ current;
-    if changed != 0 {
-        log::debug!("agent buttons {previous:#04x} -> {current:#04x}");
-    }
-    if changed & BUTTON_LEFT != 0 {
-        unsafe {
-            mouse_event(
-                if current & BUTTON_LEFT != 0 {
-                    MOUSEEVENTF_LEFTDOWN
-                } else {
-                    MOUSEEVENTF_LEFTUP
-                },
-                0,
-                0,
-                0,
-                0,
-            );
-        }
-    }
-    if changed & BUTTON_RIGHT != 0 {
-        unsafe {
-            mouse_event(
-                if current & BUTTON_RIGHT != 0 {
-                    MOUSEEVENTF_RIGHTDOWN
-                } else {
-                    MOUSEEVENTF_RIGHTUP
-                },
-                0,
-                0,
-                0,
-                0,
-            );
-        }
-    }
-    if changed & BUTTON_MIDDLE != 0 {
-        unsafe {
-            mouse_event(
-                if current & BUTTON_MIDDLE != 0 {
-                    MOUSEEVENTF_MIDDLEDOWN
-                } else {
-                    MOUSEEVENTF_MIDDLEUP
-                },
-                0,
-                0,
-                0,
-                0,
-            );
-        }
-    }
-    if changed & BUTTON_X1 != 0 {
-        unsafe {
-            mouse_event(
-                if current & BUTTON_X1 != 0 {
-                    MOUSEEVENTF_XDOWN
-                } else {
-                    MOUSEEVENTF_XUP
-                },
-                0,
-                0,
-                XBUTTON1 as i32,
-                0,
-            );
-        }
-    }
-    if changed & BUTTON_X2 != 0 {
-        unsafe {
-            mouse_event(
-                if current & BUTTON_X2 != 0 {
-                    MOUSEEVENTF_XDOWN
-                } else {
-                    MOUSEEVENTF_XUP
-                },
-                0,
-                0,
-                XBUTTON2 as i32,
-                0,
-            );
+    for (button, down, up, data) in [
+        (BUTTON_LEFT, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, 0),
+        (BUTTON_RIGHT, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 0),
+        (
+            BUTTON_MIDDLE,
+            MOUSEEVENTF_MIDDLEDOWN,
+            MOUSEEVENTF_MIDDLEUP,
+            0,
+        ),
+        (BUTTON_X1, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON1),
+        (BUTTON_X2, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON2),
+    ] {
+        if (previous ^ current) & button != 0 {
+            send_mouse(if current & button != 0 { down } else { up }, 0, 0, data);
         }
     }
 }

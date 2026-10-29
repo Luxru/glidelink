@@ -1,5 +1,5 @@
 use crate::input::keymap::{KeyState, CAPS_LOCK};
-use crate::input::{InputEvent, ReconcileState, RemoteInput, WarpInput};
+use crate::input::{InputEvent, InputMsg, PointerPosition, ReconcileState};
 use crate::layout::DeviceId;
 use crate::status::ScreenInfo;
 use chacha20poly1305::aead::AeadInPlace;
@@ -23,7 +23,6 @@ pub const TYPE_CONFIRM: u8 = 7;
 pub const TYPE_CONFIRM_ACK: u8 = 8;
 pub const TYPE_EVENT: u8 = 9;
 pub const TYPE_RECONCILE: u8 = 10;
-pub const TYPE_WARP: u8 = 11;
 
 pub const SID_LEN: usize = 8;
 pub const TAG_LEN: usize = 16;
@@ -31,25 +30,20 @@ pub const HEADER_LEN: usize = 4 + 1 + 1 + SID_LEN + 8;
 pub const PAKE_MSG_LEN: usize = 33;
 pub const DEVICE_ID_LEN: usize = 16;
 pub const HELLO_LEN: usize = HEADER_LEN + 4 + 4 + 8 + 1 + DEVICE_ID_LEN + PAKE_MSG_LEN;
-pub const ACCEPT_LEN: usize = HELLO_LEN;
-pub const INPUT_LEN: usize = 12;
-pub const WARP_LEN: usize = 4;
+pub const INPUT_LEN: usize = 4;
 pub const EVENT_LEN: usize = 16;
 pub const RECONCILE_LEN: usize = 36;
-pub const PONG_STATS_LEN: usize = 24;
 pub const CONFIRM_PAYLOAD: &[u8] = b"GlideLink/v1/confirm";
 
 const EVENT_BUTTON: u8 = 1;
 const EVENT_WHEEL: u8 = 2;
 const EVENT_KEY: u8 = 3;
 const EVENT_CAPS: u8 = 4;
-const EVENT_RELEASE_ALL: u8 = 5;
 const EVENT_FLAG_DOWN_OR_LOCKED: u8 = 1 << 0;
 const RECONCILE_FLAG_ACTIVE: u8 = 1 << 0;
 const RECONCILE_FLAG_CAPS_LOCK: u8 = 1 << 1;
 const BUTTON_MASK: u8 = 0b0001_1111;
 
-pub const PLATFORM_UNKNOWN: u8 = 0;
 #[allow(dead_code)]
 pub const PLATFORM_MACOS: u8 = 1;
 #[allow(dead_code)]
@@ -81,8 +75,8 @@ pub enum ProtocolError {
     Authentication,
     #[error("session id mismatch")]
     SessionMismatch,
-    #[error("replayed packet")]
-    Replay,
+    #[error("non-contiguous input sequence")]
+    Sequence,
 }
 
 pub fn random_sid() -> [u8; SID_LEN] {
@@ -149,7 +143,7 @@ fn validate_prefix(
     packet: &[u8],
     expected_len: Option<usize>,
 ) -> Result<(u8, [u8; SID_LEN]), ProtocolError> {
-    if packet.len() < 6 || &packet[0..4] != MAGIC || packet[4] != VERSION {
+    if packet.len() < HEADER_LEN || &packet[0..4] != MAGIC || packet[4] != VERSION {
         return Err(ProtocolError::Malformed);
     }
     if let Some(len) = expected_len {
@@ -208,24 +202,6 @@ pub fn build_pake_accept(accept: &Handshake, pake_msg: &[u8]) -> Vec<u8> {
     build_pake_packet(TYPE_ACCEPT, accept, pake_msg)
 }
 
-pub fn hello_sid(packet: &[u8]) -> Result<[u8; SID_LEN], ProtocolError> {
-    let (kind, sid) = validate_prefix(packet, Some(HELLO_LEN))?;
-    if kind != TYPE_HELLO {
-        return Err(ProtocolError::Malformed);
-    }
-    Ok(sid)
-}
-
-/// Extract the plaintext SID from any packet header so the hub can dispatch
-/// encrypted packets to the right session before decrypting.
-pub fn packet_sid(packet: &[u8]) -> Result<[u8; SID_LEN], ProtocolError> {
-    let (_, sid) = validate_prefix(packet, None)?;
-    if packet.len() < HEADER_LEN {
-        return Err(ProtocolError::Malformed);
-    }
-    Ok(sid)
-}
-
 pub fn parse_pake_hello(packet: &[u8]) -> Result<(Handshake, Vec<u8>), ProtocolError> {
     parse_pake_packet(packet, TYPE_HELLO)
 }
@@ -241,45 +217,12 @@ pub fn parse_pake_accept(
     Ok((accept, pake_msg))
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct ReplayWindow {
-    highest: u64,
-    bitmap: u64,
-}
-
-impl ReplayWindow {
-    pub fn accept(&mut self, seq: u64) -> bool {
-        if seq == 0 {
-            return false;
-        }
-        if seq > self.highest {
-            let shift = seq - self.highest;
-            self.bitmap = if shift >= 64 { 0 } else { self.bitmap << shift };
-            self.bitmap |= 1;
-            self.highest = seq;
-            true
-        } else {
-            let diff = self.highest - seq;
-            if diff >= 64 {
-                return false;
-            }
-            let bit = 1u64 << diff;
-            if self.bitmap & bit != 0 {
-                false
-            } else {
-                self.bitmap |= bit;
-                true
-            }
-        }
-    }
-}
-
 pub struct Session {
     sid: [u8; SID_LEN],
     tx: ChaCha20Poly1305,
     rx: ChaCha20Poly1305,
     tx_seq: u64,
-    replay: ReplayWindow,
+    rx_seq: u64,
 }
 
 impl Session {
@@ -298,8 +241,12 @@ impl Session {
             tx: ChaCha20Poly1305::new(Key::from_slice(tx_key)),
             rx: ChaCha20Poly1305::new(Key::from_slice(rx_key)),
             tx_seq: 0,
-            replay: ReplayWindow::default(),
+            rx_seq: 0,
         }
+    }
+
+    pub fn id(&self) -> u64 {
+        u64::from_be_bytes(self.sid)
     }
 
     fn nonce_sid(&self) -> [u8; 4] {
@@ -316,7 +263,10 @@ impl Session {
     }
 
     pub fn encrypt_packet(&mut self, kind: u8, payload: &[u8]) -> Vec<u8> {
-        self.tx_seq += 1;
+        self.tx_seq = self
+            .tx_seq
+            .checked_add(1)
+            .expect("session sequence exhausted");
         let seq = self.tx_seq;
         let mut out = Vec::with_capacity(HEADER_LEN + payload.len() + TAG_LEN);
         out.extend_from_slice(MAGIC);
@@ -343,8 +293,7 @@ impl Session {
             .map(|(kind, payload, _)| (kind, payload))
     }
 
-    /// Like `decrypt_packet`, but also returns the accepted packet's own
-    /// sequence number for RFC 3550-style loss accounting.
+    /// TCP must deliver every authenticated packet exactly once, in order.
     pub fn decrypt_packet_with_seq(
         &mut self,
         packet: &[u8],
@@ -356,7 +305,7 @@ impl Session {
             return Err(ProtocolError::Malformed);
         }
         let kind = packet[5];
-        if &packet[6..14] != self.sid {
+        if packet[6..14] != self.sid {
             return Err(ProtocolError::SessionMismatch);
         }
         let seq = u64::from_be_bytes(packet[14..22].try_into().unwrap());
@@ -378,52 +327,49 @@ impl Session {
             )
             .map_err(|_| ProtocolError::Authentication)?;
 
-        if !self.replay.accept(seq) {
-            return Err(ProtocolError::Replay);
+        if seq != self.rx_seq + 1 {
+            return Err(ProtocolError::Sequence);
         }
+        self.rx_seq = seq;
         Ok((kind, payload, seq))
     }
 }
 
-pub fn encode_input(input: &RemoteInput) -> [u8; INPUT_LEN] {
-    let mut out = [0u8; INPUT_LEN];
-    out[0..4].copy_from_slice(&input.dx.to_le_bytes());
-    out[4..8].copy_from_slice(&input.dy.to_le_bytes());
-    out[8] = input.buttons;
-    out
-}
-
-pub fn decode_input(payload: &[u8]) -> Result<RemoteInput, ProtocolError> {
-    if payload.len() != INPUT_LEN {
-        return Err(ProtocolError::Malformed);
-    }
-    if payload[9..].iter().any(|byte| *byte != 0) {
-        return Err(ProtocolError::Malformed);
-    }
-    Ok(RemoteInput {
-        dx: i32::from_le_bytes(payload[0..4].try_into().unwrap()),
-        dy: i32::from_le_bytes(payload[4..8].try_into().unwrap()),
-        buttons: payload[8],
-    })
-}
-
-pub fn encode_warp(input: &WarpInput) -> [u8; WARP_LEN] {
+pub fn encode_input(input: &PointerPosition) -> [u8; INPUT_LEN] {
     let x = (input.x.clamp(0.0, 1.0) * u16::MAX as f32).round() as u16;
     let y = (input.y.clamp(0.0, 1.0) * u16::MAX as f32).round() as u16;
-    let mut out = [0u8; WARP_LEN];
+    let mut out = [0u8; INPUT_LEN];
     out[0..2].copy_from_slice(&x.to_le_bytes());
     out[2..4].copy_from_slice(&y.to_le_bytes());
     out
 }
 
-pub fn decode_warp(payload: &[u8]) -> Result<WarpInput, ProtocolError> {
-    if payload.len() != WARP_LEN {
+pub fn decode_input(payload: &[u8]) -> Result<PointerPosition, ProtocolError> {
+    if payload.len() != INPUT_LEN {
         return Err(ProtocolError::Malformed);
     }
-    Ok(WarpInput {
+    Ok(PointerPosition {
         x: u16::from_le_bytes(payload[0..2].try_into().unwrap()) as f32 / u16::MAX as f32,
         y: u16::from_le_bytes(payload[2..4].try_into().unwrap()) as f32 / u16::MAX as f32,
     })
+}
+
+pub fn encode_command(input: InputMsg) -> Result<(u8, Vec<u8>), ProtocolError> {
+    Ok(match input {
+        InputMsg::Pointer(position) => (TYPE_INPUT, encode_input(&position).to_vec()),
+        InputMsg::Event(event) => (TYPE_EVENT, encode_event(&event).to_vec()),
+        InputMsg::Reconcile(state) => (TYPE_RECONCILE, encode_reconcile(&state).to_vec()),
+        InputMsg::Reset => return Err(ProtocolError::Malformed),
+    })
+}
+
+pub fn decode_command(kind: u8, payload: &[u8]) -> Result<InputMsg, ProtocolError> {
+    match kind {
+        TYPE_INPUT => decode_input(payload).map(InputMsg::Pointer),
+        TYPE_EVENT => decode_event(payload).map(InputMsg::Event),
+        TYPE_RECONCILE => decode_reconcile(payload).map(InputMsg::Reconcile),
+        _ => Err(ProtocolError::Malformed),
+    }
 }
 
 fn valid_button(button: u8) -> bool {
@@ -450,9 +396,6 @@ pub fn encode_event(event: &InputEvent) -> [u8; EVENT_LEN] {
         InputEvent::CapsLock { locked } => {
             out[0] = EVENT_CAPS;
             out[1] = u8::from(locked);
-        }
-        InputEvent::ReleaseAll => {
-            out[0] = EVENT_RELEASE_ALL;
         }
     }
     out
@@ -503,12 +446,6 @@ pub fn decode_event(payload: &[u8]) -> Result<InputEvent, ProtocolError> {
             Ok(InputEvent::CapsLock {
                 locked: flags & EVENT_FLAG_DOWN_OR_LOCKED != 0,
             })
-        }
-        EVENT_RELEASE_ALL => {
-            if flags != 0 || code != 0 || delta != 0 {
-                return Err(ProtocolError::Malformed);
-            }
-            Ok(InputEvent::ReleaseAll)
         }
         _ => Err(ProtocolError::Malformed),
     }
@@ -562,33 +499,6 @@ pub fn decode_u64(payload: &[u8]) -> Result<u64, ProtocolError> {
     Ok(u64::from_le_bytes(payload.try_into().unwrap()))
 }
 
-/// PONG carries the PING id plus the agent's receiver counts for the
-/// controller-to-agent direction. Apps must treat liveness separately from
-/// these optional statistics.
-pub fn encode_pong(id: u64, expected: u64, received: u64) -> [u8; PONG_STATS_LEN] {
-    let mut out = [0u8; PONG_STATS_LEN];
-    out[0..8].copy_from_slice(&id.to_le_bytes());
-    out[8..16].copy_from_slice(&expected.to_le_bytes());
-    out[16..24].copy_from_slice(&received.to_le_bytes());
-    out
-}
-
-/// Returns the PING id and, when present, `(expected, received)` counters.
-/// An 8-byte legacy payload, or any payload shorter than the full stats
-/// extension, is accepted without statistics.
-pub fn decode_pong(payload: &[u8]) -> Result<(u64, Option<(u64, u64)>), ProtocolError> {
-    if payload.len() < 8 {
-        return Err(ProtocolError::Malformed);
-    }
-    let id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-    if payload.len() < PONG_STATS_LEN {
-        return Ok((id, None));
-    }
-    let expected = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-    let received = u64::from_le_bytes(payload[16..24].try_into().unwrap());
-    Ok((id, Some((expected, received))))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,8 +530,7 @@ mod tests {
         let hello_packet = build_pake_hello(&hello, &[0x41; PAKE_MSG_LEN]);
         let accept_packet = build_pake_accept(&accept, &[0x42; PAKE_MSG_LEN]);
         assert_eq!(hello_packet.len(), HELLO_LEN);
-        assert_eq!(accept_packet.len(), ACCEPT_LEN);
-        assert_eq!(hello_sid(&hello_packet).unwrap(), sid);
+        assert_eq!(accept_packet.len(), HELLO_LEN);
 
         let (parsed_hello, hello_pake) = parse_pake_hello(&hello_packet).unwrap();
         assert_eq!(parsed_hello, hello);
@@ -639,16 +548,12 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_input_round_trip_and_replay_rejection() {
+    fn encrypted_input_round_trip_and_duplicate_rejection() {
         let sid = random_sid();
         let mut controller = Session::from_keys(&[7u8; 32], &[9u8; 32], sid, Side::Controller);
         let mut agent = Session::from_keys(&[7u8; 32], &[9u8; 32], sid, Side::Agent);
 
-        let input = RemoteInput {
-            dx: -1234,
-            dy: 5678,
-            buttons: 0b0000_0101,
-        };
+        let input = PointerPosition { x: 0.0, y: 1.0 };
         let packet = controller.encrypt_packet(TYPE_INPUT, &encode_input(&input));
         let (kind, payload, seq) = agent.decrypt_packet_with_seq(&packet).unwrap();
         assert_eq!(kind, TYPE_INPUT);
@@ -657,7 +562,7 @@ mod tests {
 
         assert!(matches!(
             agent.decrypt_packet(&packet),
-            Err(ProtocolError::Replay)
+            Err(ProtocolError::Sequence)
         ));
 
         let mut wrong = Session::from_keys(&[8u8; 32], &[9u8; 32], sid, Side::Agent);
@@ -669,27 +574,13 @@ mod tests {
     }
 
     #[test]
-    fn warp_round_trip() {
-        let input = WarpInput { x: 0.25, y: 0.75 };
-        let decoded = decode_warp(&encode_warp(&input)).unwrap();
+    fn absolute_position_round_trip() {
+        let input = PointerPosition { x: 0.25, y: 0.75 };
+        let decoded = decode_input(&encode_input(&input)).unwrap();
         assert!((decoded.x - input.x).abs() < 0.001);
         assert!((decoded.y - input.y).abs() < 0.001);
-        assert!(decode_warp(&[0u8; WARP_LEN - 1]).is_err());
-        assert!(decode_warp(&[0u8; WARP_LEN + 1]).is_err());
-    }
-
-    #[test]
-    fn replay_window_handles_reorder_and_old_packets() {
-        let mut w = ReplayWindow::default();
-        assert!(w.accept(1));
-        assert!(w.accept(3));
-        assert!(w.accept(2));
-        assert!(!w.accept(2));
-        assert!(!w.accept(1));
-        assert!(w.accept(100));
-        assert!(!w.accept(30));
-        assert!(w.accept(99));
-        assert!(!w.accept(0));
+        assert!(decode_input(&[0u8; INPUT_LEN - 1]).is_err());
+        assert!(decode_input(&[0u8; INPUT_LEN + 1]).is_err());
     }
 
     #[test]
@@ -720,7 +611,6 @@ mod tests {
                 down: false,
             },
             InputEvent::CapsLock { locked: true },
-            InputEvent::ReleaseAll,
         ] {
             let encoded = encode_event(&event);
             assert_eq!(encoded.len(), EVENT_LEN);
@@ -798,36 +688,37 @@ mod tests {
     }
 
     #[test]
-    fn pong_stats_round_trip_and_legacy_length() {
-        let stats = decode_pong(&encode_pong(42, 100, 97)).unwrap();
-        assert_eq!(stats, (42, Some((100, 97))));
-
-        let legacy = decode_pong(&42u64.to_le_bytes()).unwrap();
-        assert_eq!(legacy, (42, None));
-
-        assert!(decode_pong(&[0u8; 7]).is_err());
-
-        let mut extended = encode_pong(7, 8, 9).to_vec();
-        extended.push(0xff);
-        assert_eq!(decode_pong(&extended).unwrap(), (7, Some((8, 9))));
+    fn short_headers_are_rejected_without_panicking() {
+        for n in 0..HEADER_LEN {
+            let mut packet = vec![0; n];
+            if n >= 5 {
+                packet[..4].copy_from_slice(MAGIC);
+                packet[4] = VERSION;
+            }
+            assert!(validate_prefix(&packet, None).is_err());
+        }
     }
 
     #[test]
-    fn decrypt_with_seq_reports_accepted_order() {
+    fn encrypted_stream_requires_contiguous_sequence() {
         let sid = random_sid();
         let mut controller = Session::from_keys(&[7u8; 32], &[9u8; 32], sid, Side::Controller);
         let mut agent = Session::from_keys(&[7u8; 32], &[9u8; 32], sid, Side::Agent);
-        let payload = encode_input(&RemoteInput::default());
+        let payload = encode_input(&PointerPosition::default());
         let first = controller.encrypt_packet(TYPE_INPUT, &payload);
         let second = controller.encrypt_packet(TYPE_INPUT, &payload);
         let third = controller.encrypt_packet(TYPE_INPUT, &payload);
 
         assert_eq!(agent.decrypt_packet_with_seq(&first).unwrap().2, 1);
-        assert_eq!(agent.decrypt_packet_with_seq(&third).unwrap().2, 3);
+        assert!(matches!(
+            agent.decrypt_packet_with_seq(&third),
+            Err(ProtocolError::Sequence)
+        ));
         assert_eq!(agent.decrypt_packet_with_seq(&second).unwrap().2, 2);
+        assert_eq!(agent.decrypt_packet_with_seq(&third).unwrap().2, 3);
         assert!(matches!(
             agent.decrypt_packet_with_seq(&second),
-            Err(ProtocolError::Replay)
+            Err(ProtocolError::Sequence)
         ));
     }
 

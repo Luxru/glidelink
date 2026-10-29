@@ -2,41 +2,28 @@
 
 English | [Chinese](README.md)
 
-Control multiple computers with one mouse and keyboard. The controller listens and agents join with one shared pairing code; move the pointer across freely arranged screens, including directly between agents. LAN direct, no drivers or accounts.
+Control up to 8 agents with one mouse and keyboard on Windows and macOS. Connections use encrypted TCP over the LAN, with no drivers or accounts.
 
 ![GlideLink](screenshot.png)
 
-## Features
+## Usage
 
-- The controller listens; up to 8 agents can join.
-- Relative mouse motion, buttons, wheel, and keyboard forwarding; touching edges allow direct traversal, including agent-to-agent.
-- Free 2D draggable arrangement of multiple agent screens, persisted per device.
-- Keyboard follows the mouse; optional macOS ⌘ ↔ Windows Ctrl mapping.
-- Encrypted sessions via one 20-character controller pairing code over LAN UDP.
-- Keyboard & shortcuts settings are controller-only and include a fixed release shortcut.
-- A Logs page lets you choose Error/Warn/Info/Debug/Trace and copy the log buffer.
-- Chinese / English; Windows and macOS.
+1. Controller: choose a network interface, start listening, and copy the 20-character pairing code.
+2. Agent: enter the code and connect. All agents use the same code.
+3. Arrange screens in **Display Layout**. Move across touching edges to switch devices; the keyboard follows the pointer.
+4. Press `Ctrl + Alt + Backspace` to return control to the local machine.
 
-## Build
+Allow the controller's TCP listening port through the firewall. On macOS, grant Accessibility and Input Monitoring permissions. Treat the pairing code as a connection credential and use it only on trusted LANs.
+
+Settings live in `~/.glidelink/settings.json` (Windows: `C:\Users\<you>\.glidelink\settings.json`). The UI provides log viewing, level selection, and copying.
+
+## Development
 
 ```bash
 cd src-tauri
-cargo run              # development
-cargo test             # tests
-cargo build --release  # release
+cargo run
+cargo test
+cargo build --release
 ```
 
-Node.js and a frontend build step are not required.
-
-## Usage
-
-1. Controller: select **Controller** and pick the listening interface in **Settings**. The pairing code is generated automatically; click **Start listening** and copy it.
-2. Agent: select **Controlled PC**, enter that code, and click **Connect**. Multiple agents use the same code.
-3. In **Display Layout**, drag agent screens. When edges touch, the pointer can move directly from the host or from another agent.
-4. Press `Ctrl + Alt + Backspace` to force control back to the local machine.
-
-The controller needs a LAN-reachable UDP listening port; agents only need outbound access to it. Grant Accessibility and Input Monitoring in macOS System Settings → Privacy & Security.
-
-> The pairing code is a bearer secret shared by all agents. Use it only on trusted LANs and limit who can see it.
-
-Settings live in `~/.glidelink/settings.json` (Windows: `C:\Users\<you>\.glidelink\settings.json`).
+No Node.js or frontend build step is needed. See the [architecture](ARCHITECTURE.en.md) for backend details.

@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "glidelink"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
  "crossbeam-channel",
@@ -1202,7 +1202,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "socket2",
  "spake2",
  "tauri",
  "tauri-build",

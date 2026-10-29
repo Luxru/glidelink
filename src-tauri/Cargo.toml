@@ -1,6 +1,6 @@
 [package]
 name = "glidelink"
-version = "1.0.0"
+version = "0.1.0"
 description = "Low-latency software KVM for sharing one mouse across machines"
 authors = ["GlideLink contributors"]
 edition = "2021"
@@ -24,7 +24,6 @@ thiserror = "2"
 log = "0.4"
 spake2 = "0.4"
 if-addrs = "0.15"
-socket2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

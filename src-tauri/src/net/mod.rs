@@ -1,61 +1,53 @@
 mod metrics;
 pub mod protocol;
+mod stream;
 
 use crate::config::{AppConfig, ConfigHandle};
 use crate::error;
 use crate::input::{
-    self, adapt_event, adapt_reconcile, CaptureMsg, InjectMsg, InputEvent, ReconcileState,
-    RemoteInput, WarpInput,
+    self, adapt_event, adapt_reconcile, CaptureMsg, InputEvent, InputMsg, PointerPosition,
+    ReconcileState,
 };
 use crate::invite::{self, Invite, PORT_RANGE_END, PORT_RANGE_START};
 use crate::layout::{
     default_placement, device_id_to_hex, DeviceId, DevicePlacement, LayoutStore, WorldLayout,
 };
 use crate::status::{PeerStatus, ScreenInfo, Status};
-use crossbeam_channel::{bounded, never, tick, Receiver, Sender, TrySendError};
-use metrics::{LossTracker, RttEstimator};
+use crossbeam_channel::Receiver;
+use metrics::RttEstimator;
 use protocol::{
-    build_pake_accept, build_pake_hello, decode_event, decode_input, decode_pong, decode_reconcile,
-    decode_u64, decode_warp, derive_session_keys, encode_event, encode_input, encode_pong,
-    encode_reconcile, encode_u64, encode_warp, packet_sid, parse_pake_accept, parse_pake_hello,
-    random_sid, transcript_hash, Handshake, ProtocolError, Session, Side, CONFIRM_PAYLOAD,
-    HELLO_LEN, TYPE_ACCEPT, TYPE_BYE, TYPE_CONFIRM, TYPE_CONFIRM_ACK, TYPE_EVENT, TYPE_HELLO,
-    TYPE_INPUT, TYPE_PING, TYPE_PONG, TYPE_RECONCILE, TYPE_WARP,
+    build_pake_accept, build_pake_hello, decode_u64, derive_session_keys, encode_u64,
+    parse_pake_accept, parse_pake_hello, random_sid, transcript_hash, Handshake, Session, Side,
+    CONFIRM_PAYLOAD, TYPE_BYE, TYPE_CONFIRM, TYPE_CONFIRM_ACK, TYPE_PING, TYPE_PONG,
 };
 use rand::RngCore;
 use serde::Serialize;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use stream::FramedStream;
 
-const HANDSHAKE_RETRY: Duration = Duration::from_millis(500);
+const POLL_INTERVAL: Duration = Duration::from_millis(1);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const CONFIRM_RETRY: Duration = Duration::from_millis(500);
-const CONFIRM_TIMEOUT: Duration = Duration::from_millis(2_500);
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const PING_ACTIVE_INTERVAL: Duration = Duration::from_millis(100);
 const PING_IDLE_INTERVAL: Duration = Duration::from_millis(500);
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
-const PONG_TIMEOUT: Duration = Duration::from_millis(2_500);
-const CONTROLLER_READER_TIMEOUT: Duration = Duration::from_millis(50);
-const CONTROLLER_NET_QUEUE: usize = 512;
-const AGENT_SESSION_TIMEOUT: Duration = Duration::from_millis(3_000);
-const AGENT_ACTIVE_TIMEOUT: Duration = Duration::from_secs(1);
-const PENDING_TIMEOUT: Duration = Duration::from_secs(10);
-const AGENT_READ_TIMEOUT: Duration = Duration::from_millis(100);
+const SESSION_TIMEOUT: Duration = Duration::from_secs(3);
+const INPUT_INTERVAL: Duration = Duration::from_millis(4);
+const SLOW_INPUT_INTERVAL: Duration = Duration::from_millis(8);
 const MAX_PEERS: usize = 8;
 const MAX_PENDING: usize = 8;
-
-const INPUT_INTERVAL: Duration = Duration::from_millis(2);
-const DSCP_EF: u32 = 0xB8;
+const POLL_BUDGET: usize = 64;
 const PAKE_ID_CONTROLLER: &[u8] = b"GlideLink v1 controller";
 const PAKE_ID_AGENT: &[u8] = b"GlideLink v1 agent";
 
-type Datagram = (Vec<u8>, SocketAddr);
+type NetResult<T> = Result<T, String>;
 
 fn local_screen_or_zero() -> ScreenInfo {
     input::screen_info().unwrap_or(ScreenInfo {
@@ -76,70 +68,18 @@ pub fn local_interfaces() -> Vec<NetworkInterface> {
     if let Ok(adapters) = if_addrs::get_if_addrs() {
         for adapter in adapters {
             if let if_addrs::IfAddr::V4(v4) = adapter.addr {
-                if v4.ip.is_loopback() || v4.ip.is_unspecified() {
-                    continue;
+                if !v4.ip.is_loopback() && !v4.ip.is_unspecified() {
+                    interfaces.push(NetworkInterface {
+                        name: adapter.name,
+                        ip: v4.ip.to_string(),
+                    });
                 }
-                interfaces.push(NetworkInterface {
-                    name: adapter.name,
-                    ip: v4.ip.to_string(),
-                });
             }
         }
     }
     interfaces.sort_by(|a, b| a.name.cmp(&b.name).then(a.ip.cmp(&b.ip)));
     interfaces.dedup_by(|a, b| a.name == b.name && a.ip == b.ip);
     interfaces
-}
-
-fn interface_name_for_ip(ip: Ipv4Addr) -> Option<String> {
-    local_interfaces()
-        .into_iter()
-        .find(|interface| interface.ip == ip.to_string())
-        .map(|interface| interface.name)
-}
-
-fn set_dscp(socket: &UdpSocket) {
-    if let Err(error) = socket2::SockRef::from(socket).set_tos_v4(DSCP_EF) {
-        log::debug!("DSCP EF not applied: {error}");
-    }
-}
-
-fn spawn_reader(
-    socket: &UdpSocket,
-    tx: Sender<Datagram>,
-    stop: Arc<AtomicBool>,
-    drops: Arc<AtomicU64>,
-) -> Result<JoinHandle<()>, String> {
-    let socket = socket
-        .try_clone()
-        .map_err(|e| error::detail("E_NET_SOCKET", e))?;
-    socket
-        .set_read_timeout(Some(CONTROLLER_READER_TIMEOUT))
-        .map_err(|e| error::detail("E_NET_SOCKET", e))?;
-
-    thread::Builder::new()
-        .name("glidelink-controller-rx".into())
-        .spawn(move || {
-            crate::sched::boost_current_thread();
-            let mut buf = [0u8; 2048];
-            while !stop.load(Ordering::Acquire) {
-                match socket.recv_from(&mut buf) {
-                    Ok((n, from)) => match tx.try_send((buf[..n].to_vec(), from)) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(_)) => {
-                            drops.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(TrySendError::Disconnected(_)) => break,
-                    },
-                    Err(e) if is_benign_recv_error(&e) => {}
-                    Err(e) => {
-                        log::warn!("UDP receive error: {e}");
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                }
-            }
-        })
-        .map_err(|e| error::detail("E_NET_THREAD", e))
 }
 
 struct PakeLimiter {
@@ -159,76 +99,38 @@ impl PakeLimiter {
         let now = Instant::now();
         self.tokens = (self.tokens + now.duration_since(self.last).as_secs_f64() * 4.0).min(8.0);
         self.last = now;
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
+fn bind_listener(ip: Ipv4Addr, last_code: &str) -> NetResult<(TcpListener, String)> {
+    if let Ok(invite) = Invite::decode(last_code) {
+        if invite.ip == ip {
+            if let Ok(listener) = TcpListener::bind((ip, invite.port)) {
+                return Ok((listener, last_code.to_string()));
+            }
         }
     }
-}
-
-struct InputPacer {
-    interval: Duration,
-    last_move_send: Instant,
-    rtt: RttEstimator,
-}
-
-impl InputPacer {
-    fn new() -> Self {
-        Self {
-            interval: INPUT_INTERVAL,
-            last_move_send: Instant::now()
-                .checked_sub(INPUT_INTERVAL)
-                .unwrap_or_else(Instant::now),
-            rtt: RttEstimator::new(),
-        }
-    }
-
-    fn observe_rtt(&mut self, rtt_ms: f64) -> f64 {
-        self.rtt.observe(rtt_ms);
-        self.rtt.jitter_ms()
-    }
-}
-
-/// Windows reports ICMP port-unreachable as `WSAECONNRESET` on an unconnected
-/// UDP socket. Sending to an agent that is not running yet must not be treated
-/// as a fatal receive error or spam the log at the handshake rate.
-fn is_benign_recv_error(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        ErrorKind::WouldBlock
-            | ErrorKind::TimedOut
-            | ErrorKind::ConnectionReset
-            | ErrorKind::ConnectionRefused
-            | ErrorKind::Interrupted
-    )
-}
-
-fn send_packet(
-    socket: &UdpSocket,
-    packet: &[u8],
-    addr: SocketAddr,
-    status: &Status,
-) -> std::io::Result<usize> {
-    let sent = socket.send_to(packet, addr)?;
-    status.add_sent(sent);
-    Ok(sent)
-}
-
-fn bind_free_port(ip: Ipv4Addr) -> Result<UdpSocket, String> {
     let count = u32::from(PORT_RANGE_END - PORT_RANGE_START + 1);
     let offset = rand::rngs::OsRng.next_u32() % count;
     for step in 0..count {
-        let candidate = PORT_RANGE_START + ((offset + step) % count) as u16;
-        let addr = SocketAddr::new(IpAddr::V4(ip), candidate);
-        match UdpSocket::bind(addr) {
-            Ok(socket) => return Ok(socket),
+        let port = PORT_RANGE_START + ((offset + step) % count) as u16;
+        match TcpListener::bind((ip, port)) {
+            Ok(listener) => return Ok((listener, Invite::generate(ip, port).encode())),
             Err(e) if e.kind() == ErrorKind::AddrInUse => continue,
-            Err(e) => return Err(error::detail("E_NET_BIND", format!("{addr}: {e}"))),
+            Err(e) => return Err(error::detail("E_NET_BIND", e)),
         }
     }
     Err(error::code("E_PORT_RANGE"))
+}
+
+pub fn preview_listen_code(ip: Ipv4Addr, last_code: &str) -> NetResult<String> {
+    let (_listener, code) = bind_listener(ip, last_code)?;
+    Ok(code)
 }
 
 fn platform_label(id: u8) -> &'static str {
@@ -243,35 +145,194 @@ fn peer_label(platform: u8, addr: SocketAddr) -> String {
     format!("{} · {}", platform_label(platform), addr.ip())
 }
 
-fn bind_listener(ip: Ipv4Addr, last_code: &str) -> Result<(UdpSocket, String), String> {
-    if let Ok(invite) = Invite::decode(last_code) {
-        if invite.ip == ip {
-            let addr = SocketAddr::new(IpAddr::V4(ip), invite.port);
-            if let Ok(socket) = UdpSocket::bind(addr) {
-                return Ok((socket, last_code.to_string()));
-            }
-        }
-    }
-    let socket = bind_free_port(ip)?;
-    let port = socket
-        .local_addr()
-        .map_err(|e| error::detail("E_NET_BIND", e))?
-        .port();
-    Ok((socket, Invite::generate(ip, port).encode()))
+/// Shared by both roles: one cipher sequence, one framed stream, one heartbeat.
+struct Link {
+    wire: FramedStream,
+    session: Session,
+    last_received: Instant,
+    last_ping: Instant,
+    pending_pings: Vec<(u64, Instant)>,
+    next_ping: u64,
+    rtt: RttEstimator,
+    last_log: Instant,
 }
 
-fn send_encrypted(
-    socket: &UdpSocket,
-    session: &mut Session,
-    kind: u8,
-    payload: &[u8],
+impl Link {
+    fn new(wire: FramedStream, session: Session) -> Self {
+        let now = Instant::now();
+        Self {
+            wire,
+            session,
+            last_received: now,
+            last_ping: now.checked_sub(PING_IDLE_INTERVAL).unwrap_or(now),
+            pending_pings: Vec::new(),
+            next_ping: 1,
+            rtt: RttEstimator::new(),
+            last_log: now,
+        }
+    }
+
+    fn send(&mut self, kind: u8, payload: &[u8]) -> NetResult<()> {
+        self.wire
+            .queue(self.session.encrypt_packet(kind, payload))
+            .map_err(|e| e.to_string())
+    }
+
+    fn send_input(&mut self, input: InputMsg) -> NetResult<()> {
+        let (kind, payload) = protocol::encode_command(input).map_err(|e| e.to_string())?;
+        self.send(kind, &payload)
+    }
+
+    fn receive(&mut self) -> NetResult<Option<(u8, Vec<u8>)>> {
+        let Some(packet) = self.wire.read_packet().map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let message = self
+            .session
+            .decrypt_packet(&packet)
+            .map_err(|e| e.to_string())?;
+        self.last_received = Instant::now();
+        Ok(Some(message))
+    }
+
+    fn heartbeat(&mut self, kind: u8, payload: &[u8]) -> NetResult<bool> {
+        match kind {
+            TYPE_PING => {
+                let id = decode_u64(payload).map_err(|e| e.to_string())?;
+                self.send(TYPE_PONG, &encode_u64(id))?;
+            }
+            TYPE_PONG => {
+                let id = decode_u64(payload).map_err(|e| e.to_string())?;
+                if let Some(index) = self
+                    .pending_pings
+                    .iter()
+                    .position(|(pending, _)| *pending == id)
+                {
+                    let (_, sent) = self.pending_pings.remove(index);
+                    self.rtt.observe(sent.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            TYPE_BYE => return Err(error::code("NET_PEER_DISCONNECTED")),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn tick(&mut self, now: Instant, interval: Duration) -> NetResult<()> {
+        if now.saturating_duration_since(self.last_received) >= SESSION_TIMEOUT {
+            return Err("peer heartbeat timed out".into());
+        }
+        if now.saturating_duration_since(self.last_ping) >= interval {
+            let id = self.next_ping;
+            self.next_ping = self.next_ping.wrapping_add(1).max(1);
+            self.send(TYPE_PING, &encode_u64(id))?;
+            self.pending_pings.push((id, now));
+            if self.pending_pings.len() > 32 {
+                self.pending_pings.remove(0);
+            }
+            self.last_ping = now;
+        }
+        if now.saturating_duration_since(self.last_log) >= Duration::from_secs(5) {
+            log::debug!(
+                "TCP input queue={} age_ms={:.1} srtt_ms={:?} rttvar_ms={:.1}",
+                self.wire.queue_depth(),
+                self.wire.queue_age().as_secs_f64() * 1000.0,
+                self.rtt.srtt_ms(),
+                self.rtt.jitter_ms()
+            );
+            self.last_log = now;
+        }
+        self.wire.flush().map_err(|e| e.to_string())
+    }
+}
+
+struct PeerSession {
+    device_id: DeviceId,
     addr: SocketAddr,
-    status: &Status,
-) -> Result<(), String> {
-    let packet = session.encrypt_packet(kind, payload);
-    send_packet(socket, &packet, addr, status)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    screen: ScreenInfo,
+    platform: u8,
+    link: Link,
+    pending_pointer: Option<PointerPosition>,
+    reconcile: ReconcileState,
+    last_move: Instant,
+    last_reconcile: Instant,
+}
+
+fn pointer_interval(rtt: &RttEstimator) -> Duration {
+    if rtt.jitter_ms() > 4.0 || rtt.srtt_ms().unwrap_or(0.0) > 40.0 {
+        SLOW_INPUT_INTERVAL
+    } else {
+        INPUT_INTERVAL
+    }
+}
+
+impl PeerSession {
+    fn flush_pointer(&mut self) -> NetResult<()> {
+        if let Some(input) = self.pending_pointer.take() {
+            self.link.send_input(InputMsg::Pointer(input))?;
+            self.last_move = Instant::now();
+        }
+        Ok(())
+    }
+
+    fn capture(&mut self, input: InputMsg, adapt: bool) -> NetResult<()> {
+        if let InputMsg::Pointer(position) = input {
+            self.pending_pointer = Some(position);
+            return Ok(());
+        }
+        // One common barrier for every semantic command, including activation.
+        self.flush_pointer()?;
+        let wire = match input {
+            InputMsg::Event(mut event) => {
+                apply_event_to_reconcile(&mut self.reconcile, event);
+                if adapt {
+                    adapt_event(&mut event);
+                }
+                InputMsg::Event(event)
+            }
+            InputMsg::Reconcile(mut state) => {
+                self.reconcile = state;
+                self.last_reconcile = Instant::now();
+                if adapt {
+                    adapt_reconcile(&mut state);
+                }
+                InputMsg::Reconcile(state)
+            }
+            other => other,
+        };
+        self.link.send_input(wire)
+    }
+
+    fn poll(&mut self, now: Instant, active: bool, adapt: bool) -> NetResult<()> {
+        for _ in 0..POLL_BUDGET {
+            let Some((kind, payload)) = self.link.receive()? else {
+                break;
+            };
+            if !self.link.heartbeat(kind, &payload)? {
+                return Err("unexpected agent message".into());
+            }
+        }
+        if now.saturating_duration_since(self.last_move) >= pointer_interval(&self.link.rtt) {
+            self.flush_pointer()?;
+        }
+        if now.saturating_duration_since(self.last_reconcile) >= RECONCILE_INTERVAL {
+            let mut state = self.reconcile;
+            state.active = active;
+            if !active {
+                state.buttons = 0;
+                state.keys = input::keymap::KeyState::EMPTY;
+            }
+            self.capture(InputMsg::Reconcile(state), adapt)?;
+        }
+        self.link.tick(
+            now,
+            if active {
+                PING_ACTIVE_INTERVAL
+            } else {
+                PING_IDLE_INTERVAL
+            },
+        )
+    }
 }
 
 fn apply_event_to_reconcile(state: &mut ReconcileState, event: InputEvent) {
@@ -290,99 +351,73 @@ fn apply_event_to_reconcile(state: &mut ReconcileState, event: InputEvent) {
                 state.keys.remove(hid);
             }
         }
-        InputEvent::CapsLock { locked } => {
-            state.caps_lock = locked;
-        }
-        InputEvent::ReleaseAll => {
-            state.buttons = 0;
-            state.keys = crate::input::keymap::KeyState::EMPTY;
-        }
+        InputEvent::CapsLock { locked } => state.caps_lock = locked,
         InputEvent::Wheel { .. } => {}
     }
 }
 
-fn peer_reconcile(peer: &mut PeerSession, active: bool, adapt: bool) -> ReconcileState {
-    let mut state = peer.reconcile;
-    state.active = active;
-    if !active {
-        state.buttons = 0;
-        state.keys = crate::input::keymap::KeyState::EMPTY;
-    }
-    if adapt {
-        adapt_reconcile(&mut state);
-    }
-    peer.last_reconcile_send = Instant::now();
-    state
-}
-
-fn scale_relative(input: RemoteInput, host: ScreenInfo, peer: ScreenInfo) -> RemoteInput {
-    if host.width == 0 || host.height == 0 {
-        return input;
-    }
-    let dx = (input.dx as f64 * peer.width as f64 / host.width as f64).round() as i32;
-    let dy = (input.dy as f64 * peer.height as f64 / host.height as f64).round() as i32;
-    RemoteInput {
-        dx,
-        dy,
-        buttons: input.buttons,
-    }
-}
-
-fn flush_peer_move(
-    socket: &UdpSocket,
-    peer: &mut PeerSession,
-    host: ScreenInfo,
-    status: &Status,
-) -> Result<(), String> {
-    let Some(input) = peer.pending_move.take() else {
-        return Ok(());
-    };
-    let input = scale_relative(input, host, peer.screen);
-    send_encrypted(
-        socket,
-        &mut peer.session,
-        TYPE_INPUT,
-        &encode_input(&input),
-        peer.addr,
-        status,
-    )?;
-    peer.pacer.last_move_send = Instant::now();
-    Ok(())
-}
-
-struct PendingAccept {
-    sid: [u8; protocol::SID_LEN],
+struct PendingConnection {
+    wire: FramedStream,
     addr: SocketAddr,
-    session: Session,
-    accept_packet: Vec<u8>,
-    device_id: DeviceId,
-    screen: ScreenInfo,
-    platform: u8,
     created: Instant,
+    auth: Option<(Handshake, Session)>,
 }
 
-struct PeerSession {
-    device_id: DeviceId,
-    sid: [u8; protocol::SID_LEN],
-    addr: SocketAddr,
-    session: Session,
-    screen: ScreenInfo,
-    platform: u8,
-    pacer: InputPacer,
-    pending_move: Option<RemoteInput>,
-    reconcile: ReconcileState,
-    last_ping: Instant,
-    last_pong: Instant,
-    pending_pings: Vec<(u64, Instant)>,
-    next_ping_id: u64,
-    last_reconcile_send: Instant,
-    latency_ms: Option<f64>,
-    jitter_ms: Option<f64>,
-    loss_percent: Option<f64>,
+impl PendingConnection {
+    fn poll(&mut self, code: &str, local_device: DeviceId, screen: ScreenInfo) -> NetResult<bool> {
+        if self.created.elapsed() >= HANDSHAKE_TIMEOUT {
+            return Err("handshake timed out".into());
+        }
+        self.wire.flush().map_err(|e| e.to_string())?;
+        let Some(packet) = self.wire.read_packet().map_err(|e| e.to_string())? else {
+            return Ok(false);
+        };
+        if let Some((_, session)) = self.auth.as_mut() {
+            let (kind, payload) = session.decrypt_packet(&packet).map_err(|e| e.to_string())?;
+            if kind != TYPE_CONFIRM || payload != CONFIRM_PAYLOAD {
+                return Err("invalid confirmation".into());
+            }
+            self.wire
+                .queue(session.encrypt_packet(TYPE_CONFIRM_ACK, CONFIRM_PAYLOAD))
+                .map_err(|e| e.to_string())?;
+            return Ok(true);
+        }
+        let (hello, pake_msg) = parse_pake_hello(&packet).map_err(|e| e.to_string())?;
+        if hello.device_id == [0; 16]
+            || hello.device_id == local_device
+            || hello.screen.width == 0
+            || hello.screen.height == 0
+        {
+            return Err("invalid peer identity or desktop".into());
+        }
+        let (pake, accept_msg) = Spake2::<Ed25519Group>::start_a(
+            &Password::new(code.as_bytes()),
+            &Identity::new(PAKE_ID_CONTROLLER),
+            &Identity::new(PAKE_ID_AGENT),
+        );
+        let shared = pake.finish(&pake_msg).map_err(|_| error::code("E_PAKE"))?;
+        let accept = Handshake {
+            sid: hello.sid,
+            screen,
+            timestamp_ms: protocol::now_ms(),
+            platform: input::platform_id(),
+            device_id: local_device,
+        };
+        let accept_packet = build_pake_accept(&accept, &accept_msg);
+        let transcript = transcript_hash(&packet, &accept_packet);
+        let (c2a, a2c) = derive_session_keys(&shared, &hello.sid, &transcript);
+        self.wire.queue(accept_packet).map_err(|e| e.to_string())?;
+        self.auth = Some((
+            hello.clone(),
+            Session::from_keys(&c2a, &a2c, hello.sid, Side::Controller),
+        ));
+        self.wire.flush().map_err(|e| e.to_string())?;
+        Ok(false)
+    }
 }
 
 struct Hub {
-    socket: UdpSocket,
+    listener: TcpListener,
     pairing_code: String,
     local_screen: ScreenInfo,
     local_device: DeviceId,
@@ -391,8 +426,7 @@ struct Hub {
     layout: LayoutStore,
     status: Status,
     peers: HashMap<DeviceId, PeerSession>,
-    sid_index: HashMap<[u8; protocol::SID_LEN], DeviceId>,
-    pending: HashMap<[u8; protocol::SID_LEN], PendingAccept>,
+    pending: Vec<PendingConnection>,
     active_target: Option<DeviceId>,
     limiters: HashMap<IpAddr, PakeLimiter>,
     last_status_refresh: Instant,
@@ -400,396 +434,110 @@ struct Hub {
 
 impl Hub {
     fn handle_capture(&mut self, message: CaptureMsg) {
-        match message {
-            CaptureMsg::Move { device, input } => {
-                if let Some(peer) = self.peers.get_mut(&device) {
-                    let pending = peer.pending_move.get_or_insert_with(RemoteInput::default);
-                    pending.dx = pending.dx.saturating_add(input.dx);
-                    pending.dy = pending.dy.saturating_add(input.dy);
-                }
-            }
-            CaptureMsg::Warp { device, input } => {
-                let host = self.local_screen;
-                if let Some(peer) = self.peers.get_mut(&device) {
-                    if let Err(e) = flush_peer_move(&self.socket, peer, host, &self.status) {
-                        log::warn!("input move send failed: {e}");
-                    }
-                    if let Err(e) = send_encrypted(
-                        &self.socket,
-                        &mut peer.session,
-                        TYPE_WARP,
-                        &encode_warp(&input),
-                        peer.addr,
-                        &self.status,
-                    ) {
-                        log::warn!("warp send failed: {e}");
-                    }
-                }
-            }
-            CaptureMsg::Event { device, event } => {
-                let adapt = self.adapt_modifiers
-                    && self
-                        .peers
-                        .get(&device)
-                        .map(|peer| peer.platform != input::platform_id())
-                        .unwrap_or(false);
-                if let Some(peer) = self.peers.get_mut(&device) {
-                    apply_event_to_reconcile(&mut peer.reconcile, event);
-                    if let Err(e) =
-                        flush_peer_move(&self.socket, peer, self.local_screen, &self.status)
-                    {
-                        log::warn!("input move send failed: {e}");
-                    }
-                    let mut wire_event = event;
-                    if adapt {
-                        adapt_event(&mut wire_event);
-                    }
-                    if let Err(e) = send_encrypted(
-                        &self.socket,
-                        &mut peer.session,
-                        TYPE_EVENT,
-                        &encode_event(&wire_event),
-                        peer.addr,
-                        &self.status,
-                    ) {
-                        log::warn!("event send failed: {e}");
-                    }
-                    // Critical edges are idempotent. Also send the resulting
-                    // state now so a lost button/key packet does not wait for
-                    // the 500ms periodic reconcile.
-                    if !matches!(event, InputEvent::Wheel { .. }) {
-                        let active = self.active_target == Some(device);
-                        let state = peer_reconcile(peer, active, adapt);
-                        let _ = send_encrypted(
-                            &self.socket,
-                            &mut peer.session,
-                            TYPE_RECONCILE,
-                            &encode_reconcile(&state),
-                            peer.addr,
-                            &self.status,
-                        );
-                    }
-                }
-            }
-            CaptureMsg::Reconcile { device, state } => {
-                if !self.peers.contains_key(&device) {
-                    return;
-                }
-                if state.active {
-                    if self.active_target != Some(device) {
-                        if let Some(old) = self.active_target {
-                            self.release_peer(old);
-                        }
-                        self.active_target = Some(device);
-                    }
-                } else if self.active_target == Some(device) {
-                    self.active_target = None;
-                }
-
-                let adapt = self.adapt_modifiers
-                    && self
-                        .peers
-                        .get(&device)
-                        .map(|peer| peer.platform != input::platform_id())
-                        .unwrap_or(false);
-                if let Some(peer) = self.peers.get_mut(&device) {
-                    peer.reconcile = state;
-                    if let Err(e) =
-                        flush_peer_move(&self.socket, peer, self.local_screen, &self.status)
-                    {
-                        log::warn!("input move send failed: {e}");
-                    }
-                    let state = peer_reconcile(peer, state.active, adapt);
-                    if let Err(e) = send_encrypted(
-                        &self.socket,
-                        &mut peer.session,
-                        TYPE_RECONCILE,
-                        &encode_reconcile(&state),
-                        peer.addr,
-                        &self.status,
-                    ) {
-                        log::warn!("reconcile send failed: {e}");
-                    }
-                }
-                self.status.update(|s| {
-                    s.remote_active = self.active_target.is_some();
-                    s.target_device = self.active_target.map(|id| device_id_to_hex(&id));
-                });
-                self.refresh_status();
-            }
-        }
-    }
-
-    fn release_peer(&mut self, device: DeviceId) {
-        let Some(peer) = self.peers.get_mut(&device) else {
-            return;
-        };
-        peer.reconcile.active = false;
-        peer.reconcile.buttons = 0;
-        peer.reconcile.keys = crate::input::keymap::KeyState::EMPTY;
-        peer.pending_move = None;
-        let _ = send_encrypted(
-            &self.socket,
-            &mut peer.session,
-            TYPE_EVENT,
-            &encode_event(&InputEvent::ReleaseAll),
-            peer.addr,
-            &self.status,
-        );
-        let state = peer_reconcile(peer, false, false);
-        let _ = send_encrypted(
-            &self.socket,
-            &mut peer.session,
-            TYPE_RECONCILE,
-            &encode_reconcile(&state),
-            peer.addr,
-            &self.status,
-        );
-    }
-
-    fn handle_hello(&mut self, packet: &[u8], from: SocketAddr) {
-        let Ok((hello, pake_msg)) = parse_pake_hello(packet) else {
-            return;
-        };
-        if let Some(pending) = self.pending.get(&hello.sid) {
-            if pending.addr == from {
-                let _ = send_packet(&self.socket, &pending.accept_packet, from, &self.status);
-            }
-            return;
-        }
-        if self.pending.len() >= MAX_PENDING {
-            return;
-        }
-        if self.peers.len() >= MAX_PEERS && !self.peers.contains_key(&hello.device_id) {
-            return;
-        }
+        let device = message.device;
+        if !self
+            .peers
+            .get(&device)
+            .is_some_and(|peer| peer.link.session.id() == message.session)
         {
-            let limiter = self
-                .limiters
-                .entry(from.ip())
-                .or_insert_with(PakeLimiter::new);
-            if !limiter.allow() {
-                return;
-            }
-        }
-        let (state, accept_msg) = Spake2::<Ed25519Group>::start_a(
-            &Password::new(self.pairing_code.as_bytes()),
-            &Identity::new(PAKE_ID_CONTROLLER),
-            &Identity::new(PAKE_ID_AGENT),
-        );
-        let shared = match state.finish(&pake_msg) {
-            Ok(key) => key,
-            Err(_) => {
-                log::debug!("PAKE exchange failed for {from}");
-                return;
-            }
-        };
-        let accept = Handshake {
-            sid: hello.sid,
-            screen: self.local_screen,
-            timestamp_ms: protocol::now_ms(),
-            platform: input::platform_id(),
-            device_id: self.local_device,
-        };
-        let accept_packet = build_pake_accept(&accept, &accept_msg);
-        let transcript = transcript_hash(packet, &accept_packet);
-        let (c2a, a2c) = derive_session_keys(&shared, &hello.sid, &transcript);
-        let session = Session::from_keys(&c2a, &a2c, hello.sid, Side::Controller);
-        if let Err(e) = send_packet(&self.socket, &accept_packet, from, &self.status) {
-            log::warn!("accept send failed: {e}");
             return;
         }
-        self.pending.insert(
-            hello.sid,
-            PendingAccept {
-                sid: hello.sid,
-                addr: from,
-                session,
-                accept_packet,
-                device_id: hello.device_id,
-                screen: hello.screen,
-                platform: hello.platform,
-                created: Instant::now(),
-            },
-        );
-    }
-
-    fn handle_pending_confirm(
-        &mut self,
-        sid: [u8; protocol::SID_LEN],
-        packet: &[u8],
-        from: SocketAddr,
-    ) {
-        let Some(mut pending) = self.pending.remove(&sid) else {
-            return;
-        };
-        if pending.addr != from {
-            self.pending.insert(sid, pending);
-            return;
-        }
-        match pending.session.decrypt_packet_with_seq(packet) {
-            Ok((TYPE_CONFIRM, payload, _seq)) if payload == CONFIRM_PAYLOAD => {
-                let ack = pending
-                    .session
-                    .encrypt_packet(TYPE_CONFIRM_ACK, CONFIRM_PAYLOAD);
-                let _ = send_packet(&self.socket, &ack, from, &self.status);
-                self.promote(pending);
-            }
-            Ok(_) => {
-                self.pending.insert(sid, pending);
-            }
-            Err(e) => {
-                log::debug!("confirm from {from} rejected: {e}");
-                self.pending.insert(sid, pending);
+        if let InputMsg::Reconcile(state) = message.input {
+            if state.active && self.active_target != Some(device) {
+                if let Some(old) = self.active_target {
+                    if let Some(peer) = self.peers.get_mut(&old) {
+                        if let Err(e) =
+                            peer.capture(InputMsg::Reconcile(ReconcileState::INACTIVE), false)
+                        {
+                            log::warn!("release send failed: {e}");
+                            self.remove_peer(old);
+                        }
+                    }
+                }
+                self.active_target = Some(device);
+            } else if !state.active && self.active_target == Some(device) {
+                self.active_target = None;
             }
         }
-    }
-
-    fn promote(&mut self, pending: PendingAccept) {
-        let device = pending.device_id;
-        let old = self.peers.remove(&device);
-        let (old_reconcile, old_move) = if let Some(mut old) = old {
-            self.sid_index.remove(&old.sid);
-            let _ = send_encrypted(
-                &self.socket,
-                &mut old.session,
-                TYPE_BYE,
-                &[],
-                old.addr,
-                &self.status,
-            );
-            (Some(old.reconcile), old.pending_move)
-        } else {
-            (None, None)
-        };
-
-        let now = Instant::now();
-        let reconcile = old_reconcile.unwrap_or_else(|| {
-            let mut state = ReconcileState::INACTIVE;
-            state.active = self.active_target == Some(device);
-            state
-        });
-        self.peers.insert(
-            device,
-            PeerSession {
-                device_id: device,
-                sid: pending.sid,
-                addr: pending.addr,
-                session: pending.session,
-                screen: pending.screen,
-                platform: pending.platform,
-                pacer: InputPacer::new(),
-                pending_move: old_move,
-                reconcile,
-                last_ping: now.checked_sub(PING_IDLE_INTERVAL).unwrap_or(now),
-                last_pong: now,
-                pending_pings: Vec::new(),
-                next_ping_id: 1,
-                last_reconcile_send: now.checked_sub(RECONCILE_INTERVAL).unwrap_or(now),
-                latency_ms: None,
-                jitter_ms: None,
-                loss_percent: None,
-            },
-        );
-        self.sid_index.insert(pending.sid, device);
-        self.ensure_placement(device, pending.platform, pending.addr, pending.screen);
-        self.refresh_layout();
-
-        let adapt = self.adapt_modifiers && pending.platform != input::platform_id();
         if let Some(peer) = self.peers.get_mut(&device) {
-            let host = self.local_screen;
-            let _ = flush_peer_move(&self.socket, peer, host, &self.status);
-            let active = self.active_target == Some(device);
-            let state = peer_reconcile(peer, active, adapt);
-            let _ = send_encrypted(
-                &self.socket,
-                &mut peer.session,
-                TYPE_RECONCILE,
-                &encode_reconcile(&state),
-                peer.addr,
-                &self.status,
-            );
+            let adapt = self.adapt_modifiers && peer.platform != input::platform_id();
+            if let Err(e) = peer.capture(message.input, adapt) {
+                log::warn!("input connection closed: {e}");
+                self.remove_peer(device);
+            }
         }
+    }
+
+    fn accept_connections(&mut self) {
+        // Limit work per pass so connection attempts cannot starve input.
+        for _ in 0..MAX_PENDING {
+            match self.listener.accept() {
+                Ok((socket, addr)) => {
+                    if self.pending.len() >= MAX_PENDING
+                        || !self
+                            .limiters
+                            .entry(addr.ip())
+                            .or_insert_with(PakeLimiter::new)
+                            .allow()
+                    {
+                        continue;
+                    }
+                    match FramedStream::new(socket, self.status.clone()) {
+                        Ok(wire) => self.pending.push(PendingConnection {
+                            wire,
+                            addr,
+                            created: Instant::now(),
+                            auth: None,
+                        }),
+                        Err(e) => log::debug!("TCP setup failed: {e}"),
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    log::warn!("TCP accept failed: {e}");
+                    break;
+                }
+            }
+        }
+    }
+
+    fn promote(&mut self, mut pending: PendingConnection) -> NetResult<()> {
+        let (hello, session) = pending.auth.take().ok_or("missing authentication")?;
+        let device = hello.device_id;
+        if self.peers.len() >= MAX_PEERS && !self.peers.contains_key(&device) {
+            return Err("peer limit reached".into());
+        }
+        // A new stream is a fresh input lifecycle. Never restore held keys or
+        // pending positions from a previous connection with the same device id.
+        self.remove_peer(device);
+        let now = Instant::now();
+        let mut peer = PeerSession {
+            device_id: device,
+            addr: pending.addr,
+            screen: hello.screen,
+            platform: hello.platform,
+            link: Link::new(pending.wire, session),
+            pending_pointer: None,
+            reconcile: ReconcileState::INACTIVE,
+            last_move: now,
+            last_reconcile: now,
+        };
+        peer.link
+            .send_input(InputMsg::Reconcile(ReconcileState::INACTIVE))?;
+        peer.link.wire.flush().map_err(|e| e.to_string())?;
+        self.peers.insert(device, peer);
+        self.ensure_placement(device, hello.platform, pending.addr, hello.screen);
+        self.refresh_layout();
+        self.refresh_status();
         log::info!(
-            "agent {} connected ({}x{}, {})",
-            peer_label(pending.platform, pending.addr),
-            pending.screen.width,
-            pending.screen.height,
+            "agent {} connected via TCP ({}x{}, {})",
+            peer_label(hello.platform, pending.addr),
+            hello.screen.width,
+            hello.screen.height,
             device_id_to_hex(&device)
         );
-        self.refresh_status();
+        Ok(())
     }
-
-    fn handle_peer_packet(&mut self, device: DeviceId, packet: &[u8], from: SocketAddr) {
-        let remove = {
-            let Some(peer) = self.peers.get_mut(&device) else {
-                return;
-            };
-            if peer.addr != from {
-                return;
-            }
-            match peer.session.decrypt_packet_with_seq(packet) {
-                Ok((kind, payload, _seq)) => match kind {
-                    TYPE_PONG => {
-                        peer.last_pong = Instant::now();
-                        if let Ok((id, stats)) = decode_pong(&payload) {
-                            if let Some(index) = peer
-                                .pending_pings
-                                .iter()
-                                .position(|(pending_id, _)| *pending_id == id)
-                            {
-                                let (_, sent_at) = peer.pending_pings.remove(index);
-                                let rtt = sent_at.elapsed().as_secs_f64() * 1000.0;
-                                peer.latency_ms = Some(rtt);
-                                peer.jitter_ms = Some(peer.pacer.observe_rtt(rtt));
-                            }
-                            if let Some((expected, received)) = stats {
-                                peer.loss_percent = if expected == 0 {
-                                    None
-                                } else {
-                                    Some(
-                                        ((expected.saturating_sub(received) as f64
-                                            / expected as f64)
-                                            * 100.0)
-                                            .clamp(0.0, 100.0),
-                                    )
-                                };
-                            }
-                        }
-                        false
-                    }
-                    TYPE_PING => {
-                        if let Ok(id) = decode_u64(&payload) {
-                            let pong = peer.session.encrypt_packet(TYPE_PONG, &encode_u64(id));
-                            let _ = send_packet(&self.socket, &pong, from, &self.status);
-                        }
-                        false
-                    }
-                    TYPE_CONFIRM => {
-                        if payload == CONFIRM_PAYLOAD {
-                            let ack = peer
-                                .session
-                                .encrypt_packet(TYPE_CONFIRM_ACK, CONFIRM_PAYLOAD);
-                            let _ = send_packet(&self.socket, &ack, from, &self.status);
-                        }
-                        false
-                    }
-                    TYPE_BYE => true,
-                    _ => false,
-                },
-                Err(ProtocolError::Replay) => false,
-                Err(e) => {
-                    log::debug!("packet from {from} rejected: {e}");
-                    false
-                }
-            }
-        };
-        if remove {
-            self.remove_peer(device);
-        }
-        self.refresh_status();
-    }
-
     fn ensure_placement(
         &mut self,
         device: DeviceId,
@@ -831,32 +579,33 @@ impl Hub {
 
     fn refresh_layout(&mut self) {
         let config = self.config.snapshot().unwrap_or_default();
-        let online: Vec<DeviceId> = self.peers.keys().copied().collect();
+        let connections: Vec<_> = self
+            .peers
+            .iter()
+            .map(|(id, peer)| (*id, peer.link.session.id()))
+            .collect();
         let world =
-            crate::layout::world_from_placements(self.local_screen, &config.layout, &online);
+            crate::layout::world_from_placements(self.local_screen, &config.layout, &connections);
         self.layout.replace(world);
     }
 
     fn remove_peer(&mut self, device: DeviceId) {
-        let Some(peer) = self.peers.remove(&device) else {
-            return;
-        };
-        self.sid_index.remove(&peer.sid);
-        if self.active_target == Some(device) {
-            self.active_target = None;
+        if let Some(peer) = self.peers.remove(&device) {
+            if self.active_target == Some(device) {
+                self.active_target = None;
+            }
+            self.refresh_layout();
+            self.refresh_status();
+            log::info!(
+                "agent {} disconnected",
+                peer_label(peer.platform, peer.addr)
+            );
         }
-        self.refresh_layout();
-        log::info!(
-            "agent {} disconnected",
-            peer_label(peer.platform, peer.addr)
-        );
-        self.refresh_status();
     }
 
     fn refresh_status(&mut self) {
-        let now = Instant::now();
-        self.last_status_refresh = now;
-        let mut devices: Vec<PeerStatus> = self
+        self.last_status_refresh = Instant::now();
+        let mut devices: Vec<_> = self
             .peers
             .values()
             .map(|peer| PeerStatus {
@@ -867,9 +616,9 @@ impl Hub {
                 screen: Some(peer.screen),
                 online: true,
                 active: self.active_target == Some(peer.device_id),
-                latency_ms: peer.latency_ms,
-                jitter_ms: peer.jitter_ms,
-                packet_loss_percent: peer.loss_percent,
+                latency_ms: peer.link.rtt.srtt_ms(),
+                jitter_ms: peer.link.rtt.srtt_ms().map(|_| peer.link.rtt.jitter_ms()),
+                packet_loss_percent: None,
                 last_error_code: None,
             })
             .collect();
@@ -884,111 +633,53 @@ impl Hub {
             s.peer = active.map(|p| peer_label(p.platform, p.addr));
             s.peer_platform = active.map(|p| p.platform);
             s.remote_screen = active.map(|p| p.screen);
-            s.latency_ms = active.and_then(|p| p.latency_ms);
-            s.jitter_ms = active.and_then(|p| p.jitter_ms);
-            s.packet_loss_percent = active.and_then(|p| p.loss_percent);
-            s.input_interval_ms = active.map(|p| p.pacer.interval.as_secs_f64() * 1000.0);
+            s.latency_ms = active.and_then(|p| p.link.rtt.srtt_ms());
+            s.jitter_ms = active.and_then(|p| p.link.rtt.srtt_ms().map(|_| p.link.rtt.jitter_ms()));
+            s.packet_loss_percent = None;
+            s.input_interval_ms =
+                active.map(|p| pointer_interval(&p.link.rtt).as_secs_f64() * 1000.0);
         });
     }
 
-    fn on_timer(&mut self, now: Instant) {
-        self.pending
-            .retain(|_, pending| now.saturating_duration_since(pending.created) < PENDING_TIMEOUT);
-        self.limiters.retain(|_, limiter| limiter.active());
-
-        let ids: Vec<DeviceId> = self.peers.keys().copied().collect();
-        let mut remove = Vec::new();
-        for device in ids {
-            let active = self.active_target == Some(device);
-            let Some(peer) = self.peers.get_mut(&device) else {
-                continue;
-            };
-            if now.saturating_duration_since(peer.last_pong) >= PONG_TIMEOUT {
-                remove.push(device);
-                continue;
-            }
-            let ping_interval = if active {
-                PING_ACTIVE_INTERVAL
-            } else {
-                PING_IDLE_INTERVAL
-            };
-            if now.saturating_duration_since(peer.last_ping) >= ping_interval {
-                let id = peer.next_ping_id;
-                peer.next_ping_id = peer.next_ping_id.wrapping_add(1).max(1);
-                if send_encrypted(
-                    &self.socket,
-                    &mut peer.session,
-                    TYPE_PING,
-                    &encode_u64(id),
-                    peer.addr,
-                    &self.status,
-                )
-                .is_ok()
-                {
-                    peer.pending_pings.push((id, now));
-                    if peer.pending_pings.len() > 32 {
-                        peer.pending_pings.remove(0);
+    fn poll(&mut self) {
+        self.accept_connections();
+        for mut pending in std::mem::take(&mut self.pending) {
+            match pending.poll(&self.pairing_code, self.local_device, self.local_screen) {
+                Ok(true) => {
+                    if let Err(e) = self.promote(pending) {
+                        log::debug!("TCP promotion failed: {e}");
                     }
                 }
-                peer.last_ping = now;
+                Ok(false) => self.pending.push(pending),
+                Err(e) => log::debug!("handshake from {} rejected: {e}", pending.addr),
             }
-            if active
-                && peer.pending_move.is_some()
-                && now.saturating_duration_since(peer.pacer.last_move_send) >= peer.pacer.interval
-            {
-                if let Err(e) = flush_peer_move(&self.socket, peer, self.local_screen, &self.status)
-                {
-                    log::warn!("input send failed: {e}");
-                }
-            }
-            if !active {
-                peer.pending_move = None;
-            }
-            if now.saturating_duration_since(peer.last_reconcile_send) >= RECONCILE_INTERVAL {
-                let adapt = self.adapt_modifiers && peer.platform != input::platform_id();
-                let state = peer_reconcile(peer, active, adapt);
-                let _ = send_encrypted(
-                    &self.socket,
-                    &mut peer.session,
-                    TYPE_RECONCILE,
-                    &encode_reconcile(&state),
-                    peer.addr,
-                    &self.status,
-                );
+        }
+        let now = Instant::now();
+        let mut remove = Vec::new();
+        for (device, peer) in &mut self.peers {
+            let adapt = self.adapt_modifiers && peer.platform != input::platform_id();
+            if let Err(e) = peer.poll(now, self.active_target == Some(*device), adapt) {
+                log::debug!("input connection {} closed: {e}", peer.addr);
+                remove.push(*device);
             }
         }
         for device in remove {
             self.remove_peer(device);
         }
-        if now.saturating_duration_since(self.last_status_refresh) >= Duration::from_millis(500) {
+        self.limiters
+            .retain(|_, limiter| limiter.last.elapsed() < Duration::from_secs(30));
+        if now.saturating_duration_since(self.last_status_refresh) >= Duration::from_millis(100) {
             self.refresh_status();
         }
     }
 
     fn shutdown(&mut self) {
         for peer in self.peers.values_mut() {
-            let _ = send_encrypted(
-                &self.socket,
-                &mut peer.session,
-                TYPE_BYE,
-                &[],
-                peer.addr,
-                &self.status,
-            );
+            let _ = peer.capture(InputMsg::Reconcile(ReconcileState::INACTIVE), false);
+            let _ = peer.link.send(TYPE_BYE, &[]);
+            let _ = peer.link.wire.flush();
         }
     }
-}
-
-impl PakeLimiter {
-    fn active(&self) -> bool {
-        self.last.elapsed() < Duration::from_secs(30)
-    }
-}
-
-pub fn preview_listen_code(ip: Ipv4Addr, last_code: &str) -> Result<String, String> {
-    let (socket, code) = bind_listener(ip, last_code)?;
-    drop(socket);
-    Ok(code)
 }
 
 pub fn start_controller(
@@ -998,146 +689,82 @@ pub fn start_controller(
     capture_rx: Receiver<CaptureMsg>,
     stop: Arc<AtomicBool>,
     status: Status,
-) -> Result<JoinHandle<()>, String> {
+) -> NetResult<JoinHandle<()>> {
     let ip = config.local_ipv4()?;
-    let local_screen = local_screen_or_zero();
-    let (socket, pairing_code) = bind_listener(ip, &config.last_invite)?;
-    if let Err(e) = config_handle.update(|current| {
-        current.last_invite = pairing_code.clone();
+    let (listener, pairing_code) = bind_listener(ip, &config.last_invite)?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| error::detail("E_NET_SOCKET", e))?;
+    if let Err(e) = config_handle.update(|c| {
+        c.last_invite = pairing_code.clone();
         Ok(())
     }) {
         log::warn!("could not persist listening code: {e}");
     }
-    set_dscp(&socket);
-
+    let local_screen = local_screen_or_zero();
     let local_device = config.device_id_bytes()?;
-    match interface_name_for_ip(ip) {
-        Some(name) => log::info!("controller listening on {ip} via {name}"),
-        None => log::info!("controller listening on {ip}"),
-    }
-    let reader_drops = Arc::new(AtomicU64::new(0));
-    let (net_tx, net_rx) = bounded::<Datagram>(CONTROLLER_NET_QUEUE);
-    let reader = spawn_reader(&socket, net_tx, Arc::clone(&stop), reader_drops)?;
-
     status.update(|s| {
         s.running = true;
         s.connected = false;
         s.remote_active = false;
+        s.local_screen = Some(local_screen);
         s.peer = None;
         s.peer_platform = None;
-        s.local_screen = Some(local_screen);
         s.remote_screen = None;
         s.latency_ms = None;
+        s.jitter_ms = None;
+        s.input_interval_ms = None;
+        s.packet_loss_percent = None;
         s.last_error_code = None;
         s.last_error_detail = None;
         s.pairing_code = Some(pairing_code.clone());
         s.devices.clear();
         s.target_device = None;
         s.started_at_ms = Some(protocol::now_ms());
-        s.jitter_ms = None;
-        s.input_interval_ms = None;
-        s.packet_loss_percent = None;
     });
-
     let hub = Hub {
-        socket,
-        pairing_code: pairing_code.clone(),
+        listener,
+        pairing_code,
         local_screen,
         local_device,
         adapt_modifiers: config.adapt_modifiers,
         config: config_handle,
         layout,
-        status: status.clone(),
+        status,
         peers: HashMap::new(),
-        sid_index: HashMap::new(),
-        pending: HashMap::new(),
+        pending: Vec::new(),
         active_target: None,
         limiters: HashMap::new(),
         last_status_refresh: Instant::now(),
     };
-
+    log::info!("controller listening on {ip} via TCP");
     thread::Builder::new()
         .name("glidelink-controller-hub".into())
-        .spawn(move || run_hub(hub, capture_rx, net_rx, stop, reader))
+        .spawn(move || run_hub(hub, capture_rx, stop))
         .map_err(|e| error::detail("E_NET_THREAD", e))
 }
 
-fn run_hub(
-    mut hub: Hub,
-    capture_rx: Receiver<CaptureMsg>,
-    net_rx: Receiver<Datagram>,
-    stop: Arc<AtomicBool>,
-    reader: JoinHandle<()>,
-) {
+fn run_hub(mut hub: Hub, capture_rx: Receiver<CaptureMsg>, stop: Arc<AtomicBool>) {
     crate::sched::boost_current_thread();
-    let _session_guard = crate::sched::SessionGuard::begin();
-    let mut capture_source = capture_rx.clone();
-    let mut net_source = net_rx.clone();
-    let tick = tick(Duration::from_millis(1));
-
-    loop {
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-        crossbeam_channel::select! {
-            recv(capture_source) -> message => {
-                match message {
-                    Ok(message) => {
-                        hub.handle_capture(message);
-                        while let Ok(message) = capture_rx.try_recv() {
-                            hub.handle_capture(message);
-                        }
-                    }
-                    Err(_) => capture_source = never(),
-                }
+    let _guard = crate::sched::SessionGuard::begin();
+    while !stop.load(Ordering::Acquire) {
+        // Bounded work prevents a busy mouse or peer from starving the others.
+        for _ in 0..POLL_BUDGET {
+            match capture_rx.try_recv() {
+                Ok(message) => hub.handle_capture(message),
+                Err(_) => break,
             }
-            recv(net_source) -> datagram => {
-                match datagram {
-                    Ok((packet, from)) => {
-                        hub.status.add_received(packet.len());
-                        if packet.len() == HELLO_LEN && packet.get(5) == Some(&TYPE_HELLO) {
-                            hub.handle_hello(&packet, from);
-                        } else if let Ok(sid) = packet_sid(&packet) {
-                            if let Some(device) = hub.sid_index.get(&sid).copied() {
-                                hub.handle_peer_packet(device, &packet, from);
-                            } else if hub.pending.contains_key(&sid) {
-                                hub.handle_pending_confirm(sid, &packet, from);
-                            }
-                        }
-                        while let Ok((packet, from)) = net_rx.try_recv() {
-                            hub.status.add_received(packet.len());
-                            if packet.len() == HELLO_LEN && packet.get(5) == Some(&TYPE_HELLO) {
-                                hub.handle_hello(&packet, from);
-                            } else if let Ok(sid) = packet_sid(&packet) {
-                                if let Some(device) = hub.sid_index.get(&sid).copied() {
-                                    hub.handle_peer_packet(device, &packet, from);
-                                } else if hub.pending.contains_key(&sid) {
-                                    hub.handle_pending_confirm(sid, &packet, from);
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        log::warn!("controller receive thread stopped");
-                        net_source = never();
-                    }
-                }
-            }
-            recv(tick) -> _ => {}
         }
-        hub.on_timer(Instant::now());
+        hub.poll();
+        thread::sleep(POLL_INTERVAL);
     }
-
     hub.shutdown();
     hub.layout.update(|layout| {
-        for screen in layout.screens.iter_mut() {
-            screen.online = false;
+        for s in &mut layout.screens {
+            s.online = false;
         }
         true
     });
-    if reader.join().is_err() {
-        log::error!("controller receive thread panicked");
-    }
     hub.status.update(|s| {
         s.connected = false;
         s.remote_active = false;
@@ -1147,168 +774,37 @@ fn run_hub(
     });
 }
 
-struct AgentHandshake {
-    started: Instant,
-    last_send: Instant,
-}
-
-struct AgentSession {
-    session: Session,
-    last_packet: Instant,
-    loss: LossTracker,
-    last_event_seq: u64,
-    last_reconcile_seq: u64,
-    last_move_seq: u64,
-    inactive_seq: u64,
-    rtt: RttEstimator,
-    last_ping: Instant,
-    pending_pings: Vec<(u64, Instant)>,
-    next_ping_id: u64,
-}
-
-fn update_agent_link_status(
-    status: &Status,
-    latency: Option<f64>,
-    jitter: Option<f64>,
-    loss: Option<f64>,
-) {
-    status.update(|s| {
-        if latency.is_some() {
-            s.latency_ms = latency;
+/// Wait only during PAKE. Normal traffic uses the same nonblocking framing.
+fn wait_packet(wire: &mut FramedStream, stop: &AtomicBool) -> NetResult<Vec<u8>> {
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    while !stop.load(Ordering::Acquire) {
+        wire.flush().map_err(|e| e.to_string())?;
+        if let Some(packet) = wire.read_packet().map_err(|e| e.to_string())? {
+            return Ok(packet);
         }
-        if jitter.is_some() {
-            s.jitter_ms = jitter;
+        if Instant::now() >= deadline {
+            return Err(error::code("NET_TIMEOUT"));
         }
-        s.packet_loss_percent = loss;
-        if let Some(peer) = s.devices.first_mut() {
-            if latency.is_some() {
-                peer.latency_ms = latency;
-            }
-            if jitter.is_some() {
-                peer.jitter_ms = jitter;
-            }
-            peer.packet_loss_percent = loss;
-        }
-    });
-}
-
-pub fn start_agent(
-    config: &AppConfig,
-    pairing_code: &str,
-    inject_tx: Sender<InjectMsg>,
-    stop: Arc<AtomicBool>,
-    status: Status,
-) -> Result<JoinHandle<()>, String> {
-    let invite = Invite::decode(pairing_code).map_err(|_| error::code("E_PAIRING_CODE"))?;
-    let controller = SocketAddr::new(IpAddr::V4(invite.ip), invite.port);
-    let pairing_code = invite::normalize_code(pairing_code);
-    let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-    let socket =
-        UdpSocket::bind(SocketAddr::new(bind_ip, 0)).map_err(|e| error::detail("E_NET_BIND", e))?;
-    socket
-        .set_read_timeout(Some(AGENT_READ_TIMEOUT))
-        .map_err(|e| error::detail("E_NET_SOCKET", e))?;
-    set_dscp(&socket);
-    let local_screen = local_screen_or_zero();
-    let local_device = config.device_id_bytes()?;
-
-    status.update(|s| {
-        s.running = true;
-        s.connected = false;
-        s.remote_active = false;
-        s.latency_ms = None;
-        s.local_screen = Some(local_screen);
-        s.last_error_code = None;
-        s.last_error_detail = None;
-        s.peer = Some(controller.to_string());
-        s.remote_screen = None;
-        s.started_at_ms = Some(protocol::now_ms());
-        s.jitter_ms = None;
-        s.input_interval_ms = None;
-        s.packet_loss_percent = None;
-        s.pairing_code = Some(pairing_code.clone());
-        s.devices.clear();
-        s.target_device = None;
-    });
-
-    thread::Builder::new()
-        .name("glidelink-agent-connect".into())
-        .spawn(move || {
-            crate::sched::boost_current_thread();
-            let _guard = crate::sched::SessionGuard::begin();
-            agent_loop(
-                socket,
-                controller,
-                pairing_code,
-                local_screen,
-                local_device,
-                inject_tx,
-                stop,
-                status,
-            );
-        })
-        .map_err(|e| error::detail("E_NET_THREAD", e))
-}
-
-fn agent_loop(
-    socket: UdpSocket,
-    controller: SocketAddr,
-    pairing_code: String,
-    local_screen: ScreenInfo,
-    local_device: DeviceId,
-    inject_tx: Sender<InjectMsg>,
-    stop: Arc<AtomicBool>,
-    status: Status,
-) {
-    let mut buf = [0u8; 2048];
-    loop {
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-        let result = agent_attempt(
-            &socket,
-            &mut buf,
-            controller,
-            &pairing_code,
-            local_screen,
-            local_device,
-            &inject_tx,
-            &stop,
-            &status,
-        );
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-        if let Err(e) = result {
-            log::debug!("agent connection attempt ended: {e}");
-        }
-        let _ = inject_tx.send(InjectMsg::Reset);
-        status.update(|s| {
-            s.connected = false;
-            s.remote_active = false;
-            s.latency_ms = None;
-            s.devices.clear();
-            s.target_device = None;
-        });
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(POLL_INTERVAL);
     }
-    let _ = inject_tx.send(InjectMsg::Reset);
+    Err("stopped".into())
 }
 
-fn agent_attempt(
-    socket: &UdpSocket,
-    buf: &mut [u8],
+fn connect_agent(
     controller: SocketAddr,
-    pairing_code: &str,
+    code: &str,
     local_screen: ScreenInfo,
     local_device: DeviceId,
-    inject_tx: &Sender<InjectMsg>,
-    stop: &Arc<AtomicBool>,
+    stop: &AtomicBool,
     status: &Status,
-) -> Result<(), String> {
+) -> NetResult<(Link, Handshake)> {
+    let socket = TcpStream::connect_timeout(&controller, CONNECT_TIMEOUT)
+        .map_err(|e| error::detail("NET_NO_RESPONSE", e))?;
+    let mut wire =
+        FramedStream::new(socket, status.clone()).map_err(|e| error::detail("E_NET_SOCKET", e))?;
     let sid = random_sid();
-    let (state, hello_msg) = Spake2::<Ed25519Group>::start_b(
-        &Password::new(pairing_code.as_bytes()),
+    let (pake, hello_msg) = Spake2::<Ed25519Group>::start_b(
+        &Password::new(code.as_bytes()),
         &Identity::new(PAKE_ID_CONTROLLER),
         &Identity::new(PAKE_ID_AGENT),
     );
@@ -1320,333 +816,177 @@ fn agent_attempt(
         device_id: local_device,
     };
     let hello_packet = build_pake_hello(&hello, &hello_msg);
-    send_packet(socket, &hello_packet, controller, status)
-        .map_err(|e| error::detail("E_NET_SEND", e))?;
-    let mut handshake = AgentHandshake {
-        started: Instant::now(),
-        last_send: Instant::now(),
-    };
+    wire.queue(hello_packet.clone())
+        .map_err(|e| e.to_string())?;
+    let accept_packet = wait_packet(&mut wire, stop)?;
+    let (accept, accept_msg) =
+        parse_pake_accept(&accept_packet, &sid).map_err(|e| e.to_string())?;
+    let shared = pake
+        .finish(&accept_msg)
+        .map_err(|_| error::code("E_PAKE"))?;
+    let transcript = transcript_hash(&hello_packet, &accept_packet);
+    let (c2a, a2c) = derive_session_keys(&shared, &sid, &transcript);
+    let mut session = Session::from_keys(&c2a, &a2c, sid, Side::Agent);
+    wire.queue(session.encrypt_packet(TYPE_CONFIRM, CONFIRM_PAYLOAD))
+        .map_err(|e| e.to_string())?;
+    let ack = wait_packet(&mut wire, stop)?;
+    let (kind, payload) = session.decrypt_packet(&ack).map_err(|e| e.to_string())?;
+    if kind != TYPE_CONFIRM_ACK || payload != CONFIRM_PAYLOAD {
+        return Err(error::code("E_PAKE"));
+    }
+    Ok((Link::new(wire, session), accept))
+}
 
-    let mut state = Some(state);
-    let (accept, session) = loop {
-        if stop.load(Ordering::Acquire) {
-            return Err("stopped".into());
-        }
-        if Instant::now().saturating_duration_since(handshake.started) >= HANDSHAKE_TIMEOUT {
-            status.set_error("NET_NO_RESPONSE", None);
-            return Err(error::code("NET_NO_RESPONSE"));
-        }
-        if Instant::now().saturating_duration_since(handshake.last_send) >= HANDSHAKE_RETRY {
-            let _ = send_packet(socket, &hello_packet, controller, status);
-            handshake.last_send = Instant::now();
-        }
-        match socket.recv_from(buf) {
-            Ok((n, from)) if from == controller => {
-                if n != protocol::ACCEPT_LEN || buf.get(5) != Some(&TYPE_ACCEPT) {
-                    continue;
-                }
-                let Ok((accept_handshake, accept_msg)) = parse_pake_accept(&buf[..n], &sid) else {
-                    continue;
-                };
-                let Some(state) = state.take() else {
-                    continue;
-                };
-                let shared = state
-                    .finish(&accept_msg)
-                    .map_err(|_| error::code("E_PAKE"))?;
-                let transcript = transcript_hash(&hello_packet, &buf[..n]);
-                let (c2a, a2c) = derive_session_keys(&shared, &sid, &transcript);
-                let session = Session::from_keys(&c2a, &a2c, sid, Side::Agent);
-                break (accept_handshake, session);
-            }
-            Ok(_) => {}
-            Err(e) if is_benign_recv_error(&e) => {}
-            Err(e) => return Err(error::detail("E_NET_RECV", e)),
-        }
-    };
-
-    let mut session = session;
-    let mut last_confirm = Instant::now()
-        .checked_sub(CONFIRM_RETRY)
-        .unwrap_or_else(Instant::now);
-    let confirm_started = Instant::now();
-    let ack_seq = loop {
-        if stop.load(Ordering::Acquire) {
-            return Err("stopped".into());
-        }
-        if Instant::now().saturating_duration_since(confirm_started) >= CONFIRM_TIMEOUT {
-            status.set_error("NET_TIMEOUT", None);
-            return Err(error::code("NET_TIMEOUT"));
-        }
-        if Instant::now().saturating_duration_since(last_confirm) >= CONFIRM_RETRY {
-            let packet = session.encrypt_packet(TYPE_CONFIRM, CONFIRM_PAYLOAD);
-            send_packet(socket, &packet, controller, status)
-                .map_err(|e| error::detail("E_NET_SEND", e))?;
-            last_confirm = Instant::now();
-        }
-        match socket.recv_from(buf) {
-            Ok((n, from)) if from == controller => {
-                match session.decrypt_packet_with_seq(&buf[..n]) {
-                    Ok((TYPE_CONFIRM_ACK, payload, seq)) if payload == CONFIRM_PAYLOAD => {
-                        break seq
+pub fn start_agent(
+    config: &AppConfig,
+    pairing_code: &str,
+    inject_tx: crossbeam_channel::Sender<InputMsg>,
+    stop: Arc<AtomicBool>,
+    status: Status,
+) -> NetResult<JoinHandle<()>> {
+    let invite = Invite::decode(pairing_code).map_err(|_| error::code("E_PAIRING_CODE"))?;
+    let controller = SocketAddr::new(IpAddr::V4(invite.ip), invite.port);
+    let code = invite::normalize_code(pairing_code);
+    let local_screen = local_screen_or_zero();
+    let local_device = config.device_id_bytes()?;
+    status.update(|s| {
+        s.running = true;
+        s.connected = false;
+        s.remote_active = false;
+        s.local_screen = Some(local_screen);
+        s.remote_screen = None;
+        s.peer = Some(controller.to_string());
+        s.peer_platform = None;
+        s.latency_ms = None;
+        s.jitter_ms = None;
+        s.input_interval_ms = None;
+        s.packet_loss_percent = None;
+        s.last_error_code = None;
+        s.last_error_detail = None;
+        s.pairing_code = Some(code.clone());
+        s.devices.clear();
+        s.target_device = None;
+        s.started_at_ms = Some(protocol::now_ms());
+    });
+    thread::Builder::new()
+        .name("glidelink-agent-connect".into())
+        .spawn(move || {
+            crate::sched::boost_current_thread();
+            let _guard = crate::sched::SessionGuard::begin();
+            while !stop.load(Ordering::Acquire) {
+                let result = connect_agent(
+                    controller,
+                    &code,
+                    local_screen,
+                    local_device,
+                    &stop,
+                    &status,
+                )
+                .and_then(|(link, accept)| {
+                    run_agent(link, accept, controller, &inject_tx, &stop, &status)
+                });
+                // Reset before backoff, including authentication/transport failures.
+                let _ = inject_tx.send(InputMsg::Reset);
+                status.update(|s| {
+                    s.connected = false;
+                    s.remote_active = false;
+                    s.latency_ms = None;
+                    s.jitter_ms = None;
+                    s.devices.clear();
+                    s.target_device = None;
+                });
+                if let Err(e) = result {
+                    log::debug!("agent connection ended: {e}");
+                    if !stop.load(Ordering::Acquire) {
+                        status.set_error("NET_PEER_DISCONNECTED", Some(e));
                     }
-                    Ok(_) | Err(ProtocolError::Replay) => {}
-                    Err(e) => log::debug!("confirm ack rejected: {e}"),
+                }
+                let retry_at = Instant::now() + Duration::from_millis(250);
+                while !stop.load(Ordering::Acquire) && Instant::now() < retry_at {
+                    thread::sleep(POLL_INTERVAL);
                 }
             }
-            Ok(_) => {}
-            Err(e) if is_benign_recv_error(&e) => {}
-            Err(e) => return Err(error::detail("E_NET_RECV", e)),
-        }
-    };
+        })
+        .map_err(|e| error::detail("E_NET_THREAD", e))
+}
 
-    let label = peer_label(accept.platform, controller);
+fn run_agent(
+    mut link: Link,
+    accept: Handshake,
+    controller: SocketAddr,
+    inject_tx: &crossbeam_channel::Sender<InputMsg>,
+    stop: &AtomicBool,
+    status: &Status,
+) -> NetResult<()> {
+    let _ = inject_tx.send(InputMsg::Reset);
     status.update(|s| {
         s.connected = true;
         s.remote_active = false;
-        s.peer = Some(controller.to_string());
         s.peer_platform = Some(accept.platform);
         s.remote_screen = Some(accept.screen);
         s.last_error_code = None;
         s.last_error_detail = None;
         s.devices = vec![PeerStatus {
             device_id: device_id_to_hex(&accept.device_id),
-            label,
+            label: peer_label(accept.platform, controller),
             addr: controller.to_string(),
             platform: Some(accept.platform),
             screen: Some(accept.screen),
             online: true,
-            active: false,
-            latency_ms: None,
-            jitter_ms: None,
-            packet_loss_percent: None,
-            last_error_code: None,
+            ..PeerStatus::default()
         }];
     });
-    let _ = inject_tx.send(InjectMsg::Reset);
-
-    let mut active_session = AgentSession {
-        session,
-        last_packet: Instant::now(),
-        loss: LossTracker::new(ack_seq),
-        last_event_seq: 0,
-        last_reconcile_seq: 0,
-        last_move_seq: 0,
-        inactive_seq: 0,
-        rtt: RttEstimator::new(),
-        last_ping: Instant::now()
-            .checked_sub(Duration::from_millis(500))
-            .unwrap_or_else(Instant::now),
-        pending_pings: Vec::new(),
-        next_ping_id: 1,
-    };
-    let mut last_input = Instant::now();
-    let mut active_reported = false;
-
-    loop {
-        if stop.load(Ordering::Acquire) {
-            return Err("stopped".into());
-        }
-        if Instant::now().saturating_duration_since(active_session.last_packet)
-            >= AGENT_SESSION_TIMEOUT
-        {
-            return Err(error::code("NET_PEER_DISCONNECTED"));
-        }
-        if active_reported
-            && Instant::now().saturating_duration_since(last_input) >= AGENT_ACTIVE_TIMEOUT
-        {
-            active_reported = false;
-            let _ = inject_tx.send(InjectMsg::Event(InputEvent::ReleaseAll));
-            status.update(|s| s.remote_active = false);
+    let mut last_status = Instant::now();
+    while !stop.load(Ordering::Acquire) {
+        for _ in 0..POLL_BUDGET {
+            let Some((kind, payload)) = link.receive()? else {
+                break;
+            };
+            if link.heartbeat(kind, &payload)? {
+                continue;
+            }
+            let input = protocol::decode_command(kind, &payload).map_err(|e| e.to_string())?;
+            if let InputMsg::Reconcile(state) = input {
+                status.update(|s| {
+                    s.remote_active = state.active;
+                    if let Some(peer) = s.devices.first_mut() {
+                        peer.active = state.active;
+                    }
+                });
+            }
+            inject_tx
+                .send(input)
+                .map_err(|_| "input injector stopped".to_string())?;
         }
         let now = Instant::now();
-        if now.saturating_duration_since(active_session.last_ping) >= Duration::from_millis(500) {
-            let id = active_session.next_ping_id;
-            active_session.next_ping_id = active_session.next_ping_id.wrapping_add(1).max(1);
-            let packet = active_session
-                .session
-                .encrypt_packet(TYPE_PING, &encode_u64(id));
-            if send_packet(socket, &packet, controller, status).is_ok() {
-                active_session.pending_pings.push((id, now));
-                if active_session.pending_pings.len() > 32 {
-                    active_session.pending_pings.remove(0);
+        link.tick(now, PING_IDLE_INTERVAL)?;
+        if now.saturating_duration_since(last_status) >= Duration::from_millis(100) {
+            status.update(|s| {
+                s.latency_ms = link.rtt.srtt_ms();
+                s.jitter_ms = link.rtt.srtt_ms().map(|_| link.rtt.jitter_ms());
+                s.packet_loss_percent = None;
+                if let Some(peer) = s.devices.first_mut() {
+                    peer.latency_ms = s.latency_ms;
+                    peer.jitter_ms = s.jitter_ms;
+                    peer.packet_loss_percent = None;
                 }
-            }
-            active_session.last_ping = now;
+            });
+            last_status = now;
         }
-
-        match socket.recv_from(buf) {
-            Ok((n, from)) if from == controller => {
-                let Ok((kind, payload, seq)) =
-                    active_session.session.decrypt_packet_with_seq(&buf[..n])
-                else {
-                    continue;
-                };
-                active_session.loss.observe(seq);
-                match kind {
-                    TYPE_WARP => {
-                        let now = Instant::now();
-                        active_session.last_packet = now;
-                        if seq > active_session.inactive_seq {
-                            if let Ok(input) = decode_warp(&payload) {
-                                active_session.last_move_seq = seq;
-                                let _ = inject_tx.send(InjectMsg::Warp(input));
-                                last_input = now;
-                                if !active_reported {
-                                    active_reported = true;
-                                    status.update(|s| s.remote_active = true);
-                                }
-                            }
-                        }
-                    }
-                    TYPE_INPUT => {
-                        let now = Instant::now();
-                        active_session.last_packet = now;
-                        if seq > active_session.last_move_seq
-                            && seq > active_session.last_event_seq
-                            && seq > active_session.inactive_seq
-                        {
-                            if let Ok(input) = decode_input(&payload) {
-                                active_session.last_move_seq = seq;
-                                let _ = inject_tx.send(InjectMsg::Move(input));
-                                last_input = now;
-                                if !active_reported {
-                                    active_reported = true;
-                                    status.update(|s| s.remote_active = true);
-                                }
-                            }
-                        }
-                    }
-                    TYPE_EVENT => {
-                        let now = Instant::now();
-                        active_session.last_packet = now;
-                        if seq > active_session.last_event_seq && seq > active_session.inactive_seq
-                        {
-                            if let Ok(event) = decode_event(&payload) {
-                                active_session.last_event_seq = seq;
-                                match event {
-                                    InputEvent::Key { hid, down } => {
-                                        log::debug!("agent key {hid:#04x} down={down}")
-                                    }
-                                    InputEvent::Button { button, down } => {
-                                        log::debug!("agent button {button:#04x} down={down}")
-                                    }
-                                    InputEvent::CapsLock { locked } => {
-                                        log::debug!("agent caps locked={locked}")
-                                    }
-                                    InputEvent::ReleaseAll => log::debug!("agent release-all"),
-                                    InputEvent::Wheel { delta } => {
-                                        log::debug!("agent wheel {delta}")
-                                    }
-                                }
-                                let release = matches!(event, InputEvent::ReleaseAll);
-                                let _ = inject_tx.send(InjectMsg::Event(event));
-                                if release {
-                                    active_session.inactive_seq = seq;
-                                    active_reported = false;
-                                    status.update(|s| s.remote_active = false);
-                                } else {
-                                    last_input = now;
-                                    if !active_reported {
-                                        active_reported = true;
-                                        status.update(|s| s.remote_active = true);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    TYPE_RECONCILE => {
-                        let now = Instant::now();
-                        active_session.last_packet = now;
-                        if seq > active_session.last_reconcile_seq
-                            && seq > active_session.last_event_seq
-                            && seq > active_session.inactive_seq
-                        {
-                            if let Ok(state) = decode_reconcile(&payload) {
-                                active_session.last_reconcile_seq = seq;
-                                let active = state.active;
-                                if !active {
-                                    active_session.inactive_seq = seq;
-                                }
-                                let _ = inject_tx.send(InjectMsg::Reconcile(state));
-                                if active {
-                                    last_input = now;
-                                    if !active_reported {
-                                        active_reported = true;
-                                        status.update(|s| s.remote_active = true);
-                                    }
-                                } else {
-                                    active_reported = false;
-                                    status.update(|s| s.remote_active = false);
-                                }
-                            }
-                        }
-                    }
-                    TYPE_PING => {
-                        active_session.last_packet = Instant::now();
-                        if let Ok(id) = decode_u64(&payload) {
-                            let response = active_session.session.encrypt_packet(
-                                TYPE_PONG,
-                                &encode_pong(
-                                    id,
-                                    active_session.loss.expected(),
-                                    active_session.loss.received(),
-                                ),
-                            );
-                            let _ = send_packet(socket, &response, controller, status);
-                            update_agent_link_status(
-                                status,
-                                None,
-                                None,
-                                active_session.loss.loss_percent(),
-                            );
-                        }
-                    }
-                    TYPE_PONG => {
-                        let now = Instant::now();
-                        active_session.last_packet = now;
-                        if let Ok((id, _stats)) = decode_pong(&payload) {
-                            if let Some(index) = active_session
-                                .pending_pings
-                                .iter()
-                                .position(|(pending_id, _)| *pending_id == id)
-                            {
-                                let (_, sent_at) = active_session.pending_pings.remove(index);
-                                let rtt = sent_at.elapsed().as_secs_f64() * 1000.0;
-                                active_session.rtt.observe(rtt);
-                                update_agent_link_status(
-                                    status,
-                                    Some(rtt),
-                                    Some(active_session.rtt.jitter_ms()),
-                                    active_session.loss.loss_percent(),
-                                );
-                            }
-                        }
-                    }
-                    TYPE_BYE => return Err(error::code("NET_PEER_DISCONNECTED")),
-                    _ => {}
-                }
-            }
-            Ok(_) => {}
-            Err(e) if is_benign_recv_error(&e) => {}
-            Err(e) => return Err(error::detail("E_NET_RECV", e)),
-        }
+        thread::sleep(POLL_INTERVAL);
     }
+    let _ = link.send(TYPE_BYE, &[]);
+    let _ = link.wire.flush();
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Role;
-    use crate::input::{InputEvent, ReconcileState, RemoteInput, BUTTON_LEFT};
-    use crate::layout::{device_id_to_hex, DeviceId, LayoutStore, WorldLayout};
-    use crossbeam_channel::unbounded;
+    use crate::input::{keymap::KeyState, BUTTON_LEFT};
+    use crossbeam_channel::{unbounded, Sender};
     use std::path::PathBuf;
-    use std::time::{Duration, Instant};
-
-    fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("glidelink-net-{}-{name}.json", std::process::id()))
-    }
 
     fn device(byte: u8) -> DeviceId {
         [byte; 16]
@@ -1658,323 +998,394 @@ mod tests {
             if predicate() {
                 return true;
             }
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(5));
         }
         false
     }
 
-    fn recv_event(rx: &Receiver<InjectMsg>) -> Option<InputEvent> {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(InjectMsg::Event(event)) => return Some(event),
-                Ok(_) => {}
-                Err(_) => {}
+    struct Worker {
+        stop: Arc<AtomicBool>,
+        join: Option<JoinHandle<()>>,
+        status: Status,
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(join) = self.join.take() {
+                join.join().unwrap();
             }
         }
-        None
     }
 
-    fn recv_move(rx: &Receiver<InjectMsg>) -> Option<RemoteInput> {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(InjectMsg::Move(input)) => return Some(input),
-                Ok(_) => {}
-                Err(_) => {}
+    struct Controller {
+        worker: Worker,
+        tx: Sender<CaptureMsg>,
+        code: String,
+        path: PathBuf,
+        layout: LayoutStore,
+    }
+
+    impl Controller {
+        fn new() -> Self {
+            let config = AppConfig {
+                role: Role::Controller,
+                local_ip: "127.0.0.1".into(),
+                device_id: device_id_to_hex(&device(0x10)),
+                ..AppConfig::default()
+            };
+            let path =
+                std::env::temp_dir().join(format!("glidelink-tcp-{}.json", rand::random::<u64>()));
+            let handle = ConfigHandle::new(path.clone(), config.clone());
+            let layout = LayoutStore::new(WorldLayout::new(
+                ScreenInfo {
+                    width: 1920,
+                    height: 1080,
+                },
+                vec![],
+            ));
+            let (tx, rx) = unbounded();
+            let stop = Arc::new(AtomicBool::new(false));
+            let status = Status::new(None);
+            let join = start_controller(
+                &config,
+                handle,
+                layout.clone(),
+                rx,
+                stop.clone(),
+                status.clone(),
+            )
+            .unwrap();
+            let code = status.snapshot().pairing_code.unwrap();
+            Self {
+                worker: Worker {
+                    stop,
+                    join: Some(join),
+                    status,
+                },
+                tx,
+                code,
+                path,
+                layout,
             }
         }
-        None
-    }
 
-    fn recv_warp(rx: &Receiver<InjectMsg>) -> Option<WarpInput> {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(InjectMsg::Warp(input)) => return Some(input),
-                Ok(_) => {}
-                Err(_) => {}
-            }
+        fn agent(&self, byte: u8) -> (Worker, Receiver<InputMsg>) {
+            let config = AppConfig {
+                role: Role::Agent,
+                device_id: device_id_to_hex(&device(byte)),
+                ..AppConfig::default()
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let status = Status::new(None);
+            let (tx, rx) = unbounded();
+            let join = start_agent(&config, &self.code, tx, stop.clone(), status.clone()).unwrap();
+            assert!(
+                wait_until(|| status.snapshot().connected
+                    && self
+                        .layout
+                        .snapshot()
+                        .1
+                        .screen_spec(crate::layout::ScreenId::Device(device(byte)))
+                        .is_some_and(|s| s.online)),
+                "agent did not connect: {:?}",
+                status.snapshot()
+            );
+            (
+                Worker {
+                    stop,
+                    join: Some(join),
+                    status,
+                },
+                rx,
+            )
         }
-        None
-    }
 
-    fn has_motion_or_event(rx: &Receiver<InjectMsg>, duration: Duration) -> bool {
-        let deadline = Instant::now() + duration;
-        while Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(InjectMsg::Move(_)) | Ok(InjectMsg::Event(_)) => return true,
-                Ok(_) => {}
-                Err(_) => {}
-            }
+        fn send(&self, byte: u8, input: InputMsg) {
+            self.tx
+                .send(CaptureMsg {
+                    device: device(byte),
+                    session: self
+                        .layout
+                        .snapshot()
+                        .1
+                        .screen_spec(crate::layout::ScreenId::Device(device(byte)))
+                        .map_or(0, |screen| screen.session),
+                    input,
+                })
+                .unwrap();
         }
-        false
     }
 
-    #[test]
-    fn constants_fit_in_udp_buffers() {
-        assert!(protocol::HEADER_LEN + protocol::INPUT_LEN + protocol::TAG_LEN < 2048);
-        assert!(protocol::HEADER_LEN + protocol::EVENT_LEN + protocol::TAG_LEN < 2048);
-        assert!(protocol::HEADER_LEN + protocol::RECONCILE_LEN + protocol::TAG_LEN < 2048);
-        assert_eq!(protocol::HELLO_LEN, 88);
+    impl Drop for Controller {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 
-    #[test]
-    fn controller_hub_routes_two_agents_by_device() {
-        let controller_stop = Arc::new(AtomicBool::new(false));
-        let agent1_stop = Arc::new(AtomicBool::new(false));
-        let agent2_stop = Arc::new(AtomicBool::new(false));
-        let controller_status = Status::new(None);
-        let agent1_status = Status::new(None);
-        let agent2_status = Status::new(None);
-
-        let controller_config = AppConfig {
-            role: Role::Controller,
-            local_ip: "127.0.0.1".into(),
-            device_id: device_id_to_hex(&device(0x10)),
-            ..AppConfig::default()
-        };
-        let config_path = temp_path("controller");
-        let _ = std::fs::remove_file(&config_path);
-        let config_handle = ConfigHandle::new(config_path.clone(), controller_config.clone());
-        let host = ScreenInfo {
-            width: 1920,
-            height: 1080,
-        };
-        let layout = LayoutStore::new(WorldLayout::new(host, Vec::new()));
-        let (capture_tx, capture_rx) = unbounded::<CaptureMsg>();
-        let controller_handle = start_controller(
-            &controller_config,
-            config_handle,
-            layout,
-            capture_rx,
-            Arc::clone(&controller_stop),
-            controller_status.clone(),
-        )
-        .expect("start controller");
-        let pairing_code = controller_status
-            .snapshot()
-            .pairing_code
-            .expect("controller pairing code");
-
-        let agent1_config = AppConfig {
-            role: Role::Agent,
-            device_id: device_id_to_hex(&device(0x21)),
-            ..AppConfig::default()
-        };
-        let agent2_config = AppConfig {
-            role: Role::Agent,
-            device_id: device_id_to_hex(&device(0x22)),
-            ..AppConfig::default()
-        };
-        let (inject1_tx, inject1_rx) = unbounded::<InjectMsg>();
-        let (inject2_tx, inject2_rx) = unbounded::<InjectMsg>();
-        let agent1_handle = start_agent(
-            &agent1_config,
-            &pairing_code,
-            inject1_tx,
-            Arc::clone(&agent1_stop),
-            agent1_status.clone(),
-        )
-        .expect("start agent 1");
-        let agent2_handle = start_agent(
-            &agent2_config,
-            &pairing_code,
-            inject2_tx,
-            Arc::clone(&agent2_stop),
-            agent2_status.clone(),
-        )
-        .expect("start agent 2");
-
-        assert!(
-            wait_until(|| agent1_status.snapshot().connected
-                && agent2_status.snapshot().connected
-                && controller_status.snapshot().devices.len() == 2),
-            "agents did not connect: controller={:?} a1={:?} a2={:?}",
-            controller_status.snapshot(),
-            agent1_status.snapshot(),
-            agent2_status.snapshot()
-        );
-
-        assert!(
-            wait_until(|| agent1_status.snapshot().latency_ms.is_some()),
-            "agent did not receive RTT stats: {:?}",
-            agent1_status.snapshot()
-        );
-
-        let id1 = device(0x21);
-        let id2 = device(0x22);
-        let active = ReconcileState {
+    fn active() -> InputMsg {
+        InputMsg::Reconcile(ReconcileState {
             active: true,
             caps_lock: false,
             buttons: 0,
-            keys: crate::input::keymap::KeyState::EMPTY,
-        };
-        capture_tx
-            .send(CaptureMsg::Reconcile {
-                device: id1,
-                state: active,
-            })
-            .unwrap();
-        capture_tx
-            .send(CaptureMsg::Move {
-                device: id1,
-                input: RemoteInput {
-                    dx: 25,
-                    dy: -75,
-                    buttons: BUTTON_LEFT,
-                },
-            })
-            .unwrap();
-        let moved = recv_move(&inject1_rx).expect("agent 1 did not receive move");
-        assert_eq!(moved.dx, 25);
-        assert_eq!(moved.dy, -75);
-        capture_tx
-            .send(CaptureMsg::Warp {
-                device: id1,
-                input: WarpInput { x: 0.25, y: 0.75 },
-            })
-            .unwrap();
-        let warp = recv_warp(&inject1_rx).expect("agent 1 did not receive warp");
-        assert!((warp.x - 0.25).abs() < 0.001);
-        assert!((warp.y - 0.75).abs() < 0.001);
-        assert!(
-            !has_motion_or_event(&inject2_rx, Duration::from_millis(150)),
-            "agent 2 received agent 1 input"
-        );
+            keys: KeyState::EMPTY,
+        })
+    }
 
-        capture_tx
-            .send(CaptureMsg::Event {
-                device: id1,
-                event: InputEvent::Button {
-                    button: BUTTON_LEFT,
-                    down: true,
-                },
-            })
-            .unwrap();
-        assert_eq!(
-            recv_event(&inject1_rx),
-            Some(InputEvent::Button {
-                button: BUTTON_LEFT,
-                down: true
-            })
-        );
+    fn pointer(x: f32, y: f32) -> InputMsg {
+        InputMsg::Pointer(PointerPosition { x, y })
+    }
+    fn key(down: bool) -> InputMsg {
+        InputMsg::Event(InputEvent::Key { hid: 0x04, down })
+    }
 
-        capture_tx
-            .send(CaptureMsg::Reconcile {
-                device: id1,
-                state: ReconcileState::INACTIVE,
-            })
-            .unwrap();
-        capture_tx
-            .send(CaptureMsg::Reconcile {
-                device: id2,
-                state: active,
-            })
-            .unwrap();
-        capture_tx
-            .send(CaptureMsg::Move {
-                device: id2,
-                input: RemoteInput {
-                    dx: 60,
-                    dy: 40,
-                    buttons: BUTTON_LEFT,
-                },
-            })
-            .unwrap();
-        let moved2 = recv_move(&inject2_rx).expect("agent 2 did not receive move");
-        assert_eq!(moved2.dx, 60);
-        assert_eq!(moved2.dy, 40);
-        assert!(wait_until(
-            || controller_status.snapshot().target_device == Some(device_id_to_hex(&id2))
-        ));
+    fn recv_matching(
+        rx: &Receiver<InputMsg>,
+        mut predicate: impl FnMut(InputMsg) -> bool,
+    ) -> InputMsg {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let message = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("missing input");
+            if predicate(message) {
+                return message;
+            }
+        }
+    }
 
-        capture_tx
-            .send(CaptureMsg::Event {
-                device: id2,
-                event: InputEvent::Key {
-                    hid: 0x04,
-                    down: true,
-                },
-            })
-            .unwrap();
-        assert_eq!(
-            recv_event(&inject2_rx),
-            Some(InputEvent::Key {
-                hid: 0x04,
-                down: true
-            })
-        );
-
-        capture_tx
-            .send(CaptureMsg::Move {
-                device: device(0x99),
-                input: RemoteInput {
-                    dx: 10,
-                    dy: 10,
-                    buttons: BUTTON_LEFT,
-                },
-            })
-            .unwrap();
-        assert!(!has_motion_or_event(
-            &inject1_rx,
-            Duration::from_millis(150)
-        ));
-        assert!(!has_motion_or_event(
-            &inject2_rx,
-            Duration::from_millis(150)
-        ));
-
-        agent1_stop.store(true, Ordering::Release);
-        let _ = agent1_handle.join();
-        assert!(
-            wait_until(|| controller_status.snapshot().devices.len() == 1),
-            "controller did not drop agent 1: {:?}",
-            controller_status.snapshot()
-        );
-        assert!(agent2_status.snapshot().connected);
-
-        agent2_stop.store(true, Ordering::Release);
-        controller_stop.store(true, Ordering::Release);
-        let _ = agent2_handle.join();
-        let _ = controller_handle.join();
-        let _ = std::fs::remove_file(&config_path);
+    fn recv_event(rx: &Receiver<InputMsg>) -> InputEvent {
+        match recv_matching(rx, |m| matches!(m, InputMsg::Event(_))) {
+            InputMsg::Event(e) => e,
+            _ => unreachable!(),
+        }
     }
 
     #[test]
-    fn pairing_code_is_shared_and_reused() {
-        let config = AppConfig {
-            role: Role::Controller,
-            local_ip: "127.0.0.1".into(),
-            device_id: device_id_to_hex(&device(0x31)),
-            ..AppConfig::default()
+    fn two_agents_route_positions_and_semantics_in_order() {
+        let controller = Controller::new();
+        let (agent1, rx1) = controller.agent(0x21);
+        let (agent2, rx2) = controller.agent(0x22);
+        assert!(wait_until(|| controller
+            .worker
+            .status
+            .snapshot()
+            .devices
+            .len()
+            == 2));
+        assert!(wait_until(|| agent1.status.snapshot().latency_ms.is_some()));
+        assert!(agent1.status.snapshot().packet_loss_percent.is_none());
+
+        controller.send(0x21, pointer(0.25, 0.75));
+        controller.send(0x21, active());
+        let InputMsg::Pointer(pos) = recv_matching(&rx1, |m| matches!(m, InputMsg::Pointer(_)))
+        else {
+            unreachable!()
         };
-        let path = temp_path("reuse");
-        let _ = std::fs::remove_file(&path);
-        let handle = ConfigHandle::new(path.clone(), config.clone());
-        let (tx, rx) = unbounded::<CaptureMsg>();
-        let stop = Arc::new(AtomicBool::new(false));
-        let status = Status::new(None);
-        let host = ScreenInfo {
-            width: 1920,
-            height: 1080,
+        assert!((pos.x - 0.25).abs() < 0.001 && (pos.y - 0.75).abs() < 0.001);
+        assert!(!rx2
+            .try_iter()
+            .any(|m| matches!(m, InputMsg::Pointer(_) | InputMsg::Event(_))));
+
+        let down = InputEvent::Button {
+            button: BUTTON_LEFT,
+            down: true,
         };
-        let layout = LayoutStore::new(WorldLayout::new(host, Vec::new()));
-        let join = start_controller(
-            &config,
-            handle.clone(),
-            layout,
-            rx,
-            Arc::clone(&stop),
-            status.clone(),
+        let up = InputEvent::Button {
+            button: BUTTON_LEFT,
+            down: false,
+        };
+        controller.send(0x21, InputMsg::Event(down));
+        controller.send(0x21, pointer(0.9, 0.1));
+        controller.send(0x21, InputMsg::Event(up));
+        assert_eq!(recv_event(&rx1), down);
+        let mut saw_position = false;
+        recv_matching(&rx1, |m| {
+            match m {
+                InputMsg::Pointer(p) => saw_position = (p.x - 0.9).abs() < 0.001,
+                InputMsg::Event(e) if e == up => {
+                    assert!(saw_position);
+                    return true;
+                }
+                _ => {}
+            }
+            false
+        });
+        controller.send(0x21, InputMsg::Reconcile(ReconcileState::INACTIVE));
+        controller.send(0x22, active());
+        controller.send(0x22, key(true));
+        assert_eq!(
+            recv_event(&rx2),
+            InputEvent::Key {
+                hid: 0x04,
+                down: true
+            }
+        );
+        assert!(wait_until(|| agent2.status.snapshot().remote_active));
+        assert!(wait_until(|| !agent1.status.snapshot().remote_active));
+        drop(agent1);
+        assert!(wait_until(|| controller
+            .worker
+            .status
+            .snapshot()
+            .devices
+            .len()
+            == 1));
+        assert!(agent2.status.snapshot().connected);
+    }
+
+    #[test]
+    fn rapid_keys_and_wheel_need_no_pointer_and_hold_survives_idle() {
+        let controller = Controller::new();
+        let (agent, rx) = controller.agent(0x31);
+        controller.send(0x31, active());
+        for _ in 0..100 {
+            controller.send(0x31, key(true));
+            controller.send(0x31, key(false));
+        }
+        for _ in 0..100 {
+            assert_eq!(
+                recv_event(&rx),
+                InputEvent::Key {
+                    hid: 0x04,
+                    down: true
+                }
+            );
+            assert_eq!(
+                recv_event(&rx),
+                InputEvent::Key {
+                    hid: 0x04,
+                    down: false
+                }
+            );
+        }
+        for delta in 1..=20 {
+            controller.send(0x31, InputMsg::Event(InputEvent::Wheel { delta }));
+        }
+        for delta in 1..=20 {
+            assert_eq!(recv_event(&rx), InputEvent::Wheel { delta });
+        }
+        controller.send(0x31, key(true));
+        assert_eq!(
+            recv_event(&rx),
+            InputEvent::Key {
+                hid: 0x04,
+                down: true
+            }
+        );
+        // Multiple idle snapshots: a stationary held key must not be timed out.
+        let deadline = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < deadline {
+            if let Ok(message) = rx.recv_timeout(Duration::from_millis(50)) {
+                match message {
+                    InputMsg::Reset => panic!("held key reset while heartbeat was healthy"),
+                    InputMsg::Reconcile(state) => {
+                        assert!(state.active && state.keys.contains(0x04))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(agent.status.snapshot().remote_active);
+        controller.send(0x31, key(false));
+        assert_eq!(
+            recv_event(&rx),
+            InputEvent::Key {
+                hid: 0x04,
+                down: false
+            }
+        );
+    }
+
+    #[test]
+    fn disconnect_releases_and_reconnect_starts_inactive() {
+        let controller = Controller::new();
+        let (agent1, _rx1) = controller.agent(0x41);
+        controller.send(0x41, active());
+        controller.send(0x41, key(true));
+        assert!(wait_until(|| agent1.status.snapshot().remote_active));
+        let old_session = controller
+            .layout
+            .snapshot()
+            .1
+            .screen_spec(crate::layout::ScreenId::Device(device(0x41)))
+            .unwrap()
+            .session;
+        // Same device opens a fresh connection while the old one is active.
+        let (agent2, rx2) = controller.agent(0x41);
+        recv_matching(
+            &rx2,
+            |m| matches!(m, InputMsg::Reconcile(s) if !s.active && s.keys.is_empty()),
+        );
+        assert!(!agent2.status.snapshot().remote_active);
+        // Stop the old worker before its automatic retry can replace agent2.
+        drop(agent1);
+        assert!(agent2.status.snapshot().connected);
+        // A queued capture from the previous connection must never reactivate
+        // or type into the new connection, even though device identity matches.
+        for input in [active(), key(true)] {
+            controller
+                .tx
+                .send(CaptureMsg {
+                    device: device(0x41),
+                    session: old_session,
+                    input,
+                })
+                .unwrap();
+        }
+        controller.send(0x41, InputMsg::Event(InputEvent::Wheel { delta: 1 }));
+        assert_eq!(recv_event(&rx2), InputEvent::Wheel { delta: 1 });
+        assert!(!agent2.status.snapshot().remote_active);
+        drop(controller);
+        recv_matching(&rx2, |m| matches!(m, InputMsg::Reset));
+        assert!(wait_until(|| !agent2.status.snapshot().connected));
+    }
+
+    #[test]
+    fn wrong_version_and_pairing_code_never_become_online() {
+        let controller = Controller::new();
+        let invite = Invite::decode(&controller.code).unwrap();
+        let address = SocketAddr::from((invite.ip, invite.port));
+        let socket = TcpStream::connect(address).unwrap();
+        let mut wire = FramedStream::new(socket, Status::default()).unwrap();
+        let mut packet = vec![0; protocol::HELLO_LEN];
+        packet[..4].copy_from_slice(protocol::MAGIC);
+        packet[4] = protocol::VERSION + 1;
+        wire.queue(packet).unwrap();
+        wire.flush().unwrap();
+        assert!(wait_until(|| wire.read_packet().is_err()));
+        assert!(controller.worker.status.snapshot().devices.is_empty());
+
+        let wrong = Invite::generate(invite.ip, invite.port).encode();
+        let stop = AtomicBool::new(false);
+        assert!(connect_agent(
+            address,
+            &wrong,
+            ScreenInfo {
+                width: 1920,
+                height: 1080
+            },
+            device(0x51),
+            &stop,
+            &Status::default()
         )
-        .expect("start controller");
-        let first = status.snapshot().pairing_code.expect("code");
-        stop.store(true, Ordering::Release);
-        let _ = join.join();
-        let saved = handle.snapshot().unwrap();
-        assert_eq!(saved.last_invite, first);
-        let _ = tx;
-        let _ = std::fs::remove_file(&path);
+        .is_err());
+        assert!(controller.worker.status.snapshot().devices.is_empty());
+    }
+
+    #[test]
+    fn pairing_code_reuses_tcp_port_and_pacing_stays_bounded() {
+        let (listener, code) = bind_listener(Ipv4Addr::LOCALHOST, "").unwrap();
+        drop(listener);
+        let (_listener, reused) = bind_listener(Ipv4Addr::LOCALHOST, &code).unwrap();
+        assert_eq!(code, reused);
+        let mut rtt = RttEstimator::new();
+        assert_eq!(pointer_interval(&rtt), INPUT_INTERVAL);
+        rtt.observe(100.0);
+        assert_eq!(pointer_interval(&rtt), SLOW_INPUT_INTERVAL);
+        for _ in 0..100 {
+            rtt.observe(1.0);
+        }
+        assert_eq!(pointer_interval(&rtt), INPUT_INTERVAL);
     }
 }
