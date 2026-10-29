@@ -100,11 +100,24 @@ const DOUBLE_CLICK_DISTANCE: f64 = 4.0;
 const CG_KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
 const CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 
+const CG_FLAG_NON_COALESCED: u64 = 0x0000_0100;
 const CG_FLAG_ALPHA_SHIFT: u64 = 1 << 16;
 const CG_FLAG_SHIFT: u64 = 1 << 17;
 const CG_FLAG_CONTROL: u64 = 1 << 18;
 const CG_FLAG_ALTERNATE: u64 = 1 << 19;
 const CG_FLAG_COMMAND: u64 = 1 << 20;
+const CG_FLAG_NUMERIC_PAD: u64 = 0x0020_0000;
+const CG_FLAG_SECONDARY_FN: u64 = 0x0080_0000;
+
+// IOKit NX_DEVICE*KEYMASK bits carried by hardware FlagsChanged events.
+const NX_DEVICE_L_CTRL: u64 = 0x0000_0001;
+const NX_DEVICE_L_SHIFT: u64 = 0x0000_0002;
+const NX_DEVICE_R_SHIFT: u64 = 0x0000_0004;
+const NX_DEVICE_L_CMD: u64 = 0x0000_0008;
+const NX_DEVICE_R_CMD: u64 = 0x0000_0010;
+const NX_DEVICE_L_ALT: u64 = 0x0000_0020;
+const NX_DEVICE_R_ALT: u64 = 0x0000_0040;
+const NX_DEVICE_R_CTRL: u64 = 0x0000_2000;
 
 const CG_EVENT_SOURCE_STATE_HID_SYSTEM: i32 = 1;
 const CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
@@ -148,6 +161,7 @@ unsafe extern "C" {
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
+    fn CGEventSetType(event: CGEventRef, event_type: u32);
     fn CGEventPost(tap: u32, event: CGEventRef);
     fn CGEventCreateMouseEvent(
         source: *mut c_void,
@@ -1022,6 +1036,7 @@ fn injector_loop(
     let mut caps_actual = unsafe {
         CGEventSourceFlagsState(CG_EVENT_SOURCE_STATE_HID_SYSTEM) & CG_FLAG_ALPHA_SHIFT != 0
     };
+    let key_source = unsafe { CGEventSourceCreate(CG_EVENT_SOURCE_STATE_HID_SYSTEM) };
     let mut cursor = InjectCursor::default();
     let mut batch = Vec::with_capacity(16);
     let mut steps = Vec::with_capacity(16);
@@ -1075,28 +1090,60 @@ fn injector_loop(
                 InjectStep::KeyPress(hid) => {
                     if !applied_keys.contains(hid) {
                         applied_keys.insert(hid);
-                        post_key_event(hid, true, false, &applied_keys, caps_actual);
+                        if is_modifier(hid) {
+                            post_modifier_event(
+                                key_source,
+                                hid,
+                                &applied_keys,
+                                caps_actual,
+                            );
+                        } else {
+                            post_key_event(
+                                key_source,
+                                hid,
+                                true,
+                                false,
+                                &applied_keys,
+                                caps_actual,
+                            );
+                        }
                     }
                 }
                 InjectStep::KeyRelease(hid) => {
                     if applied_keys.contains(hid) {
                         applied_keys.remove(hid);
-                        post_key_event(hid, false, false, &applied_keys, caps_actual);
+                        if is_modifier(hid) {
+                            post_modifier_event(
+                                key_source,
+                                hid,
+                                &applied_keys,
+                                caps_actual,
+                            );
+                        } else {
+                            post_key_event(
+                                key_source,
+                                hid,
+                                false,
+                                false,
+                                &applied_keys,
+                                caps_actual,
+                            );
+                        }
                     }
                 }
                 InjectStep::KeyRepeat(hid) => {
-                    if applied_keys.contains(hid) {
-                        post_key_event(hid, true, true, &applied_keys, caps_actual);
+                    if applied_keys.contains(hid) && !is_modifier(hid) {
+                        post_key_event(key_source, hid, true, true, &applied_keys, caps_actual);
                     }
                 }
                 InjectStep::CapsLock(desired) => {
                     if desired != caps_actual {
-                        inject_caps_tap(desired, &applied_keys);
+                        inject_caps_tap(key_source, desired, &applied_keys);
                         caps_actual = desired;
                     }
                 }
                 InjectStep::Reset => {
-                    release_keys(&mut applied_keys, caps_actual);
+                    release_keys(key_source, &mut applied_keys, caps_actual);
                     let point = applied_point_or_origin(applied_position, bounds);
                     apply_button_transitions(applied_buttons, 0, point, &mut clicks);
                     applied_buttons = 0;
@@ -1108,10 +1155,15 @@ fn injector_loop(
         }
     }
 
-    release_keys(&mut applied_keys, caps_actual);
+    release_keys(key_source, &mut applied_keys, caps_actual);
     if applied_buttons != 0 {
         let point = applied_point_or_origin(applied_position, bounds);
         apply_button_transitions(applied_buttons, 0, point, &mut clicks);
+    }
+    if !key_source.is_null() {
+        unsafe {
+            CFRelease(key_source);
+        }
     }
 }
 
@@ -1135,16 +1187,27 @@ fn mac_flags(keys: &KeyState, caps_lock: bool) -> u64 {
     flags
 }
 
-fn post_key_event(hid: u8, down: bool, repeat: bool, keys: &KeyState, caps_lock: bool) {
+fn post_key_event(
+    source: *mut c_void,
+    hid: u8,
+    down: bool,
+    repeat: bool,
+    keys: &KeyState,
+    caps_lock: bool,
+) {
     let Some(keycode) = hid_to_mac(hid) else {
         return;
     };
     unsafe {
-        let event = CGEventCreateKeyboardEvent(null_mut(), keycode, if down { 1 } else { 0 });
+        let event = CGEventCreateKeyboardEvent(source, keycode, if down { 1 } else { 0 });
         if event.is_null() {
             return;
         }
-        CGEventSetFlags(event, mac_flags(keys, caps_lock));
+        let mut flags = mac_flags(keys, caps_lock);
+        if matches!(keycode, 0x7B | 0x7C | 0x7D | 0x7E) {
+            flags |= CG_FLAG_NUMERIC_PAD | CG_FLAG_SECONDARY_FN;
+        }
+        CGEventSetFlags(event, flags);
         if repeat {
             CGEventSetIntegerValueField(event, CG_KEYBOARD_EVENT_AUTOREPEAT, 1);
         }
@@ -1153,12 +1216,64 @@ fn post_key_event(hid: u8, down: bool, repeat: bool, keys: &KeyState, caps_lock:
     }
 }
 
-fn inject_caps_tap(caps_after: bool, keys: &KeyState) {
+fn mac_device_flags(keys: &KeyState) -> u64 {
+    let mut flags = 0;
+    if keys.contains(0xE0) {
+        flags |= NX_DEVICE_L_CTRL;
+    }
+    if keys.contains(0xE4) {
+        flags |= NX_DEVICE_R_CTRL;
+    }
+    if keys.contains(0xE1) {
+        flags |= NX_DEVICE_L_SHIFT;
+    }
+    if keys.contains(0xE5) {
+        flags |= NX_DEVICE_R_SHIFT;
+    }
+    if keys.contains(0xE2) {
+        flags |= NX_DEVICE_L_ALT;
+    }
+    if keys.contains(0xE6) {
+        flags |= NX_DEVICE_R_ALT;
+    }
+    if keys.contains(0xE3) {
+        flags |= NX_DEVICE_L_CMD;
+    }
+    if keys.contains(0xE7) {
+        flags |= NX_DEVICE_R_CMD;
+    }
+    flags
+}
+
+fn post_modifier_event(
+    source: *mut c_void,
+    hid: u8,
+    keys: &KeyState,
+    caps_lock: bool,
+) {
+    let Some(keycode) = hid_to_mac(hid) else {
+        return;
+    };
+    unsafe {
+        let event = CGEventCreateKeyboardEvent(source, keycode, 1);
+        if event.is_null() {
+            return;
+        }
+        CGEventSetType(event, CG_EVENT_FLAGS_CHANGED);
+        CGEventSetFlags(
+            event,
+            mac_flags(keys, caps_lock) | mac_device_flags(keys) | CG_FLAG_NON_COALESCED,
+        );
+        CGEventPost(CG_TAP_LOCATION_HID, event);
+        CFRelease(event as *const c_void);
+    }
+}
+
+fn inject_caps_tap(source: *mut c_void, caps_after: bool, keys: &KeyState) {
     let Some(keycode) = hid_to_mac(CAPS_LOCK) else {
         return;
     };
     unsafe {
-        let source = CGEventSourceCreate(CG_EVENT_SOURCE_STATE_HID_SYSTEM);
         for down in [1u8, 0u8] {
             let event = CGEventCreateKeyboardEvent(source, keycode, down);
             if !event.is_null() {
@@ -1167,22 +1282,19 @@ fn inject_caps_tap(caps_after: bool, keys: &KeyState) {
                 CFRelease(event as *const c_void);
             }
         }
-        if !source.is_null() {
-            CFRelease(source);
-        }
     }
 }
 
-fn release_keys(keys: &mut KeyState, caps_lock: bool) {
+fn release_keys(source: *mut c_void, keys: &mut KeyState, caps_lock: bool) {
     let mut hids: Vec<u8> = keys.iter().collect();
     hids.sort_unstable();
     for hid in hids.iter().copied().filter(|hid| !is_modifier(*hid)) {
         keys.remove(hid);
-        post_key_event(hid, false, false, keys, caps_lock);
+        post_key_event(source, hid, false, false, keys, caps_lock);
     }
     for hid in hids.iter().copied().filter(|hid| is_modifier(*hid)) {
         keys.remove(hid);
-        post_key_event(hid, false, false, keys, caps_lock);
+        post_modifier_event(source, hid, keys, caps_lock);
     }
 }
 
@@ -1397,9 +1509,17 @@ pub fn self_test() -> bool {
                 ok = false;
             }
         }
+        match test_modifier_injection() {
+            Ok(()) => println!("modifiers:              PASS"),
+            Err(e) => {
+                println!("modifiers:              FAIL ({e})");
+                ok = false;
+            }
+        }
     } else {
         println!("injection:              SKIP (needs Accessibility + event posting)");
         println!("caps lock:              SKIP (needs Accessibility + event posting)");
+        println!("modifiers:              SKIP (needs Accessibility + event posting)");
         ok = false;
     }
 
@@ -1502,7 +1622,13 @@ fn test_caps_injection() -> Result<(), String> {
 
     let actual = current_caps_lock();
     if actual != before {
-        inject_caps_tap(before, &KeyState::default());
+        let source = unsafe { CGEventSourceCreate(CG_EVENT_SOURCE_STATE_HID_SYSTEM) };
+        inject_caps_tap(source, before, &KeyState::default());
+        if !source.is_null() {
+            unsafe {
+                CFRelease(source);
+            }
+        }
         thread::sleep(Duration::from_millis(50));
     }
 
@@ -1511,6 +1637,53 @@ fn test_caps_injection() -> Result<(), String> {
     } else {
         Err(format!(
             "caps did not toggle/restore (before={before}, flipped={flipped}, restored={restored})"
+        ))
+    }
+}
+
+fn test_modifier_injection() -> Result<(), String> {
+    let status = Status::new(screen_info());
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = crossbeam_channel::unbounded::<InjectMsg>();
+    let handle = start_injector(rx, Arc::clone(&stop), status)?;
+    let caps = current_caps_lock();
+
+    let send_state = |state: KeyState| {
+        tx.send(InjectMsg::Keys(KeyPacket {
+            active: true,
+            caps_lock: caps,
+            state,
+            event: KeyEvent::None,
+        }))
+        .map_err(|_| "injector thread stopped".to_string())
+    };
+    let wait_shift = |desired: bool| {
+        for _ in 0..50 {
+            let shift = unsafe {
+                CGEventSourceFlagsState(CG_EVENT_SOURCE_STATE_HID_SYSTEM) & CG_FLAG_SHIFT != 0
+            };
+            if shift == desired {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    };
+
+    let mut shift = KeyState::default();
+    shift.insert(0xE1); // left Shift
+    let pressed = send_state(shift).is_ok() && wait_shift(true);
+    let released = send_state(KeyState::default()).is_ok() && wait_shift(false);
+
+    let _ = tx.send(InjectMsg::Reset);
+    stop.store(true, Ordering::Release);
+    let _ = handle.join();
+
+    if pressed && released {
+        Ok(())
+    } else {
+        Err(format!(
+            "modifier did not apply/release (pressed={pressed}, released={released})"
         ))
     }
 }
