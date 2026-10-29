@@ -11,7 +11,7 @@ use crate::layout::{
 };
 use crate::status::{ScreenInfo, Status};
 use crossbeam_channel::{Receiver, Sender};
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -224,6 +224,64 @@ unsafe extern "C" {
     fn CGRequestListenEventAccess() -> u8;
     fn CGRequestPostEventAccess() -> u8;
     static kAXTrustedCheckOptionPrompt: CFStringRef;
+}
+
+type IoConnect = u32;
+type MachPort = u32;
+
+const K_IOHID_CAPS_LOCK_STATE: i32 = 1;
+const K_IOHID_PARAM_CONNECT_TYPE: u32 = 1;
+
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    static mach_task_self_: MachPort;
+    fn IOObjectRelease(object: u32) -> i32;
+    fn IOServiceMatching(name: *const c_char) -> *const c_void;
+    fn IOServiceGetMatchingService(main_port: MachPort, matching: *const c_void) -> u32;
+    fn IOServiceOpen(
+        service: u32,
+        owning_task: MachPort,
+        connect_type: u32,
+        connect: *mut IoConnect,
+    ) -> i32;
+    fn IOServiceClose(connect: IoConnect) -> i32;
+    fn IOHIDSetModifierLockState(connect: IoConnect, selector: i32, state: u8) -> i32;
+}
+
+/// Open the IOHIDSystem parameter connection used to set the hardware Caps
+/// Lock state directly. This avoids synthesizing a Caps key tap, which on
+/// macOS can be interpreted as an input-source switch instead of a lock.
+fn open_caps_lock_connection() -> Option<IoConnect> {
+    unsafe {
+        let matching = IOServiceMatching(c"IOHIDSystem".as_ptr());
+        if matching.is_null() {
+            return None;
+        }
+        let service = IOServiceGetMatchingService(0, matching);
+        if service == 0 {
+            return None;
+        }
+        let mut connect = 0;
+        let result = IOServiceOpen(
+            service,
+            mach_task_self_,
+            K_IOHID_PARAM_CONNECT_TYPE,
+            &mut connect,
+        );
+        IOObjectRelease(service);
+        if result == 0 && connect != 0 {
+            Some(connect)
+        } else {
+            None
+        }
+    }
+}
+
+fn set_caps_lock_state(connect: IoConnect, locked: bool) -> bool {
+    connect != 0
+        && unsafe {
+            IOHIDSetModifierLockState(connect, K_IOHID_CAPS_LOCK_STATE, u8::from(locked)) == 0
+        }
 }
 
 fn virtual_bounds() -> Option<CGRect> {
@@ -537,6 +595,11 @@ impl CaptureState {
         };
 
         if is_caps(hid) {
+            // Caps is a locking modifier on macOS: it can arrive as keyDown/Up
+            // and as a flagsChanged carrying AlphaShift. Use the physical key
+            // state to collapse both into one press edge, keep our own logical
+            // lock state, and send it as an explicit CapsLock event. The local
+            // event is swallowed so Caps does not also toggle on this machine.
             let physical_down =
                 unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, keycode) } != 0;
             let pressed = match event_type {
@@ -1023,6 +1086,7 @@ fn injector_loop(
         CGEventSourceFlagsState(CG_EVENT_SOURCE_STATE_HID_SYSTEM) & CG_FLAG_ALPHA_SHIFT != 0
     };
     let key_source = unsafe { CGEventSourceCreate(CG_EVENT_SOURCE_STATE_HID_SYSTEM) };
+    let caps_connection = open_caps_lock_connection();
     let mut repeater = KeyRepeater::default();
     let mut cursor = InjectCursor {
         caps_lock: caps_actual,
@@ -1122,7 +1186,18 @@ fn injector_loop(
                     }
                 }
                 InjectStep::CapsLock(desired) => {
+                    // Caps Lock is a locking modifier on macOS, and the same
+                    // key may be configured to switch input sources. Prefer
+                    // setting the hardware lock state directly so a remote
+                    // lock request cannot accidentally switch the agent's IME.
+                    caps_actual = current_caps_lock();
                     if desired != caps_actual {
+                        if let Some(connect) = caps_connection {
+                            if set_caps_lock_state(connect, desired) {
+                                caps_actual = desired;
+                                continue;
+                            }
+                        }
                         inject_caps_tap(key_source, desired, &applied_keys);
                         caps_actual = desired;
                     }
@@ -1149,6 +1224,11 @@ fn injector_loop(
     if !key_source.is_null() {
         unsafe {
             CFRelease(key_source);
+        }
+    }
+    if let Some(connect) = caps_connection {
+        unsafe {
+            IOServiceClose(connect);
         }
     }
 }

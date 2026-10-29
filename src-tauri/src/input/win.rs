@@ -809,7 +809,7 @@ fn injector_loop(
     let _ = ready_tx.send(Ok(()));
     let mut applied_buttons = 0u8;
     let mut applied_keys = KeyState::default();
-    let mut caps_actual = unsafe { GetAsyncKeyState(VK_CAPITAL as i32) as u16 & 1 != 0 };
+    let caps_actual = unsafe { GetAsyncKeyState(VK_CAPITAL as i32) as u16 & 1 != 0 };
     let mut repeater = KeyRepeater::default();
     let mut cursor = InjectCursor {
         caps_lock: caps_actual,
@@ -877,10 +877,9 @@ fn injector_loop(
                     }
                 }
                 InjectStep::CapsLock(desired) => {
-                    if desired != caps_actual {
+                    if desired != unsafe { query_caps_lock() } {
                         send_key_hid(CAPS_LOCK, true);
                         send_key_hid(CAPS_LOCK, false);
-                        caps_actual = desired;
                     }
                 }
                 InjectStep::Reset => {
@@ -888,7 +887,6 @@ fn injector_loop(
                     repeater.release_all();
                     apply_button_transitions(applied_buttons, 0);
                     applied_buttons = 0;
-                    caps_actual = unsafe { query_caps_lock() };
                 }
             }
         }

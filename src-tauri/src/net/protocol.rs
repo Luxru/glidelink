@@ -472,6 +472,9 @@ pub fn decode_event(payload: &[u8]) -> Result<InputEvent, ProtocolError> {
     }
 }
 
+/// 36-byte idempotent snapshot:
+/// `[0]` flags (bit0 active, bit1 Caps Lock), `[1]` mouse buttons,
+/// `[2..34]` HID key bitmap, `[34..36]` reserved zero.
 pub fn encode_reconcile(state: &ReconcileState) -> [u8; RECONCILE_LEN] {
     let mut out = [0u8; RECONCILE_LEN];
     if state.active {
