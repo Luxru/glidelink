@@ -98,6 +98,9 @@ const CG_KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
 const CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 
 const CG_FLAG_NON_COALESCED: u64 = 0x0000_0100;
+/// `kCGEventFlagMaskAlphaShift`: the Caps Lock lock state is active. macOS
+/// calls it alpha shift because it shifts alphabetic characters; it is a
+/// lock flag carried by keyboard events, not a physically held key.
 const CG_FLAG_ALPHA_SHIFT: u64 = 1 << 16;
 const CG_FLAG_SHIFT: u64 = 1 << 17;
 const CG_FLAG_CONTROL: u64 = 1 << 18;
@@ -466,6 +469,10 @@ impl Default for ButtonClick {
     }
 }
 
+/// Synthesized mouse events do not get a double/triple-click count from
+/// macOS automatically: `CGEventCreateMouseEvent` leaves `clickState` at 1.
+/// lan-mouse and Deskflow both set `kCGMouseEventClickState` explicitly for
+/// this reason, so the receiver has to track down/up sequences here.
 struct ClickTracker {
     interval: Duration,
     buttons: [ButtonClick; 5],
@@ -1808,5 +1815,19 @@ mod tests {
             drag_event(BUTTON_LEFT | BUTTON_X1).map(|(_, button)| button),
             Some(CG_MOUSE_BUTTON_LEFT)
         );
+    }
+
+    #[test]
+    fn click_tracker_reports_double_and_triple_clicks() {
+        let point = CGPoint { x: 10.0, y: 20.0 };
+        let mut clicks = ClickTracker::new();
+        assert_eq!(clicks.down(BUTTON_LEFT, point), 1);
+        assert_eq!(clicks.up(BUTTON_LEFT), 1);
+        assert_eq!(clicks.down(BUTTON_LEFT, point), 2);
+        assert_eq!(clicks.up(BUTTON_LEFT), 2);
+        assert_eq!(clicks.down(BUTTON_LEFT, point), 3);
+        assert_eq!(clicks.up(BUTTON_LEFT), 3);
+        clicks.reset();
+        assert_eq!(clicks.down(BUTTON_LEFT, point), 1);
     }
 }
