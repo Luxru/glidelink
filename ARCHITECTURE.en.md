@@ -4,54 +4,67 @@ English | [Chinese](ARCHITECTURE.md)
 
 See the [README](README.en.md) for usage and build instructions.
 
-## Roles
+## Roles and topology
 
-One application supports both roles, selected in Settings:
+- **Controller Hub**: listens on UDP, captures the local mouse/keyboard, and maintains multiple agent sessions plus a 2D screen layout.
+- **Agent**: connects to the controller, receives input, and injects it locally.
 
-- **Controller**: captures the local mouse and keyboard and forwards input when the pointer crosses a screen edge.
-- **Agent**: receives input and injects it into the local system.
-
-The Tauri UI only handles configuration and status; it is not part of input processing.
+The controller generates one shared 20-character pairing code (local IP, port, random token). All agents use the same code; up to 8 may join. The controller owns input policy; agents only execute.
 
 ## Components
 
 ```
 ui/ ──commands──► Engine
-                    ├── Controller: input capture → network send (UDP)
-                    └── Agent: network receive → input injection
+                    ├── Controller: capture → 2D target routing → multi-session UDP
+                    └── Agent: UDP receive → input injection
 ```
 
-- `input/`: system-level input capture and injection, implemented per platform.
-- `net/`: pairing, handshake, encryption, UDP transport, heartbeats, reconnection.
-- `layout.rs`: screen edges and coordinate mapping.
-- `config.rs`, `state.rs`: settings persistence and runtime state.
+- `input/`: system-level capture/injection; capture messages carry a target device id.
+- `net/`: controller hub, agent client, handshake, encryption, heartbeat, reconnect, multi-session.
+- `layout.rs`: 2D world coordinates, screen rectangles, target transitions, layout persistence.
+- `config.rs`, `state.rs`: settings, device identity, layout, runtime state.
 - `ui/`: HTML / CSS / JS interface with no frontend build step.
 
-## Input flow
+## Device identity and handshake
 
-The controller captures mouse and keyboard at the system level. When the pointer reaches the configured edge and keeps moving outward, forwarding starts:
+- Each installation generates and persists a 16-byte `device_id`, carried in the handshake.
+- Agent → Controller `HELLO`, Controller → Agent `ACCEPT`, Agent → Controller `CONFIRM`, Controller → Agent `CONFIRM_ACK`.
+- Every device gets its own SID, SPAKE2 session keys, and replay window; `HELLO_LEN = 88`.
+- The controller keeps per-agent sessions, RTT, loss, heartbeat, pacer, and reconcile. One agent disconnecting does not affect the others.
+- Reconnecting with the same device id replaces the old session and keeps its layout position.
 
-- Mouse movement is coalesced to the latest position (`TYPE_INPUT`, absolute normalized coordinates).
-- Mouse buttons, wheel, key down/up, and Caps Lock are discrete events sent immediately (`TYPE_EVENT`), so coalescing a move cannot drop a click or key edge.
-- The agent owns key repeat (500 ms delay, 32 ms interval) and double-click counting; the controller does not forward OS autorepeat.
-- Every 500 ms the controller sends `TYPE_RECONCILE` with held keys, held buttons, Caps Lock, and whether the pointer is remote. A lost event heals within one period; disconnect or timeout releases everything.
-- Crossing the return threshold restores local control and sends release-all plus an inactive state.
+## 2D layout and input routing
 
-Coordinates are normalized to 0–1 on each virtual desktop, so movement stays proportional across resolutions. The peer can sit to the left, right, above, or below, and can slide along the shared edge.
+World units use the controller screen width as 1. Every screen is 1.0 wide and its height follows the screen aspect ratio.
 
-Input uses UDP: pointer position is replaceable state, so old packets need no retransmission. Discrete events are not retransmitted; the 500 ms reconciliation repairs recoverable state. A very short tap can still be lost on an extreme lossy link.
+- The host is fixed at `(0,0)`; agent screens are freely draggable.
+- The pointer keeps a continuous world coordinate; entering an online agent rectangle switches target.
+- Host ↔ agent and agent ↔ agent traversal are direct. Gaps between screens act as walls.
+- Returning to the host shows the cursor and warps it to the corresponding point; switching between agents keeps the cursor hidden.
+- On target switch the old agent receives release-all/inactive; the new one receives current buttons and Caps state; keyboard keys still held during the switch must be pressed again.
+- If the active device disconnects or leaves the layout, control returns to the host. `Ctrl + Alt + Backspace` forces release.
+- Layout lives in `config.layout`; new devices are auto-placed. While listening with the pointer local, dragging updates the live world and persists.
+
+## Input events
+
+- Mouse movement: relative pixel deltas `dx/dy`, accumulated over 2 ms (`TYPE_INPUT`, 8 bytes). A one-off `TYPE_WARP` absolute position aligns the cursor on entry or target switch.
+- Deltas are scaled to the target screen resolution so movement stays proportional across resolutions.
+- Mouse buttons, wheel, key down/up, and Caps Lock: discrete events (`TYPE_EVENT`).
+- The agent owns key repeat (500 ms / 32 ms) and double-click counting; the controller does not forward OS autorepeat.
+- Every agent receives a 500 ms reconcile: the active target gets active state, others get inactive. Lost releases heal within one period.
+- A very short tap or relative motion can still be lost on an extreme lossy link; the entry warp realigns the cursor.
 
 ## Platform backends
 
-- **Windows**: low-level mouse/keyboard hooks for capture, Raw Input for movement, `mouse_event` for injection.
-- **macOS**: `CGEventTap` for capture, `CGEventPost` for injection; Accessibility and Input Monitoring permissions are required.
+- **Windows**: low-level mouse/keyboard hooks, Raw Input for movement, `mouse_event`/`SendInput` for injection.
+- **macOS**: `CGEventTap` for capture, `CGEventPost` for injection; Accessibility and Input Monitoring permissions are required. Caps Lock is set through IOHID to avoid accidentally switching input sources.
 
-## Transport
+## Transport and security
 
-The agent generates a 20-character pairing code containing its IP, port, and a random token. Both sides run SPAKE2 to derive session keys, encrypt every packet with ChaCha20-Poly1305, and reject replays by sequence number. The controller sends a 100ms heartbeat to measure round-trip time and packet loss.
+Both sides run SPAKE2 per device; ChaCha20-Poly1305 encrypts every packet and sequence numbers reject replays. The controller pings the active target every 100 ms and idle agents every 500 ms; PONG carries receive statistics for RTT and loss.
 
-Ports are chosen automatically from 45890–45999 and should only be reachable on the local network.
+Ports are chosen from 45890–45999. The controller must allow LAN access to that UDP port; agents only connect outbound. The shared pairing code is a bearer secret; use it only on trusted LANs, keep the device count bounded, rate-limit HELLO, and never log the code.
 
 ## Configuration
 
-All settings are read and written by the Rust backend and stored in `~/.glidelink/settings.json`.
+Settings are read and written by the Rust backend in `~/.glidelink/settings.json`: role, listening interface, device id, layout, last pairing code, language, and modifier mapping.

@@ -2,12 +2,12 @@ use super::{
     keymap::{hid_to_mac, is_caps, is_modifier, mac_to_hid, KeyState, CAPS_LOCK, KEY_DEFS},
     plan_injection_batch, CaptureHandle, CaptureMsg, CaptureShared, InjectCursor, InjectMsg,
     InjectStep, InputEvent, KeyAction, KeyOwnership, KeyRepeater, ReconcileState, RemoteInput,
-    BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
+    WarpInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
 };
 use crate::error;
 use crate::layout::{
-    advance, clamp_for_edge, entry_point, has_returned, host_point_to_norm, host_return_point,
-    is_outward, Edge, NormPoint, REENTRY_COOLDOWN_MS,
+    enter_from_host, host_px_to_world, step_active, world_to_host_px, DeviceId, LayoutStore,
+    NormPoint, StepResult, WorldLayout, WorldPoint, REENTRY_COOLDOWN_MS,
 };
 use crate::status::{ScreenInfo, Status};
 use crossbeam_channel::{Receiver, Sender};
@@ -526,14 +526,17 @@ impl ClickTracker {
 struct CaptureState {
     shared: Arc<CaptureShared>,
     tx: Sender<CaptureMsg>,
-    edge: Edge,
-    offset: f32,
     bounds: CGRect,
     tap: CFMachPortRef,
+    layout: LayoutStore,
+    layout_generation: u64,
+    world_layout: Arc<WorldLayout>,
     active: bool,
+    target: Option<DeviceId>,
     hidden: bool,
     buttons: u8,
-    point: NormPoint,
+    point: WorldPoint,
+    host_anchor: NormPoint,
     cooldown_until: Instant,
     keys: KeyOwnership,
     caps_lock: bool,
@@ -541,19 +544,86 @@ struct CaptureState {
 }
 
 impl CaptureState {
-    fn send_move(&self) {
-        let input = RemoteInput {
-            x: self.point.x,
-            y: self.point.y,
+    fn host_width(&self) -> i32 {
+        self.bounds.size.width.round().max(2.0) as i32
+    }
+
+    fn host_height(&self) -> i32 {
+        self.bounds.size.height.round().max(2.0) as i32
+    }
+
+    fn host_origin(&self) -> (i32, i32) {
+        (
+            self.bounds.min_x().round() as i32,
+            self.bounds.min_y().round() as i32,
+        )
+    }
+
+    fn refresh_layout(&mut self) -> bool {
+        let (generation, layout) = self.layout.snapshot();
+        if generation == self.layout_generation {
+            return false;
+        }
+        self.layout_generation = generation;
+        self.world_layout = layout;
+        true
+    }
+
+    fn target_online(&self) -> bool {
+        self.target
+            .map(|device| {
+                self.world_layout
+                    .is_online(crate::layout::ScreenId::Device(device))
+            })
+            .unwrap_or(false)
+    }
+
+    fn local_point(&self) -> Option<NormPoint> {
+        let device = self.target?;
+        self.world_layout
+            .world_to_local(crate::layout::ScreenId::Device(device), self.point)
+    }
+
+    fn send_relative(&self, dx: i32, dy: i32) {
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        let Some(device) = self.target else {
+            return;
         };
-        let _ = self.tx.try_send(CaptureMsg::Move(input));
+        let _ = self.tx.try_send(CaptureMsg::Move {
+            device,
+            input: RemoteInput { dx, dy },
+        });
+    }
+
+    fn send_warp(&self) {
+        let Some(device) = self.target else {
+            return;
+        };
+        let Some(local) = self.local_point() else {
+            return;
+        };
+        let _ = self.tx.try_send(CaptureMsg::Warp {
+            device,
+            input: WarpInput {
+                x: local.x,
+                y: local.y,
+            },
+        });
     }
 
     fn send_event(&self, event: InputEvent) {
-        let _ = self.tx.try_send(CaptureMsg::Event(event));
+        let Some(device) = self.target else {
+            return;
+        };
+        let _ = self.tx.try_send(CaptureMsg::Event { device, event });
     }
 
     fn send_reconcile(&self, active: bool) {
+        let Some(device) = self.target else {
+            return;
+        };
         let state = ReconcileState {
             active,
             caps_lock: self.caps_lock,
@@ -561,10 +631,10 @@ impl CaptureState {
             keys: if active {
                 self.keys.remote
             } else {
-                KeyState::default()
+                KeyState::EMPTY
             },
         };
-        let _ = self.tx.try_send(CaptureMsg::Reconcile(state));
+        let _ = self.tx.try_send(CaptureMsg::Reconcile { device, state });
     }
 
     fn apply_key_action(&mut self, action: KeyAction, hid: u8, event: CGEventRef) -> CGEventRef {
@@ -600,6 +670,11 @@ impl CaptureState {
                 std::ptr::null_mut()
             };
         };
+
+        if event_type == CG_EVENT_KEY_DOWN && hid == 0x2A && ctrl_alt_pressed() {
+            self.deactivate_to_host(true, None);
+            return std::ptr::null_mut();
+        }
 
         if is_caps(hid) {
             // Caps is a locking modifier on macOS: it can arrive as keyDown/Up
@@ -659,13 +734,11 @@ impl CaptureState {
         }
     }
 
-    fn at_edge(&self, location: CGPoint) -> bool {
-        match self.edge {
-            Edge::Right => location.x >= self.bounds.max_x() - 1.5,
-            Edge::Left => location.x <= self.bounds.min_x() + 1.5,
-            Edge::Top => location.y <= self.bounds.min_y() + 1.5,
-            Edge::Bottom => location.y >= self.bounds.max_y() - 1.5,
-        }
+    fn at_host_edge(&self, location: CGPoint) -> bool {
+        location.x >= self.bounds.max_x() - 1.5
+            || location.x <= self.bounds.min_x() + 1.5
+            || location.y >= self.bounds.max_y() - 1.5
+            || location.y <= self.bounds.min_y() + 1.5
     }
 
     fn button_event(&mut self, event_type: u32, event: CGEventRef) -> bool {
@@ -725,9 +798,15 @@ impl CaptureState {
             return self.handle_key_event(event_type, event);
         }
 
+        self.refresh_layout();
+        if self.active && !self.target_online() {
+            self.deactivate_to_host(true, None);
+        }
+
         let location = unsafe { CGEventGetLocation(event) };
         let dx = unsafe { CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_X) } as f64;
         let dy = unsafe { CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_Y) } as f64;
+        let host_w = self.host_width();
 
         if self.active {
             match event_type {
@@ -735,18 +814,41 @@ impl CaptureState {
                 | CG_EVENT_LEFT_MOUSE_DRAGGED
                 | CG_EVENT_RIGHT_MOUSE_DRAGGED
                 | CG_EVENT_OTHER_MOUSE_DRAGGED => {
-                    self.point = advance(
-                        self.point,
-                        dx,
-                        dy,
-                        self.bounds.size.width.round() as i32,
-                        self.bounds.size.height.round() as i32,
-                    );
-                    if has_returned(self.edge, self.point) {
-                        self.deactivate(true);
-                    } else {
-                        self.point = clamp_for_edge(self.edge, self.point);
-                        self.send_move();
+                    let Some(device) = self.target else {
+                        return null_mut();
+                    };
+                    let old = self.point;
+                    let host_w_f = host_w as f32;
+                    match step_active(&self.world_layout, device, self.point, dx, dy, host_w) {
+                        StepResult::Stay { world, .. } | StepResult::Wall { world, .. } => {
+                            self.point = world;
+                            self.send_relative(
+                                ((world.x - old.x) * host_w_f).round() as i32,
+                                ((world.y - old.y) * host_w_f).round() as i32,
+                            );
+                        }
+                        StepResult::ReturnHost {
+                            world, consumed, ..
+                        } => {
+                            self.send_relative(
+                                ((consumed.x - old.x) * host_w_f).round() as i32,
+                                ((consumed.y - old.y) * host_w_f).round() as i32,
+                            );
+                            self.point = world;
+                            self.deactivate_to_host(true, Some(world));
+                        }
+                        StepResult::Switch {
+                            target,
+                            world,
+                            consumed,
+                            ..
+                        } => {
+                            self.send_relative(
+                                ((consumed.x - old.x) * host_w_f).round() as i32,
+                                ((consumed.y - old.y) * host_w_f).round() as i32,
+                            );
+                            self.switch_target(target, world);
+                        }
                     }
                 }
                 CG_EVENT_LEFT_MOUSE_DOWN
@@ -776,13 +878,17 @@ impl CaptureState {
             | CG_EVENT_LEFT_MOUSE_DRAGGED
             | CG_EVENT_RIGHT_MOUSE_DRAGGED
             | CG_EVENT_OTHER_MOUSE_DRAGGED => {
-                if self.shared.is_connected()
-                    && Instant::now() >= self.cooldown_until
-                    && self.at_edge(location)
-                    && is_outward(self.edge, dx, dy)
-                {
-                    self.activate(location);
-                    return null_mut();
+                if Instant::now() >= self.cooldown_until && self.at_host_edge(location) {
+                    let (origin_x, origin_y) = self.host_origin();
+                    let host_world =
+                        host_px_to_world(location.x, location.y, origin_x, origin_y, host_w);
+                    if let Some((device, _, world)) =
+                        enter_from_host(&self.world_layout, host_world, dx, dy, host_w)
+                    {
+                        let anchor = self.world_layout.world_to_host_norm(host_world).inset();
+                        self.activate_target(device, world, anchor);
+                        return null_mut();
+                    }
                 }
             }
             CG_EVENT_LEFT_MOUSE_DOWN
@@ -799,39 +905,19 @@ impl CaptureState {
         event
     }
 
-    fn activate(&mut self, host_location: CGPoint) {
+    fn activate_target(&mut self, device: DeviceId, world: WorldPoint, host_anchor: NormPoint) {
         if self.active {
             return;
         }
-        let host = host_point_to_norm(
-            host_location.x,
-            host_location.y,
-            self.bounds.min_x().round() as i32,
-            self.bounds.min_y().round() as i32,
-            self.bounds.size.width.round() as i32,
-            self.bounds.size.height.round() as i32,
-        );
-        self.point = entry_point(self.edge, host, self.offset);
-        self.buttons = unsafe {
-            let mut buttons = 0u8;
-            for (button, bit) in [
-                (CG_MOUSE_BUTTON_LEFT, BUTTON_LEFT),
-                (CG_MOUSE_BUTTON_RIGHT, BUTTON_RIGHT),
-                (CG_MOUSE_BUTTON_CENTER, BUTTON_MIDDLE),
-                (CG_MOUSE_BUTTON_X1, BUTTON_X1),
-                (CG_MOUSE_BUTTON_X2, BUTTON_X2),
-            ] {
-                if CGEventSourceButtonState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, button) != 0 {
-                    buttons |= bit;
-                }
-            }
-            buttons
-        };
         self.active = true;
-        self.shared.set_active(true);
+        self.target = Some(device);
+        self.point = world;
+        self.host_anchor = host_anchor;
+        self.buttons = current_buttons();
         self.keys.begin(current_held_keys());
         self.caps_lock = current_caps_lock();
         self.caps_down = false;
+        self.shared.set_active(true);
         if !self.hidden {
             hide_cursor();
             unsafe {
@@ -839,26 +925,60 @@ impl CaptureState {
             }
             self.hidden = true;
         }
-        self.send_move();
+        self.send_warp();
         self.send_reconcile(true);
     }
 
-    fn deactivate(&mut self, warp_back: bool) {
-        if !self.active {
-            if self.hidden {
-                unsafe {
-                    CGAssociateMouseAndMouseCursorPosition(1);
-                }
-                show_cursor();
-                self.hidden = false;
-            }
+    fn switch_target(&mut self, device: DeviceId, world: WorldPoint) {
+        if self.target == Some(device) {
             return;
+        }
+        if let Some(old) = self.target {
+            let _ = self.tx.try_send(CaptureMsg::Event {
+                device: old,
+                event: InputEvent::ReleaseAll,
+            });
+            let _ = self.tx.try_send(CaptureMsg::Reconcile {
+                device: old,
+                state: ReconcileState {
+                    active: false,
+                    caps_lock: self.caps_lock,
+                    buttons: 0,
+                    keys: KeyState::EMPTY,
+                },
+            });
+        }
+        self.target = Some(device);
+        self.point = world;
+        self.buttons = current_buttons();
+        self.keys.deactivate();
+        self.keys.begin(current_held_keys());
+        self.caps_lock = current_caps_lock();
+        self.caps_down = false;
+        self.shared.set_active(true);
+        self.send_warp();
+        self.send_reconcile(true);
+    }
+
+    fn deactivate_to_host(&mut self, warp_back: bool, world: Option<WorldPoint>) {
+        let old = self.target.take();
+        if let Some(device) = old {
+            let _ = self.tx.try_send(CaptureMsg::Event {
+                device,
+                event: InputEvent::ReleaseAll,
+            });
+            let _ = self.tx.try_send(CaptureMsg::Reconcile {
+                device,
+                state: ReconcileState {
+                    active: false,
+                    caps_lock: self.caps_lock,
+                    buttons: 0,
+                    keys: KeyState::EMPTY,
+                },
+            });
         }
         self.active = false;
         self.buttons = 0;
-        self.point = self.point.clamped();
-        self.send_event(InputEvent::ReleaseAll);
-        self.send_reconcile(false);
         self.keys.deactivate();
         self.caps_down = false;
         self.shared.set_active(false);
@@ -869,16 +989,60 @@ impl CaptureState {
             }
             self.hidden = false;
         }
+        show_cursor();
 
         if warp_back {
-            let host = host_return_point(self.edge, self.point, self.offset);
-            warp_cursor(CGPoint {
-                x: self.bounds.min_x() + host.x as f64 * (self.bounds.size.width - 1.0).max(1.0),
-                y: self.bounds.min_y() + host.y as f64 * (self.bounds.size.height - 1.0).max(1.0),
+            let (origin_x, origin_y) = self.host_origin();
+            let host_world = world.unwrap_or_else(|| {
+                self.world_layout
+                    .local_to_world(crate::layout::ScreenId::Host, self.host_anchor)
+                    .unwrap_or(self.world_layout.host.center())
             });
+            let (x, y) = world_to_host_px(
+                host_world,
+                origin_x,
+                origin_y,
+                self.host_width(),
+                self.host_height(),
+            );
+            warp_cursor(CGPoint { x, y });
         }
-        show_cursor();
         self.cooldown_until = Instant::now() + Duration::from_millis(REENTRY_COOLDOWN_MS);
+    }
+
+    fn tick(&mut self) {
+        self.refresh_layout();
+        if self.active && !self.target_online() {
+            self.deactivate_to_host(true, None);
+        }
+    }
+}
+
+fn ctrl_alt_pressed() -> bool {
+    unsafe {
+        let ctrl = CGEventSourceKeyState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, 0x3B) != 0
+            || CGEventSourceKeyState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, 0x3E) != 0;
+        let alt = CGEventSourceKeyState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, 0x3A) != 0
+            || CGEventSourceKeyState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, 0x3D) != 0;
+        ctrl && alt
+    }
+}
+
+fn current_buttons() -> u8 {
+    unsafe {
+        let mut buttons = 0u8;
+        for (button, bit) in [
+            (CG_MOUSE_BUTTON_LEFT, BUTTON_LEFT),
+            (CG_MOUSE_BUTTON_RIGHT, BUTTON_RIGHT),
+            (CG_MOUSE_BUTTON_CENTER, BUTTON_MIDDLE),
+            (CG_MOUSE_BUTTON_X1, BUTTON_X1),
+            (CG_MOUSE_BUTTON_X2, BUTTON_X2),
+        ] {
+            if CGEventSourceButtonState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, button) != 0 {
+                buttons |= bit;
+            }
+        }
+        buttons
     }
 }
 
@@ -915,8 +1079,6 @@ unsafe extern "C" fn event_tap_callback(
 pub fn start_capture(
     shared: Arc<CaptureShared>,
     tx: Sender<CaptureMsg>,
-    edge: Edge,
-    offset: f32,
 ) -> Result<CaptureHandle, String> {
     unsafe {
         if AXIsProcessTrusted() == 0 || CGPreflightListenEventAccess() == 0 {
@@ -929,7 +1091,7 @@ pub fn start_capture(
     let thread_shared = Arc::clone(&shared);
     let join = thread::Builder::new()
         .name("glidelink-input-capture".into())
-        .spawn(move || run_capture_thread(thread_shared, tx, edge, offset, bounds, ready_tx))
+        .spawn(move || run_capture_thread(thread_shared, tx, bounds, ready_tx))
         .map_err(|e| error::detail("E_CAPTURE_THREAD", e))?;
 
     match ready_rx.recv_timeout(Duration::from_secs(3)) {
@@ -950,23 +1112,26 @@ pub fn start_capture(
 fn run_capture_thread(
     shared: Arc<CaptureShared>,
     tx: Sender<CaptureMsg>,
-    edge: Edge,
-    offset: f32,
     bounds: CGRect,
     ready_tx: mpsc::Sender<Result<(), String>>,
 ) {
     crate::sched::boost_current_thread();
+    let layout = shared.layout();
+    let (layout_generation, world_layout) = layout.snapshot();
     let mut state = Box::new(CaptureState {
         shared,
         tx,
-        edge,
-        offset,
         bounds,
         tap: null_mut(),
+        layout,
+        layout_generation,
+        world_layout,
         active: false,
+        target: None,
         hidden: false,
         buttons: 0,
-        point: NormPoint::default(),
+        point: WorldPoint::default(),
+        host_anchor: NormPoint::new(0.5, 0.5),
         cooldown_until: Instant::now(),
         keys: KeyOwnership::default(),
         caps_lock: false,
@@ -1017,14 +1182,12 @@ fn run_capture_thread(
         }
 
         let state = unsafe { &mut *state_ptr };
-        if state.active && !state.shared.is_connected() {
-            state.deactivate(true);
-        }
+        state.tick();
     }
 
     let state = unsafe { &mut *state_ptr };
     if state.active {
-        state.deactivate(true);
+        state.deactivate_to_host(true, None);
     }
     if state.hidden {
         unsafe {
@@ -1130,14 +1293,17 @@ fn injector_loop(
         plan_injection_batch(&batch, &mut cursor, &mut steps);
         for step in steps.iter().copied() {
             match step {
-                InjectStep::Move { x, y, buttons } => {
-                    if applied_position != Some((x, y)) {
-                        let point = point_from_normalized(x, y, bounds);
-                        let (event_type, button) = drag_event(buttons)
-                            .unwrap_or((CG_EVENT_MOUSE_MOVED, CG_MOUSE_BUTTON_LEFT));
-                        post_mouse_event(event_type, point, button);
-                        applied_position = Some((x, y));
+                InjectStep::Move { dx, dy, buttons } => {
+                    if let Some(point) = inject_relative_move(dx, dy, buttons, bounds) {
+                        applied_position = Some(normalized_from_point(point, bounds));
                     }
+                }
+                InjectStep::Warp { x, y, buttons } => {
+                    let point = point_from_normalized(x, y, bounds);
+                    let (event_type, button) =
+                        drag_event(buttons).unwrap_or((CG_EVENT_MOUSE_MOVED, CG_MOUSE_BUTTON_LEFT));
+                    post_mouse_event(event_type, point, button);
+                    applied_position = Some((x, y));
                 }
                 InjectStep::Buttons { from, to } => {
                     let point = applied_point_or_origin(applied_position, bounds);
@@ -1364,6 +1530,52 @@ fn release_keys(source: *mut c_void, keys: &mut KeyState, caps_lock: bool) {
         keys.remove(hid);
         post_modifier_event(source, hid, keys, caps_lock);
     }
+}
+
+fn current_cursor_point() -> Option<CGPoint> {
+    unsafe {
+        let event = CGEventCreate(null_mut());
+        if event.is_null() {
+            return None;
+        }
+        let point = CGEventGetLocation(event);
+        CFRelease(event as *const c_void);
+        Some(point)
+    }
+}
+
+fn inject_relative_move(dx: i32, dy: i32, buttons: u8, bounds: CGRect) -> Option<CGPoint> {
+    let mut point = current_cursor_point()?;
+    point.x = (point.x + dx as f64).clamp(
+        bounds.min_x(),
+        bounds.max_x().max(bounds.min_x() + 1.0) - 1.0,
+    );
+    point.y = (point.y + dy as f64).clamp(
+        bounds.min_y(),
+        bounds.max_y().max(bounds.min_y() + 1.0) - 1.0,
+    );
+    let (event_type, button) =
+        drag_event(buttons).unwrap_or((CG_EVENT_MOUSE_MOVED, CG_MOUSE_BUTTON_LEFT));
+    unsafe {
+        let event = CGEventCreateMouseEvent(null_mut(), event_type, point, button);
+        if event.is_null() {
+            return None;
+        }
+        CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_X, dx as i64);
+        CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_Y, dy as i64);
+        CGEventPost(CG_TAP_LOCATION_HID, event);
+        CFRelease(event as *const c_void);
+    }
+    Some(point)
+}
+
+fn normalized_from_point(point: CGPoint, bounds: CGRect) -> (u16, u16) {
+    let width = (bounds.size.width - 1.0).max(1.0);
+    let height = (bounds.size.height - 1.0).max(1.0);
+    (
+        (((point.x - bounds.min_x()) / width).clamp(0.0, 1.0) * u16::MAX as f64).round() as u16,
+        (((point.y - bounds.min_y()) / height).clamp(0.0, 1.0) * u16::MAX as f64).round() as u16,
+    )
 }
 
 fn point_from_normalized(x: u16, y: u16, bounds: CGRect) -> CGPoint {
@@ -1605,11 +1817,23 @@ pub fn self_test() -> bool {
 
 fn test_capture(bounds: CGRect) -> Result<(), String> {
     let status = Status::new(screen_info());
-    let shared = CaptureShared::new(status);
-    // Pretend a peer is connected so edge crossing activates immediately.
-    shared.set_peer(1920, 1080);
+    let host = ScreenInfo::new(
+        bounds.size.width.round() as i32,
+        bounds.size.height.round() as i32,
+    );
+    let device = [0x42; 16];
+    let world = WorldLayout::new(
+        host,
+        vec![crate::layout::ScreenSpec {
+            id: device,
+            label: "self-test".into(),
+            rect: crate::layout::screen_rect(host, 1.0, 0.0),
+            online: true,
+        }],
+    );
+    let shared = CaptureShared::new(status, LayoutStore::new(world));
     let (tx, rx) = crossbeam_channel::unbounded::<CaptureMsg>();
-    let handle = start_capture(Arc::clone(&shared), tx, Edge::Right, 0.0)?;
+    let handle = start_capture(Arc::clone(&shared), tx)?;
     let saved = cursor_location();
 
     let point = CGPoint {
@@ -1639,8 +1863,8 @@ fn test_capture(bounds: CGRect) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(CaptureMsg::Move(_)) => return Ok(()),
-                Ok(CaptureMsg::Event(_)) | Ok(CaptureMsg::Reconcile(_)) => continue,
+                Ok(CaptureMsg::Warp { device: target, .. }) if target == device => return Ok(()),
+                Ok(_) => continue,
                 Err(_) => {
                     return Err("no input was captured after a synthetic edge crossing".to_string())
                 }
@@ -1759,7 +1983,7 @@ fn test_injection(bounds: CGRect) -> Result<(), String> {
     };
     let norm_x = (target.x - bounds.min_x()) / (bounds.size.width - 1.0).max(1.0);
     let norm_y = (target.y - bounds.min_y()) / (bounds.size.height - 1.0).max(1.0);
-    tx.send(InjectMsg::Move(RemoteInput {
+    tx.send(InjectMsg::Warp(WarpInput {
         x: norm_x as f32,
         y: norm_y as f32,
     }))
@@ -1773,18 +1997,25 @@ fn test_injection(bounds: CGRect) -> Result<(), String> {
         thread::sleep(Duration::from_millis(25));
         actual = cursor_location();
     }
+    let warped = (actual.x - target.x).abs() < 8.0 && (actual.y - target.y).abs() < 8.0;
+
+    let _ = tx.send(InjectMsg::Move(RemoteInput { dx: 8, dy: 4 }));
+    thread::sleep(Duration::from_millis(100));
+    let relative = cursor_location();
+    let moved =
+        (relative.x - actual.x - 8.0).abs() < 8.0 && (relative.y - actual.y - 4.0).abs() < 8.0;
 
     let _ = tx.send(InjectMsg::Reset);
     stop.store(true, Ordering::Release);
     let _ = handle.join();
     warp_cursor(saved);
 
-    if (actual.x - target.x).abs() < 8.0 && (actual.y - target.y).abs() < 8.0 {
+    if warped && moved {
         Ok(())
     } else {
         Err(format!(
-            "cursor is at ({:.0}, {:.0}), expected ({:.0}, {:.0})",
-            actual.x, actual.y, target.x, target.y
+            "cursor warp/relative failed: actual=({:.0}, {:.0}) target=({:.0}, {:.0}) relative=({:.0}, {:.0})",
+            actual.x, actual.y, target.x, target.y, relative.x, relative.y
         ))
     }
 }

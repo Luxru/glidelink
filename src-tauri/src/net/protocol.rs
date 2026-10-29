@@ -1,5 +1,6 @@
 use crate::input::keymap::{KeyState, CAPS_LOCK};
-use crate::input::{InputEvent, ReconcileState, RemoteInput};
+use crate::input::{InputEvent, ReconcileState, RemoteInput, WarpInput};
+use crate::layout::DeviceId;
 use crate::status::ScreenInfo;
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, Tag};
@@ -22,14 +23,17 @@ pub const TYPE_CONFIRM: u8 = 7;
 pub const TYPE_CONFIRM_ACK: u8 = 8;
 pub const TYPE_EVENT: u8 = 9;
 pub const TYPE_RECONCILE: u8 = 10;
+pub const TYPE_WARP: u8 = 11;
 
 pub const SID_LEN: usize = 8;
 pub const TAG_LEN: usize = 16;
 pub const HEADER_LEN: usize = 4 + 1 + 1 + SID_LEN + 8;
 pub const PAKE_MSG_LEN: usize = 33;
-pub const HELLO_LEN: usize = HEADER_LEN + 4 + 4 + 8 + 1 + PAKE_MSG_LEN;
+pub const DEVICE_ID_LEN: usize = 16;
+pub const HELLO_LEN: usize = HEADER_LEN + 4 + 4 + 8 + 1 + DEVICE_ID_LEN + PAKE_MSG_LEN;
 pub const ACCEPT_LEN: usize = HELLO_LEN;
-pub const INPUT_LEN: usize = 4;
+pub const INPUT_LEN: usize = 8;
+pub const WARP_LEN: usize = 4;
 pub const EVENT_LEN: usize = 16;
 pub const RECONCILE_LEN: usize = 36;
 pub const PONG_STATS_LEN: usize = 24;
@@ -66,6 +70,7 @@ pub struct Handshake {
     pub screen: ScreenInfo,
     pub timestamp_ms: u64,
     pub platform: u8,
+    pub device_id: DeviceId,
 }
 
 #[derive(Debug, Error)]
@@ -165,6 +170,7 @@ fn build_pake_packet(kind: u8, handshake: &Handshake, pake_msg: &[u8]) -> Vec<u8
     out.extend_from_slice(&handshake.screen.height.to_le_bytes());
     out.extend_from_slice(&handshake.timestamp_ms.to_le_bytes());
     out.push(handshake.platform);
+    out.extend_from_slice(&handshake.device_id);
     out.extend_from_slice(pake_msg);
     debug_assert_eq!(out.len(), HELLO_LEN);
     out
@@ -180,14 +186,17 @@ fn parse_pake_packet(packet: &[u8], kind: u8) -> Result<(Handshake, Vec<u8>), Pr
     let timestamp_ms =
         u64::from_le_bytes(packet[HEADER_LEN + 8..HEADER_LEN + 16].try_into().unwrap());
     let platform = packet[HEADER_LEN + 16];
+    let mut device_id = [0u8; DEVICE_ID_LEN];
+    device_id.copy_from_slice(&packet[HEADER_LEN + 17..HEADER_LEN + 17 + DEVICE_ID_LEN]);
     Ok((
         Handshake {
             sid,
             screen: ScreenInfo { width, height },
             timestamp_ms,
             platform,
+            device_id,
         },
-        packet[HEADER_LEN + 17..].to_vec(),
+        packet[HEADER_LEN + 17 + DEVICE_ID_LEN..].to_vec(),
     ))
 }
 
@@ -202,6 +211,16 @@ pub fn build_pake_accept(accept: &Handshake, pake_msg: &[u8]) -> Vec<u8> {
 pub fn hello_sid(packet: &[u8]) -> Result<[u8; SID_LEN], ProtocolError> {
     let (kind, sid) = validate_prefix(packet, Some(HELLO_LEN))?;
     if kind != TYPE_HELLO {
+        return Err(ProtocolError::Malformed);
+    }
+    Ok(sid)
+}
+
+/// Extract the plaintext SID from any packet header so the hub can dispatch
+/// encrypted packets to the right session before decrypting.
+pub fn packet_sid(packet: &[u8]) -> Result<[u8; SID_LEN], ProtocolError> {
+    let (_, sid) = validate_prefix(packet, None)?;
+    if packet.len() < HEADER_LEN {
         return Err(ProtocolError::Malformed);
     }
     Ok(sid)
@@ -367,11 +386,9 @@ impl Session {
 }
 
 pub fn encode_input(input: &RemoteInput) -> [u8; INPUT_LEN] {
-    let x = (input.x.clamp(0.0, 1.0) * u16::MAX as f32).round() as u16;
-    let y = (input.y.clamp(0.0, 1.0) * u16::MAX as f32).round() as u16;
     let mut out = [0u8; INPUT_LEN];
-    out[0..2].copy_from_slice(&x.to_le_bytes());
-    out[2..4].copy_from_slice(&y.to_le_bytes());
+    out[0..4].copy_from_slice(&input.dx.to_le_bytes());
+    out[4..8].copy_from_slice(&input.dy.to_le_bytes());
     out
 }
 
@@ -379,9 +396,29 @@ pub fn decode_input(payload: &[u8]) -> Result<RemoteInput, ProtocolError> {
     if payload.len() != INPUT_LEN {
         return Err(ProtocolError::Malformed);
     }
-    let x = u16::from_le_bytes(payload[0..2].try_into().unwrap()) as f32 / u16::MAX as f32;
-    let y = u16::from_le_bytes(payload[2..4].try_into().unwrap()) as f32 / u16::MAX as f32;
-    Ok(RemoteInput { x, y })
+    Ok(RemoteInput {
+        dx: i32::from_le_bytes(payload[0..4].try_into().unwrap()),
+        dy: i32::from_le_bytes(payload[4..8].try_into().unwrap()),
+    })
+}
+
+pub fn encode_warp(input: &WarpInput) -> [u8; WARP_LEN] {
+    let x = (input.x.clamp(0.0, 1.0) * u16::MAX as f32).round() as u16;
+    let y = (input.y.clamp(0.0, 1.0) * u16::MAX as f32).round() as u16;
+    let mut out = [0u8; WARP_LEN];
+    out[0..2].copy_from_slice(&x.to_le_bytes());
+    out[2..4].copy_from_slice(&y.to_le_bytes());
+    out
+}
+
+pub fn decode_warp(payload: &[u8]) -> Result<WarpInput, ProtocolError> {
+    if payload.len() != WARP_LEN {
+        return Err(ProtocolError::Malformed);
+    }
+    Ok(WarpInput {
+        x: u16::from_le_bytes(payload[0..2].try_into().unwrap()) as f32 / u16::MAX as f32,
+        y: u16::from_le_bytes(payload[2..4].try_into().unwrap()) as f32 / u16::MAX as f32,
+    })
 }
 
 fn valid_button(button: u8) -> bool {
@@ -566,12 +603,14 @@ mod tests {
             screen: screen(2560, 1440),
             timestamp_ms: now_ms(),
             platform: PLATFORM_MACOS,
+            device_id: [0x11; 16],
         };
         let accept = Handshake {
             sid,
             screen: screen(1920, 1080),
             timestamp_ms: now_ms(),
             platform: PLATFORM_WINDOWS,
+            device_id: [0x22; 16],
         };
         let hello_packet = build_pake_hello(&hello, &[0x41; PAKE_MSG_LEN]);
         let accept_packet = build_pake_accept(&accept, &[0x42; PAKE_MSG_LEN]);
@@ -600,14 +639,15 @@ mod tests {
         let mut controller = Session::from_keys(&[7u8; 32], &[9u8; 32], sid, Side::Controller);
         let mut agent = Session::from_keys(&[7u8; 32], &[9u8; 32], sid, Side::Agent);
 
-        let input = RemoteInput { x: 0.123, y: 0.987 };
+        let input = RemoteInput {
+            dx: -1234,
+            dy: 5678,
+        };
         let packet = controller.encrypt_packet(TYPE_INPUT, &encode_input(&input));
         let (kind, payload, seq) = agent.decrypt_packet_with_seq(&packet).unwrap();
         assert_eq!(kind, TYPE_INPUT);
         assert_eq!(seq, 1);
-        let decoded = decode_input(&payload).unwrap();
-        assert!((decoded.x - input.x).abs() < 0.001);
-        assert!((decoded.y - input.y).abs() < 0.001);
+        assert_eq!(decode_input(&payload).unwrap(), input);
 
         assert!(matches!(
             agent.decrypt_packet(&packet),
@@ -620,6 +660,16 @@ mod tests {
             wrong.decrypt_packet(&second),
             Err(ProtocolError::Authentication)
         ));
+    }
+
+    #[test]
+    fn warp_round_trip() {
+        let input = WarpInput { x: 0.25, y: 0.75 };
+        let decoded = decode_warp(&encode_warp(&input)).unwrap();
+        assert!((decoded.x - input.x).abs() < 0.001);
+        assert!((decoded.y - input.y).abs() < 0.001);
+        assert!(decode_warp(&[0u8; WARP_LEN - 1]).is_err());
+        assert!(decode_warp(&[0u8; WARP_LEN + 1]).is_err());
     }
 
     #[test]

@@ -12,8 +12,10 @@ mod status;
 
 use config::{AppConfig, Role};
 use invite::Invite;
+use layout::DevicePlacement;
 use state::{AppState, StateView};
-use std::net::Ipv4Addr;
+use status::ScreenInfo;
+use std::collections::HashSet;
 use tauri::Manager;
 
 #[tauri::command]
@@ -28,11 +30,9 @@ fn start_session(
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let pairing_code = invite::normalize_code(&pairing_code);
-    let invite = Invite::decode(&pairing_code).map_err(|_| error::code("E_PAIRING_CODE"))?;
     config.local_ip = config.local_ip.trim().to_string();
-    config.validate()?;
-    if config.role == Role::Agent && config.local_ipv4()? != invite.ip {
-        return Err(error::code("E_LOCAL_IP"));
+    if config.role == Role::Agent {
+        Invite::decode(&pairing_code).map_err(|_| error::code("E_PAIRING_CODE"))?;
     }
 
     if state.engine.is_running() {
@@ -45,9 +45,10 @@ fn start_session(
         let previous = next.clone();
         *next = incoming.clone();
         next.inherit_persisted_settings(&previous);
-        match next.role {
-            Role::Agent => next.last_invite = saved_code.clone(),
-            Role::Controller => next.last_pairing_code = saved_code.clone(),
+        next.ensure_device_id();
+        next.validate()?;
+        if next.role == Role::Agent {
+            next.last_pairing_code = saved_code.clone();
         }
         Ok(())
     })?;
@@ -60,7 +61,49 @@ fn start_session(
             &config.local_ip
         }
     );
-    state.engine.start(&config, &pairing_code)
+    let config_handle = state.config.clone();
+    state.engine.start(&config, &pairing_code, config_handle)
+}
+
+#[tauri::command]
+fn save_layout(
+    devices: Vec<DevicePlacement>,
+    state: tauri::State<'_, AppState>,
+) -> Result<AppConfig, String> {
+    if state.status.snapshot().remote_active {
+        return Err(error::code("E_LAYOUT_ACTIVE"));
+    }
+    if devices.len() > layout::MAX_DEVICES {
+        return Err(error::code("E_LAYOUT_INVALID"));
+    }
+    let mut ids = HashSet::new();
+    for device in &devices {
+        let Some(id) = device.device_id() else {
+            return Err(error::code("E_LAYOUT_INVALID"));
+        };
+        if !ids.insert(id)
+            || !device.x.is_finite()
+            || !device.y.is_finite()
+            || device.x.abs() > 64.0
+            || device.y.abs() > 64.0
+        {
+            return Err(error::code("E_LAYOUT_INVALID"));
+        }
+    }
+    let host = input::screen_info().unwrap_or(ScreenInfo {
+        width: 0,
+        height: 0,
+    });
+    let world = layout::world_from_placements(host, &devices, &[]);
+    if world.has_overlaps() {
+        return Err(error::code("E_LAYOUT_OVERLAP"));
+    }
+    let config = state.update_config(|config| {
+        config.layout = devices.clone();
+        Ok(())
+    })?;
+    state.engine.update_layout(host, &devices);
+    Ok(config)
 }
 
 #[tauri::command]
@@ -69,40 +112,6 @@ fn save_settings(
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
     state.update_config(|config| config.apply_patch(&patch))
-}
-
-#[tauri::command]
-fn preview_invite(local_ip: String, state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let ip = local_ip
-        .trim()
-        .parse::<Ipv4Addr>()
-        .map_err(|_| error::code("E_LOCAL_IP"))?;
-    if ip.is_loopback() || ip.is_unspecified() {
-        return Err(error::code("E_LOCAL_IP"));
-    }
-
-    if let Some(code) = state.status.snapshot().pairing_code {
-        return Ok(code);
-    }
-
-    let existing = state
-        .config
-        .lock()
-        .map(|config| config.last_invite.clone())
-        .unwrap_or_default();
-    if let Ok(invite) = Invite::decode(&existing) {
-        let bind = std::net::SocketAddr::new(std::net::IpAddr::V4(ip), invite.port);
-        if invite.ip == ip && std::net::UdpSocket::bind(bind).is_ok() {
-            return Ok(existing);
-        }
-    }
-
-    let code = net::preview_invite(ip)?;
-    state.update_config(|next| {
-        next.last_invite = code.clone();
-        Ok(())
-    })?;
-    Ok(code)
 }
 
 #[tauri::command]
@@ -172,8 +181,8 @@ fn main() {
             start_session,
             stop_session,
             open_permissions,
-            preview_invite,
             save_settings,
+            save_layout,
             reopen_app
         ])
         .build(tauri::generate_context!())

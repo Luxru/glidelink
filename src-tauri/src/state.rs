@@ -1,8 +1,9 @@
-use crate::config::{self, AppConfig, Role};
+use crate::config::{AppConfig, ConfigHandle, Role};
 use crate::error;
 use crate::input::{self, CaptureHandle, CaptureMsg, CaptureShared, InjectMsg};
+use crate::layout::{DevicePlacement, LayoutStore};
 use crate::net;
-use crate::status::Status;
+use crate::status::{ScreenInfo, Status};
 use crossbeam_channel::unbounded;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -12,8 +13,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 pub struct AppState {
-    pub config: Mutex<AppConfig>,
-    pub settings_path: PathBuf,
+    pub config: ConfigHandle,
     pub engine: Engine,
     pub status: Status,
 }
@@ -21,26 +21,17 @@ pub struct AppState {
 impl AppState {
     pub fn new(settings_path: PathBuf, config: AppConfig, status: Status) -> Self {
         Self {
-            config: Mutex::new(config),
-            settings_path,
+            config: ConfigHandle::new(settings_path, config),
             engine: Engine::new(status.clone()),
             status,
         }
     }
 
-    /// Apply `mutate` to a copy of the persisted config, write it, and only
-    /// then publish it in memory. The lock is held across the write so a
-    /// concurrent `save_settings` or `start_session` cannot interleave.
     pub fn update_config<F>(&self, mutate: F) -> Result<AppConfig, String>
     where
         F: FnOnce(&mut AppConfig) -> Result<(), String>,
     {
-        let mut current = self.config.lock().map_err(|_| error::code("E_INTERNAL"))?;
-        let mut next = current.clone();
-        mutate(&mut next)?;
-        config::save(&self.settings_path, &next)?;
-        *current = next.clone();
-        Ok(next)
+        self.config.update(mutate)
     }
 }
 
@@ -53,6 +44,7 @@ struct Running {
     stop: Arc<AtomicBool>,
     capture: Option<CaptureHandle>,
     threads: Vec<JoinHandle<()>>,
+    layout: Option<LayoutStore>,
 }
 
 impl Engine {
@@ -70,7 +62,12 @@ impl Engine {
             .unwrap_or(false)
     }
 
-    pub fn start(&self, config: &AppConfig, pairing_code: &str) -> Result<(), String> {
+    pub fn start(
+        &self,
+        config: &AppConfig,
+        pairing_code: &str,
+        config_handle: ConfigHandle,
+    ) -> Result<(), String> {
         let mut slot = self.inner.lock().map_err(|_| error::code("E_INTERNAL"))?;
         if slot.is_some() {
             return Err(error::code("E_SESSION_RUNNING"));
@@ -82,13 +79,19 @@ impl Engine {
 
         match config.role {
             Role::Controller => {
-                let shared = CaptureShared::new(status.clone());
+                let local_screen = input::screen_info().unwrap_or(ScreenInfo {
+                    width: 0,
+                    height: 0,
+                });
+                let world = crate::layout::world_from_placements(local_screen, &config.layout, &[]);
+                let layout = LayoutStore::new(world);
+                let shared = CaptureShared::new(status.clone(), layout.clone());
                 let (tx, rx) = unbounded::<CaptureMsg>();
                 let net_handle = match net::start_controller(
                     config,
-                    pairing_code,
+                    config_handle,
+                    layout.clone(),
                     rx,
-                    Arc::clone(&shared),
                     Arc::clone(&stop),
                     status.clone(),
                 ) {
@@ -98,20 +101,20 @@ impl Engine {
                         return Err(e);
                     }
                 };
-                let capture =
-                    match input::start_capture(shared, tx, config.edge, config.peer_offset) {
-                        Ok(handle) => handle,
-                        Err(e) => {
-                            stop.store(true, Ordering::Release);
-                            let _ = net_handle.join();
-                            status.reset();
-                            return Err(e);
-                        }
-                    };
+                let capture = match input::start_capture(shared, tx) {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        stop.store(true, Ordering::Release);
+                        let _ = net_handle.join();
+                        status.reset();
+                        return Err(e);
+                    }
+                };
                 *slot = Some(Running {
                     stop,
                     capture: Some(capture),
                     threads: vec![net_handle],
+                    layout: Some(layout),
                 });
             }
             Role::Agent => {
@@ -143,11 +146,35 @@ impl Engine {
                     stop,
                     capture: None,
                     threads: vec![net_handle, injector],
+                    layout: None,
                 });
             }
         }
 
         Ok(())
+    }
+
+    /// Update the live controller world after the UI saved a new arrangement.
+    /// Online devices keep their connection state; geometry is rebuilt from
+    /// placements.
+    pub fn update_layout(&self, host: ScreenInfo, placements: &[DevicePlacement]) {
+        let layout = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().and_then(|running| running.layout.clone()));
+        let Some(layout) = layout else {
+            return;
+        };
+        let (_, current) = layout.snapshot();
+        let online: Vec<_> = current
+            .screens
+            .iter()
+            .filter(|screen| screen.online)
+            .map(|screen| screen.id)
+            .collect();
+        let world = crate::layout::world_from_placements(host, placements, &online);
+        layout.replace(world);
     }
 
     pub fn stop(&self) {
@@ -163,8 +190,6 @@ impl Engine {
         // while the network thread is still draining input.
         if let Some(capture) = running.capture.take() {
             capture.stop_and_join();
-            // Give the controller network loop one short tick to flush the
-            // final button-release packet before it sees the stop flag.
             std::thread::sleep(Duration::from_millis(3));
         }
         running.stop.store(true, Ordering::Release);
@@ -197,11 +222,7 @@ pub struct StateView {
 
 impl StateView {
     pub fn build(state: &AppState) -> Self {
-        let config = state
-            .config
-            .lock()
-            .map(|cfg| cfg.clone())
-            .unwrap_or_default();
+        let config = state.config.snapshot().unwrap_or_default();
         let mut status = state.status.snapshot();
         if status.local_screen.is_none() {
             status.local_screen = input::screen_info();

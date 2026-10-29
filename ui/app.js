@@ -9,7 +9,9 @@ const els = {
   navItems: [...document.querySelectorAll(".nav-item")],
   languageSelect: document.getElementById("languageSelect"),
   roleOptions: [...document.querySelectorAll(".role-option")],
-  agentFields: document.getElementById("agentFields"),
+  controllerFields: document.getElementById("controllerFields"),
+  keyboardGroup: document.getElementById("keyboardGroup"),
+  networkGroup: document.getElementById("networkGroup"),
   adaptModifiers: document.getElementById("adaptModifiers"),
   interfaceSelect: document.getElementById("interfaceSelect"),
   selectedIp: document.getElementById("selectedIp"),
@@ -23,26 +25,23 @@ const els = {
   errorBanner: document.getElementById("errorBanner"),
   errorText: document.getElementById("errorText"),
   layoutStage: document.getElementById("layoutStage"),
-  hostScreen: document.getElementById("hostScreen"),
-  hostScreenSize: document.getElementById("hostScreenSize"),
-  remoteScreenSize: document.getElementById("remoteScreenSize"),
-  hostScreenLabel: document.getElementById("hostScreenLabel"),
-  remoteScreenLabel: document.getElementById("remoteScreenLabel"),
-  remoteBadge: document.getElementById("remoteBadge"),
+  layoutWorld: document.getElementById("layoutWorld"),
+  layoutEmpty: document.getElementById("layoutEmpty"),
   latencyDot: document.getElementById("latencyDot"),
   latencyValue: document.getElementById("latencyValue"),
   localScreenText: document.getElementById("localScreenText"),
   peerText: document.getElementById("peerText"),
+  deviceCount: document.getElementById("deviceCount"),
   permissionCard: document.getElementById("permissionCard"),
   permissionBtn: document.getElementById("permissionBtn"),
   reopenBtn: document.getElementById("reopenBtn"),
   copyPasscode: document.getElementById("copyPasscode"),
   sessionState: document.getElementById("sessionState"),
-  remoteScreen: document.getElementById("remoteScreen"),
   aboutRole: document.getElementById("aboutRole"),
   aboutState: document.getElementById("aboutState"),
   aboutDuration: document.getElementById("aboutDuration"),
   aboutPeer: document.getElementById("aboutPeer"),
+  aboutDeviceCount: document.getElementById("aboutDeviceCount"),
   aboutPeerPlatform: document.getElementById("aboutPeerPlatform"),
   aboutLinkState: document.getElementById("aboutLinkState"),
   aboutRtt: document.getElementById("aboutRtt"),
@@ -62,8 +61,6 @@ const els = {
 const ui = {
   page: "session",
   role: "controller",
-  edge: "right",
-  offset: 0,
   running: false,
   loading: false,
   initialized: false,
@@ -74,9 +71,11 @@ const ui = {
   interfaceSignature: "",
   selectedIp: "",
   configLocalIp: "",
-  previewIp: "",
-  previewPromise: null,
   lastPairingCode: "",
+  lastListenCode: "",
+  devices: [],
+  peers: [],
+  targetDevice: null,
   language: i18n.getLocale(),
   adaptModifiers: false,
   savedConfig: null,
@@ -85,14 +84,11 @@ const ui = {
   settingsSavePromise: null,
 };
 
-const SCREEN_W = 250;
-const SCREEN_H = 150;
-const SCREEN_GAP = 12;
-const MAX_OFFSET = 0.65;
-const DRAG_EDGES = ["left", "right", "top", "bottom"];
+const WORLD_UNIT = 220;
+const LAYOUT_PADDING = 28;
+const LAYOUT_SNAP = 0.12;
 
 let dragState = null;
-let lastDrag = null;
 
 const PAGES = {
   session: "page.session.title",
@@ -165,6 +161,9 @@ function sessionStateLabel() {
   if (status.remoteActive) {
     return ui.role === "agent" ? t("status.controlled") : t("status.controlling");
   }
+  if (ui.role === "controller" && !status.connected) {
+    return t("status.listening");
+  }
   return status.connected ? t("status.connected") : t("status.waitingPeer");
 }
 
@@ -178,6 +177,7 @@ function updateAboutStats(status) {
     ? formatDuration(Date.now() - status.startedAtMs)
     : "—";
   els.aboutPeer.textContent = status?.peer || "—";
+  els.aboutDeviceCount.textContent = String(Array.isArray(status?.devices) ? status.devices.length : 0);
   const peerPlatform = { 1: "platform.macos", 2: "platform.windows" }[status?.peerPlatform];
   els.aboutPeerPlatform.textContent = peerPlatform ? t(peerPlatform) : "—";
   els.aboutLinkState.textContent = connected
@@ -278,192 +278,304 @@ function setPage(page) {
 function updateStartLabel() {
   if (ui.loading) {
     els.startLabel.textContent = ui.role === "controller"
-      ? t("button.connecting")
-      : t("button.listening");
+      ? t("button.starting")
+      : t("button.connecting");
   } else if (ui.running) {
     els.startLabel.textContent = t("button.running");
   } else {
     els.startLabel.textContent = ui.role === "controller"
-      ? t("button.startControl")
-      : t("button.startListening");
+      ? t("button.startListening")
+      : t("button.connect");
   }
 }
 
 function layoutDisabled() {
-  return ui.running || ui.loading || ui.role === "agent";
+  return ui.role === "agent" || ui.loading || Boolean(ui.lastStatus?.remoteActive);
 }
 
-function screenMetrics() {
-  const hostW = els.hostScreen.offsetWidth || SCREEN_W;
-  const hostH = els.hostScreen.offsetHeight || SCREEN_H;
-  const peerW = els.remoteScreen.offsetWidth || SCREEN_W;
-  const peerH = els.remoteScreen.offsetHeight || SCREEN_H;
-  return { hostW, hostH, peerW, peerH };
+function screenAspect(screen) {
+  const width = Number(screen?.width);
+  const height = Number(screen?.height);
+  if (!width || !height) return 9 / 16;
+  return Math.max(0.25, Math.min(4, height / width));
 }
 
-function maxOffsetFor(metrics) {
-  const stage = els.layoutStage.getBoundingClientRect();
-  if (stage.width <= 0 || stage.height <= 0) return MAX_OFFSET;
-  const horizontal = ui.edge === "left" || ui.edge === "right";
-  const max = horizontal
-    ? (stage.height / 2 - metrics.peerH / 2 - 8) / metrics.hostH
-    : (stage.width / 2 - metrics.peerW / 2 - 8) / metrics.hostW;
-  return Math.max(0, Math.min(MAX_OFFSET, max));
+function deviceScreenInfo(placement, peer) {
+  return placement?.screen || peer?.screen || null;
 }
 
-function clampedOffset(metrics = screenMetrics()) {
-  const max = maxOffsetFor(metrics);
-  return Math.max(-max, Math.min(max, ui.offset));
-}
-
-function peerPosition() {
-  const metrics = screenMetrics();
-  const edge = ui.role === "agent" ? "right" : ui.edge;
-  const offset = ui.role === "agent" ? 0 : clampedOffset(metrics);
-  let hostDx = 0;
-  let hostDy = 0;
-  let peerDx = 0;
-  let peerDy = 0;
-  if (edge === "left" || edge === "right") {
-    const hostHalf = (metrics.peerW + SCREEN_GAP) / 2;
-    const peerHalf = (metrics.hostW + SCREEN_GAP) / 2;
-    hostDx = edge === "right" ? -hostHalf : hostHalf;
-    peerDx = edge === "right" ? peerHalf : -peerHalf;
-    peerDy = offset * metrics.hostH;
-  } else {
-    const hostHalf = (metrics.peerH + SCREEN_GAP) / 2;
-    const peerHalf = (metrics.hostH + SCREEN_GAP) / 2;
-    hostDy = edge === "bottom" ? -hostHalf : hostHalf;
-    peerDy = edge === "bottom" ? peerHalf : -peerHalf;
-    peerDx = offset * metrics.hostW;
+function buildLayoutItems() {
+  const hostInfo = ui.lastStatus?.localScreen || null;
+  const host = { x: 0, y: 0, w: 1, h: screenAspect(hostInfo) };
+  if (ui.role === "agent") return { host, devices: [] };
+  const peerById = new Map((ui.peers || []).map((peer) => [peer.deviceId, peer]));
+  const devices = (ui.devices || []).map((placement, index) => {
+    const peer = peerById.get(placement.id);
+    const screen = deviceScreenInfo(placement, peer);
+    const x = Number.isFinite(Number(placement.x)) ? Number(placement.x) : 1 + index;
+    const y = Number.isFinite(Number(placement.y)) ? Number(placement.y) : 0;
+    return {
+      ...placement,
+      label: placement.label || peer?.label || t("common.peerControlled"),
+      screen,
+      online: Boolean(peer?.online),
+      active: Boolean(peer?.active) || ui.targetDevice === placement.id,
+      rect: { x, y, w: 1, h: screenAspect(screen) },
+    };
+  });
+  for (const peer of ui.peers || []) {
+    if (!devices.some((device) => device.id === peer.deviceId)) {
+      devices.push({
+        id: peer.deviceId,
+        label: peer.label || t("common.peerControlled"),
+        screen: peer.screen,
+        online: Boolean(peer.online),
+        active: Boolean(peer.active) || ui.targetDevice === peer.deviceId,
+        rect: { x: 1 + devices.length, y: 0, w: 1, h: screenAspect(peer.screen) },
+      });
+    }
   }
-  return { hostDx, hostDy, peerDx, peerDy };
+  devices.sort((a, b) => String(a.label).localeCompare(String(b.label)));
+  return { host, devices };
+}
+
+function createScreenCard({ label, screen, rect, minX, minY, online, active, deviceId, host }) {
+  const card = document.createElement("div");
+  card.className = `screen ${host ? "host-screen" : "device-screen"}`;
+  if (!host) card.classList.add(online ? "is-online" : "is-offline");
+  if (active) card.classList.add("is-active");
+  card.style.left = `${(rect.x - minX) * WORLD_UNIT}px`;
+  card.style.top = `${(rect.y - minY) * WORLD_UNIT}px`;
+  card.style.width = `${rect.w * WORLD_UNIT}px`;
+  card.style.height = `${Math.max(40, rect.h * WORLD_UNIT)}px`;
+  if (!host) {
+    card.dataset.deviceId = deviceId;
+    card.tabIndex = layoutDisabled() ? -1 : 0;
+    card.setAttribute("role", "button");
+    card.setAttribute("aria-label", `${label}. ${t("layout.dragHint")}`);
+  }
+  const content = document.createElement("div");
+  content.className = "screen-content";
+  const strong = document.createElement("strong");
+  strong.textContent = label;
+  const size = document.createElement("span");
+  size.className = "screen-size";
+  size.textContent = screen ? formatScreen(screen) : "—";
+  content.append(strong, size);
+  card.append(content);
+  if (!host) {
+    const badge = document.createElement("span");
+    badge.className = "device-badge";
+    badge.textContent = active
+      ? t("status.active")
+      : online
+        ? t("status.online")
+        : t("status.offline");
+    card.append(badge);
+  }
+  return card;
 }
 
 function renderLayout() {
-  const { hostDx, hostDy, peerDx, peerDy } = peerPosition();
-  els.hostScreen.style.transform =
-    `translate(calc(-50% + ${hostDx}px), calc(-50% + ${hostDy}px))`;
-  if (!dragState) {
-    els.remoteScreen.style.transform =
-      `translate(calc(-50% + ${peerDx}px), calc(-50% + ${peerDy}px))`;
+  if (!els.layoutWorld) return;
+  if (dragState) return;
+  const { host, devices } = buildLayoutItems();
+  const cards = [host, ...devices.map((device) => device.rect)];
+  let minX = Math.min(...cards.map((rect) => rect.x));
+  let minY = Math.min(...cards.map((rect) => rect.y));
+  let maxX = Math.max(...cards.map((rect) => rect.x + rect.w));
+  let maxY = Math.max(...cards.map((rect) => rect.y + rect.h));
+  minX -= 0.75;
+  minY -= 0.75;
+  maxX += 0.75;
+  maxY += 0.75;
+  const worldW = Math.max(0.5, maxX - minX);
+  const worldH = Math.max(0.5, maxY - minY);
+  const stageRect = els.layoutStage.getBoundingClientRect();
+  const stageW = stageRect.width || 640;
+  const stageH = stageRect.height || 320;
+  const usableW = Math.max(80, stageW - LAYOUT_PADDING * 2);
+  const usableH = Math.max(80, stageH - LAYOUT_PADDING * 2);
+  const scale = Math.min(
+    usableW / (worldW * WORLD_UNIT),
+    usableH / (worldH * WORLD_UNIT),
+    1.15,
+  );
+  const offsetX = (stageW - worldW * WORLD_UNIT * scale) / 2;
+  const offsetY = (stageH - worldH * WORLD_UNIT * scale) / 2;
+  els.layoutWorld.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
+  els.layoutWorld.style.width = `${worldW * WORLD_UNIT}px`;
+  els.layoutWorld.style.height = `${worldH * WORLD_UNIT}px`;
+  ui.layoutView = { minX, minY, scale };
+  els.layoutWorld.innerHTML = "";
+  els.layoutWorld.append(
+    createScreenCard({
+      label: t("common.thisDevice"),
+      screen: ui.lastStatus?.localScreen,
+      rect: host,
+      minX,
+      minY,
+      online: true,
+      active: false,
+      host: true,
+    }),
+  );
+  for (const device of devices) {
+    els.layoutWorld.append(
+      createScreenCard({
+        label: device.label,
+        screen: device.screen,
+        rect: device.rect,
+        minX,
+        minY,
+        online: device.online,
+        active: device.active,
+        deviceId: device.id,
+        host: false,
+      }),
+    );
   }
-  const disabled = layoutDisabled();
-  els.layoutStage.dataset.edge = ui.role === "agent" ? "right" : ui.edge;
-  els.layoutStage.classList.toggle("is-disabled", disabled);
-  els.remoteScreen.tabIndex = disabled ? -1 : 0;
-  els.remoteScreen.setAttribute("aria-disabled", String(disabled));
+  els.layoutEmpty.hidden = devices.length > 0;
+  els.layoutStage.classList.toggle("is-disabled", layoutDisabled());
 }
 
-function setEdge(edge) {
-  ui.edge = DRAG_EDGES.includes(edge) ? edge : "right";
-  renderLayout();
+function snapDevicePosition(device, allRects) {
+  const threshold = LAYOUT_SNAP;
+  const rect = { ...device.rect };
+  let x = Math.round(rect.x / 0.05) * 0.05;
+  let y = Math.round(rect.y / 0.05) * 0.05;
+  let bestX = threshold;
+  let bestY = threshold;
+  for (const other of allRects) {
+    for (const edge of [other.x, other.x + other.w, other.x - rect.w, other.x + other.w - rect.w]) {
+      const distance = Math.abs(x - edge);
+      if (distance < bestX) {
+        bestX = distance;
+        x = edge;
+      }
+    }
+    for (const edge of [other.y, other.y + other.h, other.y - rect.h, other.y + other.h - rect.h]) {
+      const distance = Math.abs(y - edge);
+      if (distance < bestY) {
+        bestY = distance;
+        y = edge;
+      }
+    }
+  }
+  return { ...rect, x, y };
 }
 
-function setOffset(offset) {
-  const value = Number(offset);
-  ui.offset = Number.isFinite(value)
-    ? Math.max(-MAX_OFFSET, Math.min(MAX_OFFSET, value))
-    : 0;
-  renderLayout();
+function rectsOverlap(a, b) {
+  const overlapX = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+  const overlapY = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+  return overlapX > 0.0005 && overlapY > 0.0005;
 }
 
-function dominantEdge(dx, dy) {
-  if (Math.abs(dx) >= Math.abs(dy)) return dx >= 0 ? "right" : "left";
-  return dy >= 0 ? "bottom" : "top";
-}
-
-function onPeerPointerDown(event) {
-  if (layoutDisabled() || event.button !== 0) return;
-  const { peerDx, peerDy } = peerPosition();
-  const metrics = screenMetrics();
+function onDevicePointerDown(event) {
+  if (layoutDisabled() || event.button !== 0 || !els.layoutWorld) return;
+  const card = event.target.closest(".device-screen");
+  if (!card) return;
+  const deviceId = card.dataset.deviceId;
+  const placement = (ui.devices || []).find((device) => device.id === deviceId);
+  if (!placement) return;
+  const view = ui.layoutView;
+  if (!view) return;
   dragState = {
     pointerId: event.pointerId,
+    deviceId,
+    card,
     startX: event.clientX,
     startY: event.clientY,
-    peerDx,
-    peerDy,
-    hostW: metrics.hostW,
-    hostH: metrics.hostH,
-    peerW: metrics.peerW,
-    peerH: metrics.peerH,
+    origX: Number(placement.x) || 0,
+    origY: Number(placement.y) || 0,
+    scale: view.scale || 1,
+    minX: view.minX || 0,
+    minY: view.minY || 0,
+    moved: false,
   };
-  lastDrag = null;
+  card.setPointerCapture?.(event.pointerId);
+  card.classList.add("is-dragging");
   els.layoutStage.classList.add("is-dragging");
-  els.remoteScreen.setPointerCapture?.(event.pointerId);
-  els.remoteScreen.focus({ preventScroll: true });
   event.preventDefault();
 }
 
-function onPeerPointerMove(event) {
+function onDevicePointerMove(event) {
   if (!dragState || event.pointerId !== dragState.pointerId) return;
-  const stageRect = els.layoutStage.getBoundingClientRect();
-  let dx = dragState.peerDx + (event.clientX - dragState.startX);
-  let dy = dragState.peerDy + (event.clientY - dragState.startY);
-  const limitX = Math.max(0, stageRect.width / 2 - dragState.peerW / 2 - 6);
-  const limitY = Math.max(0, stageRect.height / 2 - dragState.peerH / 2 - 6);
-  dx = Math.max(-limitX, Math.min(limitX, dx));
-  dy = Math.max(-limitY, Math.min(limitY, dy));
-  const pointerDx = event.clientX - (stageRect.left + stageRect.width / 2);
-  const pointerDy = event.clientY - (stageRect.top + stageRect.height / 2);
-  lastDrag = { dx, dy, pointerDx, pointerDy };
-  els.remoteScreen.style.transform =
-    `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
-  els.layoutStage.dataset.edge = dominantEdge(pointerDx, pointerDy);
+  const worldScale = WORLD_UNIT * (dragState.scale || 1);
+  const dx = (event.clientX - dragState.startX) / worldScale;
+  const dy = (event.clientY - dragState.startY) / worldScale;
+  if (Math.hypot(dx, dy) > 0.01) dragState.moved = true;
+  const x = dragState.origX + dx;
+  const y = dragState.origY + dy;
+  const placement = (ui.devices || []).find((device) => device.id === dragState.deviceId);
+  if (placement) {
+    placement.x = x;
+    placement.y = y;
+  }
+  dragState.card.style.left = `${(x - dragState.minX) * WORLD_UNIT}px`;
+  dragState.card.style.top = `${(y - dragState.minY) * WORLD_UNIT}px`;
+  event.preventDefault();
 }
 
-function onPeerPointerUp(event) {
+async function onDevicePointerUp(event) {
   if (!dragState || event.pointerId !== dragState.pointerId) return;
-  const moved = lastDrag
-    ? Math.hypot(lastDrag.dx - dragState.peerDx, lastDrag.dy - dragState.peerDy)
-    : 0;
-  if (moved >= 6 && lastDrag) {
-    const edge = dominantEdge(lastDrag.pointerDx, lastDrag.pointerDy);
-    const rawOffset = edge === "left" || edge === "right"
-      ? lastDrag.dy / dragState.hostH
-      : lastDrag.dx / dragState.hostW;
-    ui.edge = edge;
-    ui.offset = Math.max(-MAX_OFFSET, Math.min(MAX_OFFSET, rawOffset));
-  }
+  const state = dragState;
   dragState = null;
-  lastDrag = null;
+  state.card.classList.remove("is-dragging");
   els.layoutStage.classList.remove("is-dragging");
-  if (els.remoteScreen.hasPointerCapture?.(event.pointerId)) {
-    els.remoteScreen.releasePointerCapture(event.pointerId);
+  if (state.card.hasPointerCapture?.(event.pointerId)) {
+    state.card.releasePointerCapture(event.pointerId);
+  }
+  if (!state.moved) {
+    renderLayout();
+    return;
+  }
+
+  const { host, devices } = buildLayoutItems();
+  const current = devices.find((device) => device.id === state.deviceId);
+  if (!current) {
+    renderLayout();
+    return;
+  }
+  const others = [host, ...devices.filter((device) => device.id !== state.deviceId).map((device) => device.rect)];
+  const snapped = snapDevicePosition(current, others);
+  const overlap = others.some((rect) => rectsOverlap(snapped, rect));
+  if (overlap) {
+    const placement = (ui.devices || []).find((device) => device.id === state.deviceId);
+    if (placement) {
+      placement.x = state.origX;
+      placement.y = state.origY;
+    }
+    showToast(t("layout.overlap"));
+    renderLayout();
+    return;
+  }
+
+  const placement = (ui.devices || []).find((device) => device.id === state.deviceId);
+  if (placement) {
+    placement.x = snapped.x;
+    placement.y = snapped.y;
+  }
+  try {
+    const config = await withTimeout(invoke("save_layout", {
+      devices: (ui.devices || []).map(({ id, label, x, y, screen }) => ({
+        id,
+        label,
+        x,
+        y,
+        screen: screen || null,
+      })),
+    }));
+    ui.savedConfig = config;
+    if (ui.lastState) ui.lastState.config = config;
+  } catch (error) {
+    if (placement) {
+      placement.x = state.origX;
+      placement.y = state.origY;
+    }
+    setError(errorToRaw(error));
   }
   renderLayout();
-}
-
-function onPeerKeyDown(event) {
-  if (layoutDisabled()) return;
-  const step = 0.05;
-  if (event.key === "0") {
-    setOffset(0);
-    event.preventDefault();
-    return;
-  }
-  const shift = event.shiftKey;
-  const horizontal = ui.edge === "left" || ui.edge === "right";
-  if (shift && horizontal && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
-    setOffset(ui.offset + (event.key === "ArrowDown" ? step : -step));
-    event.preventDefault();
-    return;
-  }
-  if (shift && !horizontal && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
-    setOffset(ui.offset + (event.key === "ArrowRight" ? step : -step));
-    event.preventDefault();
-    return;
-  }
-  const edges = {
-    ArrowLeft: "left",
-    ArrowRight: "right",
-    ArrowUp: "top",
-    ArrowDown: "bottom",
-  };
-  if (edges[event.key]) {
-    setEdge(edges[event.key]);
-    event.preventDefault();
-  }
 }
 
 const INTERFACE_STORAGE_KEY = "glidelink.interface";
@@ -504,32 +616,6 @@ function updateInterfaces(interfaces, preferredIp) {
   updateSettingsControls();
 }
 
-async function refreshInvitePreview() {
-  if (!invoke || ui.role !== "agent" || ui.running) return;
-  if (ui.previewPromise) return ui.previewPromise;
-  const ip = ui.selectedIp;
-  if (!ip) {
-    if (ui.previewIp) setPairingCode("");
-    ui.previewIp = "";
-    return;
-  }
-  if (ui.previewIp === ip && getPairingCode().length === PAIRING_CODE_LENGTH) return;
-  ui.previewPromise = (async () => {
-    try {
-      const code = await withTimeout(invoke("preview_invite", { localIp: ip }));
-      if (ui.role === "agent" && !ui.running && ui.selectedIp === ip) {
-        setPairingCode(code);
-        ui.previewIp = ip;
-      }
-    } catch (error) {
-      setError(errorToRaw(error));
-    } finally {
-      ui.previewPromise = null;
-    }
-  })();
-  return ui.previewPromise;
-}
-
 function setLoading(loading) {
   ui.loading = loading;
   els.startBtn.classList.toggle("loading", loading);
@@ -547,18 +633,17 @@ function setRole(role, syncControls = true) {
     option.classList.toggle("active", active);
     option.setAttribute("aria-checked", String(active));
   }
-  els.agentFields.hidden = ui.role !== "agent";
-  els.hostScreenLabel.textContent = t("common.thisDevice");
-  els.remoteScreenLabel.textContent = ui.role === "controller"
-    ? t("common.peerControlled")
-    : t("common.peerController");
-  for (const cell of els.codeCells) cell.readOnly = ui.role === "agent";
+  els.controllerFields.hidden = ui.role !== "controller";
+  els.keyboardGroup.hidden = ui.role !== "controller";
+  els.networkGroup.hidden = ui.role !== "controller";
+  for (const cell of els.codeCells) cell.readOnly = ui.role === "controller";
   if (previousRole !== ui.role) {
-    setPairingCode(ui.role === "controller" ? ui.lastPairingCode || "" : "");
-    ui.previewIp = "";
+    const code = ui.role === "controller"
+      ? (ui.lastStatus?.pairingCode || ui.lastListenCode || "")
+      : (ui.lastPairingCode || "");
+    setPairingCode(code);
   }
   updateInterfaces(ui.interfaces, ui.configLocalIp);
-  if (ui.role === "agent" && !ui.running) refreshInvitePreview();
   renderLayout();
   updateStartLabel();
   updateSettingsControls();
@@ -662,8 +747,15 @@ function applyState(state) {
   ui.running = Boolean(incomingStatus?.running);
   ui.lastStatus = incomingStatus || null;
   if (config) {
+    ui.savedConfig = config;
     ui.lastPairingCode = config.lastPairingCode || ui.lastPairingCode || "";
+    ui.lastListenCode = config.lastInvite || ui.lastListenCode || "";
+    if (!dragState) {
+      ui.devices = Array.isArray(config.layout) ? config.layout : [];
+    }
   }
+  ui.peers = Array.isArray(incomingStatus?.devices) ? incomingStatus.devices : [];
+  ui.targetDevice = incomingStatus?.targetDevice || null;
 
   if (config && !ui.initialized) {
     ui.savedConfig = config;
@@ -672,26 +764,26 @@ function applyState(state) {
     ui.adaptModifiers = Boolean(config.adaptModifiers);
     els.adaptModifiers.checked = ui.adaptModifiers;
     setRole(config.role, false);
-    if (config.role === "controller" && ui.lastPairingCode) {
-      setPairingCode(ui.lastPairingCode);
-    }
-    setEdge(config.edge);
-    setOffset(config.peerOffset ?? 0);
+    setPairingCode(
+      config.role === "controller"
+        ? (incomingStatus?.pairingCode || config.lastInvite || "")
+        : (config.lastPairingCode || ""),
+    );
     updateInterfaces(ui.interfaces, ui.configLocalIp);
     setDisabledControls(ui.running);
     ui.initialized = true;
     syncLanguage(config.language);
     // Persist the interface the UI had to fall back to (fresh install, or a
     // saved interface that no longer exists).
-    if (!config.localIp && ui.selectedIp) saveSettings({ localIp: ui.selectedIp });
+    if (ui.role === "controller" && !config.localIp && ui.selectedIp) {
+      saveSettings({ localIp: ui.selectedIp });
+    }
   } else if (config && !ui.running && wasRunning) {
     setDisabledControls(false);
     if (ui.role === "controller") {
-      if (ui.lastPairingCode) setPairingCode(ui.lastPairingCode);
+      setPairingCode(ui.lastListenCode || "");
     } else {
-      setPairingCode("");
-      ui.previewIp = "";
-      refreshInvitePreview();
+      setPairingCode(ui.lastPairingCode || "");
     }
   }
 
@@ -700,15 +792,10 @@ function applyState(state) {
     updateInterfaces(ui.interfaces, ui.configLocalIp);
   }
 
-  if (ui.role === "agent") {
-    if (incomingStatus?.running && incomingStatus.pairingCode) {
-      setPairingCode(incomingStatus.pairingCode);
-      ui.previewIp = ui.selectedIp;
-    } else if (!incomingStatus?.running) {
-      refreshInvitePreview();
-    }
+  if (ui.role === "controller" && incomingStatus?.running && incomingStatus.pairingCode) {
+    ui.lastListenCode = incomingStatus.pairingCode;
+    setPairingCode(incomingStatus.pairingCode);
   }
-
 
   if (ui.running) setDisabledControls(true);
 
@@ -719,33 +806,25 @@ function applyState(state) {
   const connected = Boolean(status.connected);
   const active = Boolean(status.remoteActive);
   const localScreen = status.localScreen;
-  const remoteScreen = status.remoteScreen;
   const latency = status.latencyMs == null ? null : Number(status.latencyMs);
   const statusError = status.lastErrorCode
     ? `${status.lastErrorCode}${status.lastErrorDetail ? `|${status.lastErrorDetail}` : ""}`
     : null;
   const errorRaw = ui.startError || statusError || (permissionBlocked && ui.running ? "errors.PERMISSIONS_BLOCKED" : null);
 
-  els.hostScreenSize.textContent = formatScreen(localScreen);
-  els.remoteScreenSize.textContent = remoteScreen
-    ? formatScreen(remoteScreen)
-    : (ui.role === "controller" ? t("common.waitingConnection") : t("common.waitingController"));
   els.localScreenText.textContent = formatScreen(localScreen);
   els.latencyValue.textContent = latency == null ? "—" : `${latency.toFixed(1)} ms`;
   els.latencyDot.className = `latency-dot${connected && latency != null ? (latency < 10 ? " good" : " warn") : ""}`;
-  els.peerText.textContent = status.peer || t("common.notConnected");
-  els.remoteBadge.hidden = !active;
+  const peerCount = Array.isArray(status.devices) ? status.devices.length : 0;
+  els.deviceCount.textContent = peerCount === 0 ? "—" : String(peerCount);
+  els.peerText.textContent = status.peer
+    || (peerCount > 0 ? `${peerCount} ${t("status.devices")}` : t("common.notConnected"));
   els.layoutStage.classList.toggle("remote-active", active);
   els.layoutStage.classList.toggle("is-connected", connected);
 
   const activeLabel = ui.role === "agent" ? t("status.controlled") : t("status.controlling");
-  els.sessionState.textContent = !ui.running
-    ? t("status.notStarted")
-    : active
-      ? activeLabel
-      : connected
-        ? t("status.connected")
-        : t("status.waitingPeer");
+  els.sessionState.textContent = sessionStateLabel();
+  renderLayout();
 
   let pillClass = "status-idle";
   let text = t("status.notRunning");
@@ -761,7 +840,7 @@ function applyState(state) {
       text = t("status.connected");
     } else {
       pillClass = "status-waiting";
-      text = t("status.waiting");
+      text = ui.role === "controller" ? t("status.listening") : t("status.waiting");
     }
   } else if (errorRaw) {
     pillClass = "status-error";
@@ -803,15 +882,12 @@ async function startSession(event) {
   }
   if (ui.page !== "session") setPage("session");
 
-  if (ui.role === "agent" && !ui.selectedIp) {
+  if (ui.role === "controller" && !ui.selectedIp) {
     setError("validation.interface");
     return;
   }
-  if (ui.role === "agent" && getPairingCode().length !== PAIRING_CODE_LENGTH) {
-    await refreshInvitePreview();
-  }
-  const pairingCode = getPairingCode();
-  if (pairingCode.length !== PAIRING_CODE_LENGTH) {
+  const pairingCode = ui.role === "agent" ? getPairingCode() : "";
+  if (ui.role === "agent" && pairingCode.length !== PAIRING_CODE_LENGTH) {
     setError("validation.pairingCode");
     els.codeCells[0]?.focus();
     return;
@@ -824,9 +900,7 @@ async function startSession(event) {
     await withTimeout(invoke("start_session", {
       config: {
         role: ui.role,
-        localIp: ui.role === "agent" ? ui.selectedIp : "",
-        edge: ui.edge,
-        peerOffset: ui.role === "agent" ? 0 : clampedOffset(),
+        localIp: ui.role === "controller" ? ui.selectedIp : "",
         adaptModifiers: ui.role === "controller" && ui.adaptModifiers,
         language: ui.language || "",
       },
@@ -835,10 +909,6 @@ async function startSession(event) {
     showToast(ui.role === "controller" ? t("toast.startedController") : t("toast.startedAgent"));
     await refresh();
   } catch (error) {
-    if (ui.role === "agent") {
-      ui.previewIp = "";
-      await refreshInvitePreview();
-    }
     setError(errorToRaw(error));
   } finally {
     setLoading(false);
@@ -902,33 +972,30 @@ function initEvents() {
   }
 
   window.addEventListener("resize", () => renderLayout());
-  els.remoteScreen.addEventListener("pointerdown", onPeerPointerDown);
-  els.remoteScreen.addEventListener("pointermove", onPeerPointerMove);
-  els.remoteScreen.addEventListener("pointerup", onPeerPointerUp);
-  els.remoteScreen.addEventListener("pointercancel", onPeerPointerUp);
-  els.remoteScreen.addEventListener("lostpointercapture", () => {
+  els.layoutWorld.addEventListener("pointerdown", onDevicePointerDown);
+  els.layoutWorld.addEventListener("pointermove", onDevicePointerMove);
+  els.layoutWorld.addEventListener("pointerup", onDevicePointerUp);
+  els.layoutWorld.addEventListener("pointercancel", onDevicePointerUp);
+  els.layoutWorld.addEventListener("lostpointercapture", () => {
     if (!dragState) return;
     dragState = null;
-    lastDrag = null;
     els.layoutStage.classList.remove("is-dragging");
     renderLayout();
   });
-  els.remoteScreen.addEventListener("keydown", onPeerKeyDown);
 
   els.copyPasscode.addEventListener("click", copyPasscode);
 
   els.codeCells.forEach((cell, index) => {
     cell.addEventListener("input", () => {
-      if (ui.role === "agent") return;
+      if (ui.role === "controller") return;
       const normalized = normalizeCodePart(cell.value, 4);
       if (cell.value !== normalized) cell.value = normalized;
-      ui.previewIp = "";
       if (normalized.length === 4 && index < els.codeCells.length - 1) {
         els.codeCells[index + 1].focus();
       }
     });
     cell.addEventListener("keydown", (event) => {
-      if (ui.role === "agent") return;
+      if (ui.role === "controller") return;
       if (event.key === "Backspace" && !cell.value && index > 0) {
         els.codeCells[index - 1].focus();
         event.preventDefault();
@@ -945,12 +1012,11 @@ function initEvents() {
       }
     });
     cell.addEventListener("paste", (event) => {
-      if (ui.role === "agent") return;
+      if (ui.role === "controller") return;
       event.preventDefault();
       const text = normalizeCodePart(event.clipboardData?.getData("text") || "");
       if (!text) return;
       setPairingCode(text);
-      ui.previewIp = "";
       const filled = Math.min(Math.ceil(text.length / 4), els.codeCells.length);
       els.codeCells[Math.max(0, filled - 1)]?.focus();
     });
@@ -960,10 +1026,9 @@ function initEvents() {
     if (ui.running) return;
     ui.selectedIp = els.interfaceSelect.value;
     els.selectedIp.textContent = ui.selectedIp || "—";
+    ui.lastListenCode = "";
     setPairingCode("");
-    ui.previewIp = "";
     saveSettings({ localIp: ui.selectedIp });
-    refreshInvitePreview();
   });
 
   els.adaptModifiers.addEventListener("change", () => {
@@ -1003,7 +1068,6 @@ function initEvents() {
     updatePageChrome();
     updateStartLabel();
     renderLayout();
-    setEdge(ui.edge);
     setRole(ui.role, false);
     if (ui.lastState) applyState(ui.lastState);
   });
@@ -1021,7 +1085,6 @@ async function boot() {
   initEvents();
   els.languageSelect.value = i18n.getLocale();
   setRole("controller", false);
-  setEdge("right");
   setPage("session");
   if (!invoke) {
     setError("errors.UNKNOWN");

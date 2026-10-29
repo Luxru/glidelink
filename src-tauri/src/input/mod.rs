@@ -1,12 +1,11 @@
-#[cfg(not(any(windows, target_os = "macos")))]
-use crate::layout::Edge;
+use crate::layout::{DeviceId, LayoutStore};
 #[cfg(not(any(windows, target_os = "macos")))]
 use crate::status::ScreenInfo;
 use crate::status::Status;
 #[cfg(not(any(windows, target_os = "macos")))]
 use crossbeam_channel::{Receiver, Sender};
 use keymap::{adapt_modifier_hid, is_caps, is_modifier, KeyState};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -23,11 +22,17 @@ pub const BUTTON_MIDDLE: u8 = 1 << 2;
 pub const BUTTON_X1: u8 = 1 << 3;
 pub const BUTTON_X2: u8 = 1 << 4;
 
-/// Latest absolute pointer position in the peer screen. Buttons and wheel
-/// travel as discrete events so clicks and scroll ticks cannot be coalesced
-/// away with a move.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// Relative pointer movement in peer screen pixels. Multiple moves may be
+/// accumulated before injection; buttons and wheel remain discrete events.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RemoteInput {
+    pub dx: i32,
+    pub dy: i32,
+}
+
+/// One absolute pointer position used to enter or re-synchronize a peer screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WarpInput {
     pub x: f32,
     pub y: f32,
 }
@@ -64,14 +69,28 @@ impl ReconcileState {
 
 #[derive(Clone, Copy, Debug)]
 pub enum CaptureMsg {
-    Move(RemoteInput),
-    Event(InputEvent),
-    Reconcile(ReconcileState),
+    Move {
+        device: DeviceId,
+        input: RemoteInput,
+    },
+    Warp {
+        device: DeviceId,
+        input: WarpInput,
+    },
+    Event {
+        device: DeviceId,
+        event: InputEvent,
+    },
+    Reconcile {
+        device: DeviceId,
+        state: ReconcileState,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum InjectMsg {
     Move(RemoteInput),
+    Warp(WarpInput),
     Event(InputEvent),
     Reconcile(ReconcileState),
     Reset,
@@ -160,8 +179,14 @@ pub fn adapt_reconcile(state: &mut ReconcileState) {
 /// A reduced, ordered sequence of platform injection actions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InjectStep {
-    /// Buttons in effect for this move (used to pick a drag event).
+    /// Relative movement; buttons select the platform drag event.
     Move {
+        dx: i32,
+        dy: i32,
+        buttons: u8,
+    },
+    /// Absolute entry/re-synchronization position.
+    Warp {
         x: u16,
         y: u16,
         buttons: u8,
@@ -180,7 +205,6 @@ pub(crate) enum InjectStep {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct InjectCursor {
     pub buttons: u8,
-    pub position: Option<(u16, u16)>,
     pub keys: KeyState,
     pub caps_lock: bool,
 }
@@ -191,17 +215,16 @@ fn quantize(value: f32) -> u16 {
 
 fn flush_pending_move(
     cursor: &mut InjectCursor,
-    pending_move: &mut Option<(u16, u16)>,
+    pending_move: &mut Option<RemoteInput>,
     out: &mut Vec<InjectStep>,
 ) {
-    if let Some(position) = pending_move.take() {
-        if cursor.position != Some(position) {
+    if let Some(input) = pending_move.take() {
+        if input.dx != 0 || input.dy != 0 {
             out.push(InjectStep::Move {
-                x: position.0,
-                y: position.1,
+                dx: input.dx,
+                dy: input.dy,
                 buttons: cursor.buttons,
             });
-            cursor.position = Some(position);
         }
     }
 }
@@ -334,9 +357,9 @@ fn apply_reconcile(cursor: &mut InjectCursor, state: ReconcileState, out: &mut V
     }
 }
 
-/// Collapse runs of pure pointer moves to the latest position while keeping
-/// every button transition, wheel delta, key edge, reconciliation, and Reset in
-/// order. A discrete event is applied at its own packet position.
+/// Accumulate relative pointer movement while keeping every button transition,
+/// wheel delta, key edge, warp, reconciliation, and Reset in order. A discrete
+/// event is applied at its own packet position.
 pub(crate) fn plan_injection_batch(
     msgs: &[InjectMsg],
     cursor: &mut InjectCursor,
@@ -347,7 +370,17 @@ pub(crate) fn plan_injection_batch(
     for msg in msgs {
         match *msg {
             InjectMsg::Move(input) => {
-                pending_move = Some((quantize(input.x), quantize(input.y)));
+                let pending = pending_move.get_or_insert_with(RemoteInput::default);
+                pending.dx = pending.dx.saturating_add(input.dx);
+                pending.dy = pending.dy.saturating_add(input.dy);
+            }
+            InjectMsg::Warp(input) => {
+                flush_pending_move(cursor, &mut pending_move, out);
+                out.push(InjectStep::Warp {
+                    x: quantize(input.x),
+                    y: quantize(input.y),
+                    buttons: cursor.buttons,
+                });
             }
             InjectMsg::Event(event) => {
                 flush_pending_move(cursor, &mut pending_move, out);
@@ -362,7 +395,6 @@ pub(crate) fn plan_injection_batch(
                 release_all_keys(cursor, out);
                 release_all_buttons(cursor, out);
                 out.push(InjectStep::Reset);
-                cursor.position = None;
                 cursor.caps_lock = false;
             }
         }
@@ -426,37 +458,23 @@ impl KeyRepeater {
 /// Cross-thread state shared by the capture thread and networking.
 pub struct CaptureShared {
     pub stop: AtomicBool,
-    pub connected: AtomicBool,
-    pub remote_width: AtomicU32,
-    pub remote_height: AtomicU32,
     pub active: AtomicBool,
+    pub layout: LayoutStore,
     pub status: Status,
 }
 
 impl CaptureShared {
-    pub fn new(status: Status) -> Arc<Self> {
+    pub fn new(status: Status, layout: LayoutStore) -> Arc<Self> {
         Arc::new(Self {
             stop: AtomicBool::new(false),
-            connected: AtomicBool::new(false),
-            remote_width: AtomicU32::new(0),
-            remote_height: AtomicU32::new(0),
             active: AtomicBool::new(false),
+            layout,
             status,
         })
     }
 
-    pub fn set_peer(&self, width: u32, height: u32) {
-        self.remote_width.store(width, Ordering::Release);
-        self.remote_height.store(height, Ordering::Release);
-        self.connected.store(true, Ordering::Release);
-    }
-
-    pub fn clear_peer(&self) {
-        self.connected.store(false, Ordering::Release);
-    }
-
-    pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Acquire)
+    pub fn layout(&self) -> LayoutStore {
+        self.layout.clone()
     }
 
     pub fn set_active(&self, active: bool) {
@@ -510,8 +528,6 @@ mod unsupported {
     pub fn start_capture(
         _shared: Arc<CaptureShared>,
         _tx: Sender<CaptureMsg>,
-        _edge: Edge,
-        _offset: f32,
     ) -> Result<CaptureHandle, String> {
         Err(crate::error::code("E_UNSUPPORTED"))
     }
@@ -555,8 +571,8 @@ pub fn platform_id() -> u8 {
 mod tests {
     use super::*;
 
-    fn mv(x: f32, y: f32) -> InjectMsg {
-        InjectMsg::Move(RemoteInput { x, y })
+    fn mv(dx: i32, dy: i32) -> InjectMsg {
+        InjectMsg::Move(RemoteInput { dx, dy })
     }
 
     fn px(value: f32) -> u16 {
@@ -577,42 +593,43 @@ mod tests {
         keys
     }
 
+    fn down(button: u8) -> InjectMsg {
+        InjectMsg::Event(InputEvent::Button { button, down: true })
+    }
+
+    fn up(button: u8) -> InjectMsg {
+        InjectMsg::Event(InputEvent::Button {
+            button,
+            down: false,
+        })
+    }
+
     #[test]
-    fn pure_moves_collapse_to_the_latest_position() {
-        let msgs: Vec<_> = (0..100).map(|i| mv(i as f32 / 100.0, 0.5)).collect();
+    fn relative_moves_accumulate() {
+        let msgs = [mv(1, 2), mv(3, -4), mv(-1, 0)];
         let mut cursor = InjectCursor::default();
         let steps = plan(&msgs, &mut cursor);
         assert_eq!(
             steps,
             vec![InjectStep::Move {
-                x: px(0.99),
-                y: px(0.5),
+                dx: 3,
+                dy: -2,
                 buttons: 0,
             }]
         );
     }
 
     #[test]
-    fn button_event_is_applied_at_its_own_position() {
-        let msgs = [
-            mv(0.25, 0.25),
-            InjectMsg::Event(InputEvent::Button {
-                button: BUTTON_LEFT,
-                down: true,
-            }),
-            InjectMsg::Event(InputEvent::Button {
-                button: BUTTON_LEFT,
-                down: false,
-            }),
-        ];
+    fn button_event_flushes_accumulated_motion() {
+        let msgs = [mv(10, 5), down(BUTTON_LEFT), up(BUTTON_LEFT)];
         let mut cursor = InjectCursor::default();
         let steps = plan(&msgs, &mut cursor);
         assert_eq!(
             steps,
             vec![
                 InjectStep::Move {
-                    x: px(0.25),
-                    y: px(0.25),
+                    dx: 10,
+                    dy: 5,
                     buttons: 0,
                 },
                 InjectStep::Buttons {
@@ -630,23 +647,11 @@ mod tests {
     #[test]
     fn double_click_preserves_four_button_steps() {
         let msgs = [
-            mv(0.5, 0.5),
-            InjectMsg::Event(InputEvent::Button {
-                button: BUTTON_LEFT,
-                down: true,
-            }),
-            InjectMsg::Event(InputEvent::Button {
-                button: BUTTON_LEFT,
-                down: false,
-            }),
-            InjectMsg::Event(InputEvent::Button {
-                button: BUTTON_LEFT,
-                down: true,
-            }),
-            InjectMsg::Event(InputEvent::Button {
-                button: BUTTON_LEFT,
-                down: false,
-            }),
+            mv(5, 5),
+            down(BUTTON_LEFT),
+            up(BUTTON_LEFT),
+            down(BUTTON_LEFT),
+            up(BUTTON_LEFT),
         ];
         let mut cursor = InjectCursor::default();
         let steps = plan(&msgs, &mut cursor);
@@ -660,11 +665,8 @@ mod tests {
     #[test]
     fn wheel_follows_move_and_button_transition() {
         let msgs = [
-            mv(0.3, 0.3),
-            InjectMsg::Event(InputEvent::Button {
-                button: BUTTON_LEFT,
-                down: true,
-            }),
+            mv(3, 4),
+            down(BUTTON_LEFT),
             InjectMsg::Event(InputEvent::Wheel { delta: 1 }),
         ];
         let mut cursor = InjectCursor::default();
@@ -673,8 +675,8 @@ mod tests {
             steps,
             vec![
                 InjectStep::Move {
-                    x: px(0.3),
-                    y: px(0.3),
+                    dx: 3,
+                    dy: 4,
                     buttons: 0,
                 },
                 InjectStep::Buttons {
@@ -688,23 +690,15 @@ mod tests {
 
     #[test]
     fn held_drag_moves_carry_the_button_state() {
-        let msgs = [
-            mv(0.1, 0.1),
-            InjectMsg::Event(InputEvent::Button {
-                button: BUTTON_LEFT,
-                down: true,
-            }),
-            mv(0.2, 0.2),
-            mv(0.3, 0.3),
-        ];
+        let msgs = [mv(1, 1), down(BUTTON_LEFT), mv(2, 2), mv(3, 3)];
         let mut cursor = InjectCursor::default();
         let steps = plan(&msgs, &mut cursor);
         assert_eq!(
             steps,
             vec![
                 InjectStep::Move {
-                    x: px(0.1),
-                    y: px(0.1),
+                    dx: 1,
+                    dy: 1,
                     buttons: 0,
                 },
                 InjectStep::Buttons {
@@ -712,8 +706,8 @@ mod tests {
                     to: BUTTON_LEFT,
                 },
                 InjectStep::Move {
-                    x: px(0.3),
-                    y: px(0.3),
+                    dx: 5,
+                    dy: 5,
                     buttons: BUTTON_LEFT,
                 },
             ]
@@ -721,23 +715,44 @@ mod tests {
     }
 
     #[test]
-    fn reset_flushes_the_latest_move_and_clears_state() {
-        let msgs = [mv(0.2, 0.2), mv(0.8, 0.8), InjectMsg::Reset];
+    fn warp_flushes_motion_and_emits_absolute_position() {
+        let msgs = [mv(10, 10), InjectMsg::Warp(WarpInput { x: 0.25, y: 0.75 })];
         let mut cursor = InjectCursor::default();
         let steps = plan(&msgs, &mut cursor);
         assert_eq!(
             steps,
             vec![
                 InjectStep::Move {
-                    x: px(0.8),
-                    y: px(0.8),
+                    dx: 10,
+                    dy: 10,
+                    buttons: 0,
+                },
+                InjectStep::Warp {
+                    x: px(0.25),
+                    y: px(0.75),
+                    buttons: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reset_flushes_motion_and_clears_state() {
+        let msgs = [mv(2, 3), InjectMsg::Reset];
+        let mut cursor = InjectCursor::default();
+        let steps = plan(&msgs, &mut cursor);
+        assert_eq!(
+            steps,
+            vec![
+                InjectStep::Move {
+                    dx: 2,
+                    dy: 3,
                     buttons: 0,
                 },
                 InjectStep::Reset,
             ]
         );
         assert_eq!(cursor.buttons, 0);
-        assert_eq!(cursor.position, None);
     }
 
     #[test]
@@ -777,12 +792,12 @@ mod tests {
     #[test]
     fn key_edges_flush_pending_mouse_move() {
         let msgs = [
-            mv(0.2, 0.2),
+            mv(2, 3),
             InjectMsg::Event(InputEvent::Key {
                 hid: 0x04,
                 down: true,
             }),
-            mv(0.6, 0.6),
+            mv(4, 5),
         ];
         let mut cursor = InjectCursor::default();
         let steps = plan(&msgs, &mut cursor);
@@ -790,14 +805,14 @@ mod tests {
             steps,
             vec![
                 InjectStep::Move {
-                    x: px(0.2),
-                    y: px(0.2),
+                    dx: 2,
+                    dy: 3,
                     buttons: 0,
                 },
                 InjectStep::KeyPress(0x04),
                 InjectStep::Move {
-                    x: px(0.6),
-                    y: px(0.6),
+                    dx: 4,
+                    dy: 5,
                     buttons: 0,
                 },
             ]
@@ -840,10 +855,7 @@ mod tests {
                 hid: 0x04,
                 down: true,
             }),
-            InjectMsg::Event(InputEvent::Button {
-                button: BUTTON_LEFT,
-                down: true,
-            }),
+            down(BUTTON_LEFT),
             InjectMsg::Event(InputEvent::ReleaseAll),
         ];
         let mut cursor = InjectCursor::default();
@@ -877,12 +889,17 @@ mod tests {
             buttons: 0,
             keys: key_state(&[0x04, 0xE0, 0xE1]),
         };
-        let msgs = [InjectMsg::Reconcile(state)];
+        let msgs = [mv(1, 1), InjectMsg::Reconcile(state)];
         let mut cursor = InjectCursor::default();
         let steps = plan(&msgs, &mut cursor);
         assert_eq!(
             steps,
             vec![
+                InjectStep::Move {
+                    dx: 1,
+                    dy: 1,
+                    buttons: 0,
+                },
                 InjectStep::KeyPress(0xE0),
                 InjectStep::KeyPress(0xE1),
                 InjectStep::KeyPress(0x04),

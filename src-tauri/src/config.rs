@@ -1,9 +1,10 @@
 use crate::error;
-use crate::layout::Edge;
+use crate::layout::{self, DeviceId, DevicePlacement};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -25,29 +26,30 @@ impl Role {
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     pub role: Role,
-    /// Agent-only: IPv4 address of the selected network interface. The
-    /// controller's target is carried inside the invite code.
+    /// Controller-only: IPv4 address of the listening interface. Agent
+    /// connects to the address encoded in the pairing code.
     #[serde(default)]
     pub local_ip: String,
-    pub edge: Edge,
-    /// Offset of the peer screen along the shared edge, normalized to the
-    /// host edge. Controller-only; defaults to zero for older configs.
-    #[serde(default)]
-    pub peer_offset: f32,
-    /// Controller-only: map Command <-> Control when the peer runs a
-    /// different operating system. Off by default (strict physical keys).
+    /// Controller-only: map Command <-> Control when a peer runs a different
+    /// operating system. Off by default (strict physical keys).
     #[serde(default)]
     pub adapt_modifiers: bool,
     /// UI language chosen in Settings. Empty means no explicit choice, so the
     /// UI follows the system locale on the next launch.
     #[serde(default)]
     pub language: String,
-    /// Agent-only: last generated invite code. Reused after a disconnect and
-    /// across app restarts as long as the selected interface and port remain
-    /// usable.
+    /// Stable per-installation identity used by the Controller to remember
+    /// devices across reconnects and app restarts.
+    #[serde(default)]
+    pub device_id: String,
+    /// Controller-only: persisted 2D screen arrangement.
+    #[serde(default)]
+    pub layout: Vec<DevicePlacement>,
+    /// Controller-only: last generated listening code. Reused when the
+    /// selected interface and port are still usable.
     #[serde(default)]
     pub last_invite: String,
-    /// Controller-only: last pairing code entered, restored in the UI after a
+    /// Agent-only: last pairing code entered, restored in the UI after a
     /// disconnect or restart.
     #[serde(default)]
     pub last_pairing_code: String,
@@ -67,10 +69,10 @@ impl Default for AppConfig {
         Self {
             role: Role::Controller,
             local_ip: String::new(),
-            edge: Edge::Right,
-            peer_offset: 0.0,
             adapt_modifiers: false,
             language: String::new(),
+            device_id: String::new(),
+            layout: Vec::new(),
             last_invite: String::new(),
             last_pairing_code: String::new(),
         }
@@ -85,8 +87,22 @@ impl AppConfig {
             .map_err(|_| error::code("E_LOCAL_IP"))
     }
 
+    pub fn device_id_bytes(&self) -> Result<DeviceId, String> {
+        layout::device_id_from_hex(&self.device_id).ok_or_else(|| error::code("E_DEVICE_ID"))
+    }
+
+    /// Ensure a stable id exists. Used at startup before any handshake.
+    pub fn ensure_device_id(&mut self) -> bool {
+        if layout::device_id_from_hex(&self.device_id).is_some() {
+            return false;
+        }
+        self.device_id = layout::device_id_to_hex(&layout::new_device_id());
+        true
+    }
+
     pub fn validate(&self) -> Result<(), String> {
-        if self.role == Role::Agent {
+        let _ = self.device_id_bytes()?;
+        if self.role == Role::Controller {
             let ip = self.local_ipv4()?;
             if ip.is_loopback() || ip.is_unspecified() {
                 return Err(error::code("E_LOCAL_IP"));
@@ -131,8 +147,14 @@ impl AppConfig {
         if self.language.trim().is_empty() {
             self.language = previous.language.clone();
         }
-        if self.role == Role::Controller && self.local_ip.trim().is_empty() {
+        if self.local_ip.trim().is_empty() {
             self.local_ip = previous.local_ip.clone();
+        }
+        if self.device_id.trim().is_empty() {
+            self.device_id = previous.device_id.clone();
+        }
+        if self.layout.is_empty() {
+            self.layout = previous.layout.clone();
         }
         if self.last_invite.is_empty() {
             self.last_invite = previous.last_invite.clone();
@@ -141,6 +163,42 @@ impl AppConfig {
             self.last_pairing_code = previous.last_pairing_code.clone();
         }
         self.normalize();
+    }
+}
+
+/// Shared, persist-on-write settings handle. The network thread also updates
+/// device placements, so a single lock protects both UI and hub writes.
+#[derive(Clone)]
+pub struct ConfigHandle {
+    path: Arc<PathBuf>,
+    config: Arc<Mutex<AppConfig>>,
+}
+
+impl ConfigHandle {
+    pub fn new(path: PathBuf, config: AppConfig) -> Self {
+        Self {
+            path: Arc::new(path),
+            config: Arc::new(Mutex::new(config)),
+        }
+    }
+
+    pub fn snapshot(&self) -> Result<AppConfig, String> {
+        self.config
+            .lock()
+            .map(|config| config.clone())
+            .map_err(|_| error::code("E_INTERNAL"))
+    }
+
+    pub fn update<F>(&self, mutate: F) -> Result<AppConfig, String>
+    where
+        F: FnOnce(&mut AppConfig) -> Result<(), String>,
+    {
+        let mut current = self.config.lock().map_err(|_| error::code("E_INTERNAL"))?;
+        let mut next = current.clone();
+        mutate(&mut next)?;
+        save(&self.path, &next)?;
+        *current = next.clone();
+        Ok(next)
     }
 }
 
@@ -163,12 +221,16 @@ pub fn load_or_create(settings_path: &Path) -> Result<AppConfig, String> {
             }
         };
         config.normalize();
+        if config.ensure_device_id() {
+            let _ = save(settings_path, &config);
+        }
         // Drop unknown fields from older formats.
         let _ = save(settings_path, &config);
         return Ok(config);
     }
 
-    let config = AppConfig::default();
+    let mut config = AppConfig::default();
+    config.ensure_device_id();
     save(settings_path, &config)?;
     Ok(config)
 }
@@ -219,7 +281,8 @@ mod tests {
         }"#;
         let cfg: AppConfig = serde_json::from_str(old).expect("old config parses");
         assert!(cfg.local_ip.is_empty());
-        assert_eq!(cfg.peer_offset, 0.0);
+        assert!(cfg.layout.is_empty());
+        assert!(cfg.device_id.is_empty());
         assert!(!cfg.adapt_modifiers);
         assert!(cfg.language.is_empty());
     }
@@ -347,25 +410,37 @@ mod tests {
     }
 
     #[test]
-    fn validation_checks_local_ip() {
+    fn validation_checks_controller_local_ip() {
         let controller = AppConfig {
             role: Role::Controller,
+            local_ip: "192.168.1.20".into(),
             ..AppConfig::default()
         };
-        assert!(controller.validate().is_ok());
+        assert!(controller.local_ipv4().unwrap() == Ipv4Addr::new(192, 168, 1, 20));
 
-        let agent = AppConfig {
-            role: Role::Agent,
-            local_ip: "192.168.1.10".into(),
-            ..AppConfig::default()
-        };
-        assert!(agent.validate().is_ok());
-        assert_eq!(agent.local_ipv4().unwrap(), Ipv4Addr::new(192, 168, 1, 10));
-
-        let mut invalid = agent;
+        let mut invalid = controller.clone();
         invalid.local_ip = "127.0.0.1".into();
+        invalid.ensure_device_id();
         assert!(invalid.validate().is_err());
         invalid.local_ip = "not-an-ip".into();
         assert!(invalid.validate().is_err());
+
+        let mut agent = AppConfig {
+            role: Role::Agent,
+            ..AppConfig::default()
+        };
+        agent.ensure_device_id();
+        assert!(agent.validate().is_ok());
+        assert!(agent.local_ipv4().is_err());
+    }
+
+    #[test]
+    fn device_id_is_generated_once() {
+        let mut config = AppConfig::default();
+        assert!(config.ensure_device_id());
+        let first = config.device_id.clone();
+        assert!(!config.ensure_device_id());
+        assert_eq!(config.device_id, first);
+        assert!(config.device_id_bytes().is_ok());
     }
 }

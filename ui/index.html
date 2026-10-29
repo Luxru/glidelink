@@ -115,9 +115,9 @@
             <div class="group">
               <div class="group-header"><h2 data-i18n="connection.group">Connection</h2></div>
               <div class="group-card">
-                <div id="agentFields" hidden>
+                <div id="controllerFields" hidden>
                   <div class="setting-row">
-                    <span data-i18n="connection.localIp">Local IP</span>
+                    <span data-i18n="connection.localIp">Listening IP</span>
                     <span class="row-value">
                       <span class="value" id="selectedIp">—</span>
                       <button id="openNetworkSettings" type="button" class="link-button">
@@ -163,6 +163,10 @@
                     <span data-i18n="status.rtt">Network RTT</span>
                     <strong><i class="latency-dot" id="latencyDot"></i><span id="latencyValue">—</span></strong>
                   </div>
+                  <div class="status-metric">
+                    <span data-i18n="status.devices">Devices</span>
+                    <strong id="deviceCount">—</strong>
+                  </div>
                 </div>
               </div>
             </div>
@@ -178,28 +182,16 @@
 
         <section class="page" data-page="layout" hidden>
 
-          <div id="layoutStage" class="layout-stage" data-edge="right">
+          <div id="layoutStage" class="layout-stage">
             <div class="stage-canvas" aria-hidden="true"></div>
-            <div class="screen host-screen" id="hostScreen">
-              <div class="screen-content">
-                <strong id="hostScreenLabel" data-i18n="common.thisDevice">This device</strong>
-                <span class="screen-size" id="hostScreenSize">—</span>
-              </div>
-            </div>
-
-            <div class="link-bridge" aria-hidden="true">
-              <i></i>
-            </div>
-
-            <div class="screen remote-screen" id="remoteScreen" tabindex="0" role="button"
-                 data-i18n-aria-label="layout.peerAriaLabel">
-              <div class="screen-content">
-                <strong id="remoteScreenLabel" data-i18n="common.peerControlled">Controlled PC</strong>
-                <span class="screen-size" id="remoteScreenSize">—</span>
-              </div>
-              <span class="remote-badge" id="remoteBadge" hidden data-i18n="status.controlled">Under control</span>
+            <div id="layoutWorld" class="layout-world"></div>
+            <div id="layoutEmpty" class="layout-empty" data-i18n="layout.empty">
+              Start listening and let agents connect to arrange their screens.
             </div>
           </div>
+          <p class="layout-hint" data-i18n="layout.dragHint">
+            Drag to arrange. Touching edges allow direct traversal.
+          </p>
         </section>
 
         <section class="page" data-page="settings" hidden>
@@ -216,17 +208,22 @@
             </div>
           </div>
 
-          <div class="group">
+          <div class="group" id="keyboardGroup">
             <div class="group-header"><h2 data-i18n="settings.inputGroup">Keyboard &amp; shortcuts</h2></div>
             <div class="group-card">
               <div class="setting-row">
                 <label for="adaptModifiers" data-i18n="settings.adaptModifiers">Auto-map Cmd / Ctrl</label>
                 <input id="adaptModifiers" class="toggle-input" type="checkbox" />
               </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="settings.releaseShortcut">Release control</span>
+                <span class="value" data-i18n="settings.releaseShortcutValue">Ctrl + Alt + Backspace</span>
+              </div>
             </div>
           </div>
 
-          <div class="group">
+          <div class="group" id="networkGroup">
             <div class="group-header"><h2 data-i18n="settings.networkGroup">Network</h2></div>
             <div class="group-card">
               <div class="setting-row">
@@ -266,6 +263,11 @@
               <div class="setting-row">
                 <span data-i18n="about.peer">Peer</span>
                 <span class="value" id="aboutPeer">—</span>
+              </div>
+              <div class="separator"></div>
+              <div class="setting-row">
+                <span data-i18n="about.devices">Devices</span>
+                <span class="value" id="aboutDeviceCount">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
@@ -314,7 +316,7 @@
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.remoteScreen">Peer screen</span>
+                <span data-i18n="about.remoteScreen">Active screen</span>
                 <span class="value" id="aboutRemoteScreen">—</span>
               </div>
             </div>

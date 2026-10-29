@@ -1,8 +1,8 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScreenInfo {
     pub width: u32,
@@ -16,6 +16,22 @@ impl ScreenInfo {
             height: height.max(0) as u32,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerStatus {
+    pub device_id: String,
+    pub label: String,
+    pub addr: String,
+    pub platform: Option<u8>,
+    pub screen: Option<ScreenInfo>,
+    pub online: bool,
+    pub active: bool,
+    pub latency_ms: Option<f64>,
+    pub jitter_ms: Option<f64>,
+    pub packet_loss_percent: Option<f64>,
+    pub last_error_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -41,6 +57,8 @@ pub struct RuntimeStatus {
     pub input_interval_ms: Option<f64>,
     pub packet_loss_percent: Option<f64>,
     pub pairing_code: Option<String>,
+    pub devices: Vec<PeerStatus>,
+    pub target_device: Option<String>,
 }
 
 #[derive(Default)]

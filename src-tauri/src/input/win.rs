@@ -2,12 +2,12 @@ use super::{
     keymap::{hid_to_scan, is_caps, is_modifier, scan_to_hid, KeyState, CAPS_LOCK, KEY_DEFS},
     plan_injection_batch, CaptureHandle, CaptureMsg, CaptureShared, InjectCursor, InjectMsg,
     InjectStep, InputEvent, KeyAction, KeyOwnership, KeyRepeater, ReconcileState, RemoteInput,
-    BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
+    WarpInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
 };
 use crate::error;
 use crate::layout::{
-    advance, clamp_for_edge, entry_point, has_returned, host_point_to_norm, host_return_point,
-    is_outward, Edge, NormPoint, REENTRY_COOLDOWN_MS,
+    enter_from_host, host_px_to_world, step_active, world_to_host_px, DeviceId, LayoutStore,
+    NormPoint, StepResult, WorldLayout, WorldPoint, REENTRY_COOLDOWN_MS,
 };
 use crate::status::{ScreenInfo, Status};
 use crossbeam_channel::{Receiver, Sender};
@@ -67,6 +67,8 @@ const SM_YVIRTUALSCREEN: i32 = 77;
 const SM_CXVIRTUALSCREEN: i32 = 78;
 const SM_CYVIRTUALSCREEN: i32 = 79;
 
+const VK_CONTROL: i32 = 0x11;
+const VK_MENU: i32 = 0x12;
 const VK_LBUTTON: i32 = 0x01;
 const VK_RBUTTON: i32 = 0x02;
 const VK_MBUTTON: i32 = 0x04;
@@ -99,18 +101,21 @@ enum HookAction {
 struct CaptureState {
     shared: Arc<CaptureShared>,
     tx: Sender<CaptureMsg>,
-    edge: Edge,
-    offset: f32,
     vx: i32,
     vy: i32,
     vw: i32,
     vh: i32,
     cursor: POINT,
+    layout: LayoutStore,
+    layout_generation: u64,
+    world_layout: Arc<WorldLayout>,
+    target: Option<DeviceId>,
     armed: bool,
     active: bool,
     hidden: bool,
     buttons: u8,
-    point: NormPoint,
+    point: WorldPoint,
+    host_anchor: NormPoint,
     cooldown_until: Instant,
     keys: KeyOwnership,
     caps_lock: bool,
@@ -135,19 +140,71 @@ fn with_state<R>(f: impl FnOnce(&mut CaptureState) -> R) -> Option<R> {
 }
 
 impl CaptureState {
-    fn send_move(&self) {
-        let input = RemoteInput {
-            x: self.point.x,
-            y: self.point.y,
+    fn refresh_layout(&mut self) -> bool {
+        let (generation, layout) = self.layout.snapshot();
+        if generation == self.layout_generation {
+            return false;
+        }
+        self.layout_generation = generation;
+        self.world_layout = layout;
+        true
+    }
+
+    fn target_online(&self) -> bool {
+        self.target
+            .map(|device| {
+                self.world_layout
+                    .is_online(crate::layout::ScreenId::Device(device))
+            })
+            .unwrap_or(false)
+    }
+
+    fn local_point(&self) -> Option<NormPoint> {
+        let device = self.target?;
+        self.world_layout
+            .world_to_local(crate::layout::ScreenId::Device(device), self.point)
+    }
+
+    fn send_relative(&self, dx: i32, dy: i32) {
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        let Some(device) = self.target else {
+            return;
         };
-        let _ = self.tx.try_send(CaptureMsg::Move(input));
+        let _ = self.tx.try_send(CaptureMsg::Move {
+            device,
+            input: RemoteInput { dx, dy },
+        });
+    }
+
+    fn send_warp(&self) {
+        let Some(device) = self.target else {
+            return;
+        };
+        let Some(local) = self.local_point() else {
+            return;
+        };
+        let _ = self.tx.try_send(CaptureMsg::Warp {
+            device,
+            input: WarpInput {
+                x: local.x,
+                y: local.y,
+            },
+        });
     }
 
     fn send_event(&self, event: InputEvent) {
-        let _ = self.tx.try_send(CaptureMsg::Event(event));
+        let Some(device) = self.target else {
+            return;
+        };
+        let _ = self.tx.try_send(CaptureMsg::Event { device, event });
     }
 
     fn send_reconcile(&self, active: bool) {
+        let Some(device) = self.target else {
+            return;
+        };
         let state = ReconcileState {
             active,
             caps_lock: self.caps_lock,
@@ -155,19 +212,17 @@ impl CaptureState {
             keys: if active {
                 self.keys.remote
             } else {
-                KeyState::default()
+                KeyState::EMPTY
             },
         };
-        let _ = self.tx.try_send(CaptureMsg::Reconcile(state));
+        let _ = self.tx.try_send(CaptureMsg::Reconcile { device, state });
     }
 
-    fn at_edge(&self) -> bool {
-        match self.edge {
-            Edge::Right => self.cursor.x >= self.vx + self.vw - 1,
-            Edge::Left => self.cursor.x <= self.vx,
-            Edge::Top => self.cursor.y <= self.vy,
-            Edge::Bottom => self.cursor.y >= self.vy + self.vh - 1,
-        }
+    fn at_host_edge(&self) -> bool {
+        self.cursor.x >= self.vx + self.vw - 1
+            || self.cursor.x <= self.vx
+            || self.cursor.y <= self.vy
+            || self.cursor.y >= self.vy + self.vh - 1
     }
 
     fn handle_hook(&mut self, code: i32, wparam: WPARAM, lparam: LPARAM) -> HookAction {
@@ -259,8 +314,9 @@ impl CaptureState {
             if message == WM_MOUSEMOVE {
                 let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
                 self.cursor = info.pt;
-                let connected = self.shared.is_connected();
-                self.armed = connected && self.at_edge() && Instant::now() >= self.cooldown_until;
+                let connected = self.world_layout.screens.iter().any(|screen| screen.online);
+                self.armed =
+                    connected && self.at_host_edge() && Instant::now() >= self.cooldown_until;
             }
             HookAction::Pass
         }
@@ -289,10 +345,11 @@ impl CaptureState {
                 HookAction::Swallow
             };
         };
-        log::debug!(
-            "captured key {hid:#04x} {}",
-            if down { "down" } else { "up" }
-        );
+
+        if down && hid == 0x2A && ctrl_alt_pressed() {
+            self.deactivate_to_host(true, None);
+            return HookAction::Swallow;
+        }
 
         if is_caps(hid) {
             if down {
@@ -332,50 +389,92 @@ impl CaptureState {
     }
 
     fn handle_raw(&mut self, dx: f64, dy: f64) {
+        self.refresh_layout();
+        if self.active && !self.target_online() {
+            self.deactivate_to_host(true, None);
+        }
+
         if self.active {
-            self.point = advance(self.point, dx, dy, self.vw, self.vh);
-            if has_returned(self.edge, self.point) {
-                self.deactivate(true);
-            } else {
-                self.point = clamp_for_edge(self.edge, self.point);
-                self.send_move();
+            let Some(device) = self.target else {
+                return;
+            };
+            let old = self.point;
+            let host_w = self.vw as f32;
+            match step_active(&self.world_layout, device, self.point, dx, dy, self.vw) {
+                StepResult::Stay { world, .. } | StepResult::Wall { world, .. } => {
+                    self.point = world;
+                    self.send_relative(
+                        ((world.x - old.x) * host_w).round() as i32,
+                        ((world.y - old.y) * host_w).round() as i32,
+                    );
+                }
+                StepResult::ReturnHost {
+                    world, consumed, ..
+                } => {
+                    self.send_relative(
+                        ((consumed.x - old.x) * host_w).round() as i32,
+                        ((consumed.y - old.y) * host_w).round() as i32,
+                    );
+                    self.point = world;
+                    self.deactivate_to_host(true, Some(world));
+                }
+                StepResult::Switch {
+                    target,
+                    world,
+                    consumed,
+                    ..
+                } => {
+                    self.send_relative(
+                        ((consumed.x - old.x) * host_w).round() as i32,
+                        ((consumed.y - old.y) * host_w).round() as i32,
+                    );
+                    self.switch_target(target, world);
+                }
             }
             return;
         }
 
         if !self.armed {
-            return;
+            let connected = self.world_layout.screens.iter().any(|screen| screen.online);
+            if !connected || Instant::now() < self.cooldown_until || !self.at_host_edge() {
+                return;
+            }
+            self.armed = true;
         }
-        if !self.shared.is_connected() {
+        if Instant::now() < self.cooldown_until {
             self.armed = false;
             return;
         }
-        if Instant::now() < self.cooldown_until {
-            return;
-        }
-        if is_outward(self.edge, dx, dy) {
-            self.activate();
-        }
-    }
-
-    fn activate(&mut self) {
-        if self.active {
-            return;
-        }
-        let host = host_point_to_norm(
+        let host_world = host_px_to_world(
             self.cursor.x as f64,
             self.cursor.y as f64,
             self.vx,
             self.vy,
             self.vw,
-            self.vh,
         );
-        self.point = entry_point(self.edge, host, self.offset);
+        if let Some((device, _, world)) =
+            enter_from_host(&self.world_layout, host_world, dx, dy, self.vw)
+        {
+            self.activate_target(
+                device,
+                world,
+                self.world_layout.world_to_host_norm(host_world).inset(),
+            );
+        }
+    }
+
+    fn activate_target(&mut self, device: DeviceId, world: WorldPoint, host_anchor: NormPoint) {
+        if self.active {
+            return;
+        }
+        self.active = true;
+        self.target = Some(device);
+        self.point = world;
+        self.host_anchor = host_anchor;
         self.buttons = unsafe { query_buttons() };
-        self.keys.rebind(unsafe { query_held_keys() });
+        self.keys.begin(unsafe { query_held_keys() });
         self.caps_lock = unsafe { query_caps_lock() };
         self.caps_down = false;
-        self.active = true;
         self.armed = false;
         self.shared.set_active(true);
         if !self.hidden {
@@ -384,35 +483,74 @@ impl CaptureState {
             }
             self.hidden = true;
         }
-        self.send_move();
+        self.send_warp();
         self.send_reconcile(true);
     }
 
-    fn deactivate(&mut self, warp_cursor: bool) {
-        if !self.active {
-            if self.hidden {
-                unsafe {
-                    ShowCursor(1);
-                }
-                self.hidden = false;
-            }
+    fn switch_target(&mut self, device: DeviceId, world: WorldPoint) {
+        if self.target == Some(device) {
             return;
+        }
+        if let Some(old) = self.target {
+            let _ = self.tx.try_send(CaptureMsg::Event {
+                device: old,
+                event: InputEvent::ReleaseAll,
+            });
+            let _ = self.tx.try_send(CaptureMsg::Reconcile {
+                device: old,
+                state: ReconcileState {
+                    active: false,
+                    caps_lock: self.caps_lock,
+                    buttons: 0,
+                    keys: KeyState::EMPTY,
+                },
+            });
+        }
+        self.target = Some(device);
+        self.point = world;
+        self.buttons = unsafe { query_buttons() };
+        self.keys.deactivate();
+        self.keys.begin(unsafe { query_held_keys() });
+        self.caps_lock = unsafe { query_caps_lock() };
+        self.caps_down = false;
+        self.shared.set_active(true);
+        self.send_warp();
+        self.send_reconcile(true);
+    }
+
+    fn deactivate_to_host(&mut self, warp_cursor: bool, world: Option<WorldPoint>) {
+        let old = self.target.take();
+        if let Some(device) = old {
+            let _ = self.tx.try_send(CaptureMsg::Event {
+                device,
+                event: InputEvent::ReleaseAll,
+            });
+            let _ = self.tx.try_send(CaptureMsg::Reconcile {
+                device,
+                state: ReconcileState {
+                    active: false,
+                    caps_lock: self.caps_lock,
+                    buttons: 0,
+                    keys: KeyState::EMPTY,
+                },
+            });
         }
         self.active = false;
         self.buttons = 0;
-        self.point = self.point.clamped();
-        self.send_event(InputEvent::ReleaseAll);
-        self.send_reconcile(false);
         self.keys.deactivate();
         self.caps_down = false;
         self.shared.set_active(false);
+        self.armed = false;
 
         if warp_cursor {
-            let host = host_return_point(self.edge, self.point, self.offset);
-            let x = self.vx + (host.x * (self.vw - 1) as f32).round() as i32;
-            let y = self.vy + (host.y * (self.vh - 1) as f32).round() as i32;
+            let host_world = world.unwrap_or_else(|| {
+                self.world_layout
+                    .local_to_world(crate::layout::ScreenId::Host, self.host_anchor)
+                    .unwrap_or(self.world_layout.host.center())
+            });
+            let (x, y) = world_to_host_px(host_world, self.vx, self.vy, self.vw, self.vh);
             unsafe {
-                let _ = SetCursorPos(x, y);
+                let _ = SetCursorPos(x.round() as i32, y.round() as i32);
             }
         }
         if self.hidden {
@@ -421,14 +559,13 @@ impl CaptureState {
             }
             self.hidden = false;
         }
-        self.armed = false;
         self.cooldown_until = Instant::now() + Duration::from_millis(REENTRY_COOLDOWN_MS);
     }
 
     fn on_timer(&mut self) {
         if self.shared.stop.load(Ordering::Acquire) {
             if self.active {
-                self.deactivate(true);
+                self.deactivate_to_host(true, None);
             }
             if self.hidden {
                 unsafe {
@@ -441,8 +578,9 @@ impl CaptureState {
             }
             return;
         }
-        if self.active && !self.shared.is_connected() {
-            self.deactivate(true);
+        self.refresh_layout();
+        if self.active && !self.target_online() {
+            self.deactivate_to_host(true, None);
         }
     }
 }
@@ -462,6 +600,13 @@ unsafe fn query_held_keys() -> KeyState {
 
 unsafe fn query_caps_lock() -> bool {
     GetAsyncKeyState(VK_CAPITAL as i32) as u16 & 1 != 0
+}
+
+fn ctrl_alt_pressed() -> bool {
+    unsafe {
+        (GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000 != 0)
+            && (GetAsyncKeyState(VK_MENU) as u16 & 0x8000 != 0)
+    }
 }
 
 unsafe fn query_buttons() -> u8 {
@@ -574,14 +719,12 @@ pub fn open_permissions() -> Result<(), String> {
 pub fn start_capture(
     shared: Arc<CaptureShared>,
     tx: Sender<CaptureMsg>,
-    edge: Edge,
-    offset: f32,
 ) -> Result<CaptureHandle, String> {
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let thread_shared = Arc::clone(&shared);
     let join = thread::Builder::new()
         .name("glidelink-input-capture".into())
-        .spawn(move || run_capture_thread(thread_shared, tx, edge, offset, ready_tx))
+        .spawn(move || run_capture_thread(thread_shared, tx, ready_tx))
         .map_err(|e| error::detail("E_CAPTURE_THREAD", e))?;
 
     match ready_rx.recv_timeout(Duration::from_secs(3)) {
@@ -602,8 +745,6 @@ pub fn start_capture(
 fn run_capture_thread(
     shared: Arc<CaptureShared>,
     tx: Sender<CaptureMsg>,
-    edge: Edge,
-    offset: f32,
     ready_tx: mpsc::Sender<Result<(), String>>,
 ) {
     crate::sched::boost_current_thread();
@@ -720,21 +861,26 @@ fn run_capture_thread(
     unsafe {
         let _ = GetCursorPos(&mut cursor);
     }
+    let layout = shared.layout();
+    let (layout_generation, world_layout) = layout.snapshot();
     let state = CaptureState {
         shared,
         tx,
-        edge,
-        offset,
         vx,
         vy,
         vw,
         vh,
         cursor,
+        layout,
+        layout_generation,
+        world_layout,
+        target: None,
         armed: false,
         active: false,
         hidden: false,
         buttons: 0,
-        point: NormPoint::default(),
+        point: WorldPoint::default(),
+        host_anchor: NormPoint::new(0.5, 0.5),
         cooldown_until: Instant::now(),
         keys: KeyOwnership::default(),
         caps_lock: false,
@@ -760,7 +906,7 @@ fn run_capture_thread(
 
     with_state(|state| {
         if state.active {
-            state.deactivate(true);
+            state.deactivate_to_host(true, None);
         }
         if state.hidden {
             unsafe {
@@ -846,7 +992,10 @@ fn injector_loop(
         plan_injection_batch(&batch, &mut cursor, &mut steps);
         for step in steps.iter().copied() {
             match step {
-                InjectStep::Move { x, y, .. } => unsafe {
+                InjectStep::Move { dx, dy, .. } => unsafe {
+                    mouse_event(MOUSEEVENTF_MOVE, dx, dy, 0, 0);
+                },
+                InjectStep::Warp { x, y, .. } => unsafe {
                     mouse_event(
                         MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                         x as i32,

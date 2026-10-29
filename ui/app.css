@@ -1230,3 +1230,115 @@ input[type="number"]::-webkit-outer-spin-button {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Multi-device world layout ------------------------------------------------ */
+
+.layout-world {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.layout-world .screen {
+  left: 0;
+  top: 0;
+  width: auto;
+  aspect-ratio: auto;
+  transform: none;
+  transition:
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    opacity 160ms ease;
+}
+
+.layout-world .host-screen {
+  border-color: #c7c7cc;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.04),
+    0 8px 20px rgba(0, 0, 0, 0.05);
+}
+
+.device-screen {
+  cursor: grab;
+  touch-action: none;
+}
+
+.layout-stage.is-disabled .device-screen {
+  cursor: default;
+}
+
+.device-screen.is-offline {
+  opacity: 0.42;
+  border-style: dashed;
+}
+
+.device-screen.is-active {
+  border-color: var(--green);
+  box-shadow:
+    0 0 0 1px rgba(52, 199, 89, 0.18),
+    0 2px 12px rgba(52, 199, 89, 0.14);
+}
+
+.device-screen.is-dragging {
+  cursor: grabbing;
+  z-index: 5;
+  transition: none;
+}
+
+.device-screen:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.device-badge {
+  position: absolute;
+  z-index: 2;
+  top: 9px;
+  right: 9px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(120, 120, 128, 0.12);
+  color: var(--text-secondary);
+  font-size: 9.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.device-screen.is-active .device-badge {
+  background: var(--green);
+  color: #fff;
+}
+
+.device-screen.is-offline .device-badge {
+  background: transparent;
+  color: var(--text-tertiary);
+}
+
+.layout-empty {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  max-width: 320px;
+  transform: translate(-50%, -50%);
+  padding: 14px 18px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.82);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+  pointer-events: none;
+}
+
+.layout-empty[hidden] {
+  display: none;
+}
+
+.layout-hint {
+  margin: 10px 2px 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}
