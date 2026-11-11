@@ -13,6 +13,8 @@ const els = {
   keyboardGroup: document.getElementById("keyboardGroup"),
   networkGroup: document.getElementById("networkGroup"),
   adaptModifiers: document.getElementById("adaptModifiers"),
+  closeToTray: document.getElementById("closeToTray"),
+  minimizeBtn: document.getElementById("minimizeBtn"),
   interfaceSelect: document.getElementById("interfaceSelect"),
   selectedIp: document.getElementById("selectedIp"),
   openNetworkSettings: document.getElementById("openNetworkSettings"),
@@ -727,10 +729,15 @@ function syncLanguage(configLanguage) {
   els.languageSelect.value = ui.language;
 }
 
+function syncTrayLanguage() {
+  if (invoke) invoke("set_tray_language", { language: i18n.getLocale() }).catch(() => {});
+}
+
 function revertSettingsFromSaved() {
   const config = ui.savedConfig;
   if (!config) return;
   els.adaptModifiers.checked = Boolean(config.adaptModifiers);
+  els.closeToTray.checked = config.closeToTray !== false;
   ui.adaptModifiers = Boolean(config.adaptModifiers);
   if (config.logLevel) els.logLevel.value = config.logLevel;
   ui.configLocalIp = config.localIp || "";
@@ -750,6 +757,7 @@ async function saveSettings(patch) {
       ui.savedConfig = config;
       ui.adaptModifiers = Boolean(config.adaptModifiers);
       els.adaptModifiers.checked = ui.adaptModifiers;
+      els.closeToTray.checked = config.closeToTray !== false;
       if (config.logLevel) els.logLevel.value = config.logLevel;
       ui.configLocalIp = config.localIp || "";
       if (config.language) {
@@ -802,6 +810,7 @@ function applyState(state) {
     ui.interfaces = Array.isArray(state.localInterfaces) ? state.localInterfaces : [];
     ui.adaptModifiers = Boolean(config.adaptModifiers);
     els.adaptModifiers.checked = ui.adaptModifiers;
+    els.closeToTray.checked = config.closeToTray !== false;
     if (config.logLevel) els.logLevel.value = config.logLevel;
     setRole(config.role, false);
     setPairingCode(
@@ -893,7 +902,7 @@ function applyState(state) {
     }
   } else if (errorRaw) {
     pillClass = "status-error";
-    text = t("status.startFailed");
+    text = t(status.lastErrorCode === "NET_CONNECTION_EXPIRED" ? "status.disconnected" : "status.startFailed");
   }
 
   els.statusPill.className = `status-pill ${pillClass}`;
@@ -1128,6 +1137,16 @@ function initEvents() {
   });
 
   els.openNetworkSettings.addEventListener("click", () => setPage("settings"));
+  els.closeToTray.addEventListener("change", () => {
+    saveSettings({ closeToTray: els.closeToTray.checked });
+  });
+  els.minimizeBtn.addEventListener("click", async () => {
+    try {
+      await invoke("minimize_to_tray");
+    } catch (error) {
+      setError(errorToRaw(error));
+    }
+  });
   els.form.addEventListener("submit", startSession);
   els.stopBtn.addEventListener("click", stopSession);
   els.permissionBtn.addEventListener("click", async () => {
@@ -1154,6 +1173,7 @@ function initEvents() {
   });
 
   document.addEventListener("glidelink:locale", () => {
+    syncTrayLanguage();
     if (ui.languageSyncGuard) return;
     updatePageChrome();
     updateStartLabel();
@@ -1173,6 +1193,7 @@ function initEvents() {
 
 async function boot() {
   initEvents();
+  syncTrayLanguage();
   els.languageSelect.value = i18n.getLocale();
   setRole("controller", false);
   setPage("session");

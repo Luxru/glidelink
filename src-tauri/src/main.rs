@@ -10,6 +10,7 @@ mod net;
 mod sched;
 mod state;
 mod status;
+mod tray;
 
 use config::{AppConfig, Role};
 use invite::Invite;
@@ -136,9 +137,11 @@ fn save_layout(
 fn save_settings(
     patch: config::SettingsPatch,
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<AppConfig, String> {
     let config = state.update_config(|config| config.apply_patch(&patch))?;
     let _ = logging::set_level(&config.log_level);
+    tray::update_language(&app, &config.language);
     Ok(config)
 }
 
@@ -168,6 +171,16 @@ fn open_permissions() -> Result<(), String> {
     input::open_permissions()
 }
 
+#[tauri::command]
+fn minimize_to_tray(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.hide().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_tray_language(app: tauri::AppHandle, language: String) {
+    tray::update_language(&app, &language);
+}
+
 fn main() {
     logging::init("info");
 
@@ -179,6 +192,10 @@ fn main() {
     }
 
     let app = tauri::Builder::default()
+        // Tao's own foreground Raw Input registration can suppress our global
+        // keyboard hook while the settings WebView has focus. Capture owns its
+        // own mouse INPUTSINK registration and dedicated message loop.
+        .device_event_filter(tauri::DeviceEventFilter::Always)
         .setup(|app| {
             // Settings live in `~/.glidelink/settings.json`.
             let settings_path = match app.path().home_dir() {
@@ -193,7 +210,7 @@ fn main() {
             log::info!(
                 "starting on {} (build={}, screen={:?}, permissions_ok={})",
                 input::platform_name(),
-                env!("GLIDELINK_BUILD"),
+                env!("RX_SWITCH_BUILD"),
                 screen,
                 input::permissions_ok()
             );
@@ -209,8 +226,31 @@ fn main() {
             };
 
             let _ = logging::set_level(&config.log_level);
+            let language = config.language.clone();
             app.manage(AppState::new(settings_path, config, status));
+            #[cfg(target_os = "macos")]
+            input::initialize(app.handle());
+            tray::setup(app.handle(), &language)?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let close_to_tray = window
+                    .state::<AppState>()
+                    .config
+                    .snapshot()
+                    .map(|config| config.close_to_tray)
+                    .unwrap_or(true);
+                if close_to_tray {
+                    // Keep a visible window if hiding unexpectedly fails.
+                    if let Err(err) = window.hide() {
+                        log::error!("could not hide window: {err}");
+                    }
+                } else {
+                    window.app_handle().exit(0);
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -222,12 +262,22 @@ fn main() {
             preview_pairing_code,
             get_logs,
             clear_logs,
-            reopen_app
+            reopen_app,
+            minimize_to_tray,
+            set_tray_language
         ])
         .build(tauri::generate_context!())
-        .expect("failed to build GlideLink");
+        .expect("failed to build rx-switch");
 
     app.run(|app_handle, event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } = event
+        {
+            tray::show_window(app_handle);
+        }
         if let tauri::RunEvent::Exit = event {
             if let Some(state) = app_handle.try_state::<AppState>() {
                 state.engine.stop();

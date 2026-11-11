@@ -41,6 +41,9 @@ pub struct AppConfig {
     /// Runtime log level: off/error/warn/info/debug/trace.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Closing the settings window keeps the session running in the tray.
+    #[serde(default = "default_close_to_tray")]
+    pub close_to_tray: bool,
     /// Stable per-installation identity used by the Controller to remember
     /// devices across reconnects and app restarts.
     #[serde(default)]
@@ -66,6 +69,11 @@ pub struct SettingsPatch {
     pub adapt_modifiers: Option<bool>,
     pub local_ip: Option<String>,
     pub log_level: Option<String>,
+    pub close_to_tray: Option<bool>,
+}
+
+fn default_close_to_tray() -> bool {
+    true
 }
 
 pub fn default_log_level() -> String {
@@ -94,6 +102,7 @@ impl Default for AppConfig {
             adapt_modifiers: false,
             language: String::new(),
             log_level: default_log_level(),
+            close_to_tray: true,
             device_id: String::new(),
             layout: Vec::new(),
             last_invite: String::new(),
@@ -152,6 +161,9 @@ impl AppConfig {
         if let Some(log_level) = &patch.log_level {
             self.log_level = normalize_log_level(log_level);
         }
+        if let Some(close_to_tray) = patch.close_to_tray {
+            self.close_to_tray = close_to_tray;
+        }
         if let Some(local_ip) = &patch.local_ip {
             let trimmed = local_ip.trim();
             if !trimmed.is_empty() {
@@ -171,6 +183,7 @@ impl AppConfig {
     /// config record, but older clients (and controller starts) omit the
     /// language and the agent-only interface choice.
     pub fn inherit_persisted_settings(&mut self, previous: &AppConfig) {
+        self.close_to_tray = previous.close_to_tray;
         if self.language.trim().is_empty() {
             self.language = previous.language.clone();
         }
@@ -315,6 +328,7 @@ mod tests {
         assert!(cfg.device_id.is_empty());
         assert!(!cfg.adapt_modifiers);
         assert!(cfg.language.is_empty());
+        assert!(cfg.close_to_tray);
     }
 
     #[test]
@@ -384,6 +398,7 @@ mod tests {
     #[test]
     fn start_session_inherits_language_and_interface() {
         let previous = AppConfig {
+            close_to_tray: false,
             local_ip: "192.168.1.10".into(),
             language: "en".into(),
             ..AppConfig::default()
@@ -394,6 +409,7 @@ mod tests {
             ..AppConfig::default()
         };
         controller.inherit_persisted_settings(&previous);
+        assert!(!controller.close_to_tray);
         assert_eq!(controller.language, "en");
         assert_eq!(controller.local_ip, "192.168.1.10");
 
@@ -404,6 +420,7 @@ mod tests {
             ..AppConfig::default()
         };
         agent.inherit_persisted_settings(&previous);
+        assert!(!agent.close_to_tray);
         assert_eq!(agent.language, "zh");
         assert_eq!(agent.local_ip, "192.168.1.30");
     }

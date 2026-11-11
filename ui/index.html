@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>GlideLink</title>
+  <title>rx-switch</title>
   <link rel="stylesheet" href="app.css" />
 </head>
 <body>
@@ -12,7 +12,7 @@
       <div class="sidebar-brand">
         <img class="app-icon" src="app-icon.png" alt="" />
         <div class="brand-copy">
-          <strong>GlideLink</strong>
+          <strong>rx-switch</strong>
           <span data-i18n="app.taglineShort">Software KVM</span>
         </div>
       </div>
@@ -30,17 +30,17 @@
           </span>
           <span data-i18n="nav.layout">Display Layout</span>
         </button>
-        <button class="nav-item" type="button" data-page-target="settings">
-          <span class="nav-icon nav-green" aria-hidden="true">
-            <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="2.5" stroke="currentColor" stroke-width="1.6"/><path d="M10 2.6v2.1M10 15.3v2.1M2.6 10h2.1M15.3 10h2.1M4.8 4.8l1.5 1.5M13.7 13.7l1.5 1.5M15.2 4.8l-1.5 1.5M6.3 13.7l-1.5 1.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-          </span>
-          <span data-i18n="nav.settings">Settings</span>
-        </button>
         <button class="nav-item" type="button" data-page-target="logs">
           <span class="nav-icon nav-gray" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none"><rect x="2.7" y="3.4" width="14.6" height="13.2" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 7.2l2.4 2.3-2.4 2.3M10 12h4.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </span>
           <span data-i18n="nav.logs">Logs</span>
+        </button>
+        <button class="nav-item" type="button" data-page-target="settings">
+          <span class="nav-icon nav-green" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="2.5" stroke="currentColor" stroke-width="1.6"/><path d="M10 2.6v2.1M10 15.3v2.1M2.6 10h2.1M15.3 10h2.1M4.8 4.8l1.5 1.5M13.7 13.7l1.5 1.5M15.2 4.8l-1.5 1.5M6.3 13.7l-1.5 1.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          </span>
+          <span data-i18n="nav.settings">Settings</span>
         </button>
         <button class="nav-item" type="button" data-page-target="about">
           <span class="nav-icon nav-gray" aria-hidden="true">
@@ -51,7 +51,7 @@
       </nav>
 
       <div class="sidebar-footer">
-        <div class="sidebar-version">GlideLink 0.1.0</div>
+        <div class="sidebar-version">rx-switch 0.1.0</div>
       </div>
     </aside>
 
@@ -65,6 +65,7 @@
             <span class="dot"></span>
             <span id="statusText" data-i18n="status.notRunning">Not running</span>
           </div>
+          <button id="minimizeBtn" class="button secondary small" type="button" data-i18n="common.minimizeToTray">Minimize to tray</button>
           <button id="stopBtn" class="button secondary small" type="button" data-i18n="common.stop" hidden>Stop</button>
         </div>
       </header>
@@ -77,7 +78,7 @@
       <div id="permissionCard" class="permission-card" hidden>
         <div>
           <strong data-i18n="permission.title">macOS permissions required</strong>
-          <p data-i18n="permission.text">Allow GlideLink to listen for and inject mouse events, then relaunch the app.</p>
+          <p data-i18n="permission.text">Allow rx-switch to control the keyboard and mouse in Accessibility, then relaunch the app.</p>
         </div>
         <div class="permission-actions">
           <button id="permissionBtn" type="button" class="button secondary small" data-i18n="permission.open">Open System Settings</button>
@@ -229,6 +230,16 @@
             </div>
           </div>
 
+          <div class="group">
+            <div class="group-header"><h2 data-i18n="settings.windowGroup">Window</h2></div>
+            <div class="group-card">
+              <div class="setting-row">
+                <label for="closeToTray" data-i18n="settings.closeToTray">Keep running in tray when the window closes</label>
+                <input id="closeToTray" class="toggle-input" type="checkbox" checked />
+              </div>
+            </div>
+          </div>
+
           <div class="group" id="networkGroup">
             <div class="group-header"><h2 data-i18n="settings.networkGroup">Network</h2></div>
             <div class="group-card">
@@ -267,7 +278,7 @@
         <section class="page" data-page="about" hidden>
           <div class="about-hero">
             <img class="about-icon" src="app-icon.png" alt="" />
-            <h2>GlideLink</h2>
+            <h2>rx-switch</h2>
             <p data-i18n="about.tagline">Low-latency software KVM</p>
             <span class="version-pill" data-i18n="about.version">Version 0.1.0</span>
           </div>

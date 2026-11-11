@@ -48,7 +48,7 @@ impl SessionGuard {
             use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
 
             let info = NSProcessInfo::processInfo();
-            let reason = NSString::from_str("GlideLink active input session");
+            let reason = NSString::from_str("rx-switch active input session");
             let options = NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
                 | NSActivityOptions::LatencyCritical;
             let activity = info.beginActivityWithOptions_reason(options, &reason);

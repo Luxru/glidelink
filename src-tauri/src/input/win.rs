@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE,
+    GetAsyncKeyState, GetKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
+    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
     MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VK_CAPITAL,
@@ -344,7 +344,7 @@ impl CaptureState {
             };
         };
 
-        if down && hid == 0x2A && ctrl_alt_pressed() {
+        if down && hid == 0x2A && (self.keys.release_chord_pressed() || ctrl_alt_pressed()) {
             self.deactivate_to_host(true, None);
             return HookAction::Swallow;
         }
@@ -367,6 +367,9 @@ impl CaptureState {
         if down {
             match self.keys.key_down(true, hid) {
                 KeyAction::Down => {
+                    if is_modifier(hid) {
+                        log::debug!("capture modifier hid={hid:#04x} down=true");
+                    }
                     self.send_event(InputEvent::Key { hid, down: true });
                     HookAction::Swallow
                 }
@@ -377,6 +380,9 @@ impl CaptureState {
         } else {
             match self.keys.key_up(true, hid) {
                 KeyAction::Up => {
+                    if is_modifier(hid) {
+                        log::debug!("capture modifier hid={hid:#04x} down=false");
+                    }
                     self.send_event(InputEvent::Key { hid, down: false });
                     HookAction::Swallow
                 }
@@ -530,8 +536,7 @@ impl CaptureState {
             .map_or(0, |screen| screen.session);
         self.point = world;
         self.buttons = unsafe { query_buttons() };
-        self.keys.deactivate();
-        self.keys.begin(unsafe { query_held_keys() });
+        self.keys.rebind(unsafe { query_held_keys() });
         self.caps_lock = unsafe { query_caps_lock() };
         self.caps_down = false;
         self.shared.set_active(true);
@@ -623,7 +628,8 @@ unsafe fn query_held_keys() -> KeyState {
 }
 
 unsafe fn query_caps_lock() -> bool {
-    GetAsyncKeyState(VK_CAPITAL as i32) as u16 & 1 != 0
+    // GetAsyncKeyState's low bit means "pressed since last query", not locked.
+    GetKeyState(VK_CAPITAL as i32) as u16 & 1 != 0
 }
 
 fn ctrl_alt_pressed() -> bool {
@@ -956,12 +962,12 @@ fn run_capture_thread(
 pub fn start_injector(
     rx: Receiver<InputMsg>,
     stop: Arc<std::sync::atomic::AtomicBool>,
-    status: Status,
+    _status: Status,
 ) -> Result<JoinHandle<()>, String> {
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let join = thread::Builder::new()
         .name("glidelink-input-injector".into())
-        .spawn(move || injector_loop(rx, stop, status, ready_tx))
+        .spawn(move || injector_loop(rx, stop, ready_tx))
         .map_err(|e| error::detail("E_INJECTOR_THREAD", e))?;
     match ready_rx.recv_timeout(Duration::from_secs(2)) {
         Ok(Ok(())) => Ok(join),
@@ -973,14 +979,13 @@ pub fn start_injector(
 fn injector_loop(
     rx: Receiver<InputMsg>,
     stop: Arc<std::sync::atomic::AtomicBool>,
-    status: Status,
     ready_tx: mpsc::Sender<Result<(), String>>,
 ) {
     crate::sched::boost_current_thread();
     let _ = ready_tx.send(Ok(()));
     let mut applied_buttons = 0u8;
     let mut applied_keys = KeyState::default();
-    let caps_actual = unsafe { GetAsyncKeyState(VK_CAPITAL as i32) as u16 & 1 != 0 };
+    let caps_actual = unsafe { query_caps_lock() };
     let mut repeater = KeyRepeater::default();
     let mut cursor = InjectCursor {
         caps_lock: caps_actual,
@@ -1047,7 +1052,7 @@ fn injector_loop(
                         send_key_hid(hid, false);
                     }
                 }
-                InjectStep::CapsLock(desired) => {
+                InjectStep::CapsLock(desired) | InjectStep::CapsLockTap(desired) => {
                     if desired != unsafe { query_caps_lock() } {
                         send_key_hid(CAPS_LOCK, true);
                         send_key_hid(CAPS_LOCK, false);
@@ -1076,10 +1081,6 @@ fn injector_loop(
     if applied_buttons != 0 {
         apply_button_transitions(applied_buttons, 0);
     }
-    status.update(|s| {
-        s.last_error_code = None;
-        s.last_error_detail = None;
-    });
 }
 
 fn send_key_hid(hid: u8, down: bool) -> bool {

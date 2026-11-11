@@ -12,7 +12,7 @@ fn emit_build_label() {
     println!("cargo:rerun-if-changed=../.git/HEAD");
 
     let Some(commit) = git(&["rev-parse", "--short=9", "HEAD"]) else {
-        println!("cargo:rustc-env=GLIDELINK_BUILD=unknown");
+        println!("cargo:rustc-env=RX_SWITCH_BUILD=unknown");
         return;
     };
 
@@ -35,7 +35,7 @@ fn emit_build_label() {
     } else {
         commit
     };
-    println!("cargo:rustc-env=GLIDELINK_BUILD={label}");
+    println!("cargo:rustc-env=RX_SWITCH_BUILD={label}");
 }
 
 fn git(args: &[&str]) -> Option<String> {

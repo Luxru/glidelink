@@ -49,6 +49,23 @@ const PAKE_ID_AGENT: &[u8] = b"GlideLink v1 agent";
 
 type NetResult<T> = Result<T, String>;
 
+#[derive(Clone, Copy)]
+struct AgentRetryPolicy {
+    connect_window: Duration,
+    reconnect_window: Duration,
+    retry_delay: Duration,
+}
+
+impl Default for AgentRetryPolicy {
+    fn default() -> Self {
+        Self {
+            connect_window: Duration::from_secs(5),
+            reconnect_window: Duration::from_secs(30),
+            retry_delay: Duration::from_secs(1),
+        }
+    }
+}
+
 fn local_screen_or_zero() -> ScreenInfo {
     input::screen_info().unwrap_or(ScreenInfo {
         width: 0,
@@ -775,15 +792,19 @@ fn run_hub(mut hub: Hub, capture_rx: Receiver<CaptureMsg>, stop: Arc<AtomicBool>
 }
 
 /// Wait only during PAKE. Normal traffic uses the same nonblocking framing.
-fn wait_packet(wire: &mut FramedStream, stop: &AtomicBool) -> NetResult<Vec<u8>> {
-    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+fn wait_packet(
+    wire: &mut FramedStream,
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> NetResult<Vec<u8>> {
+    let deadline = deadline.min(Instant::now() + HANDSHAKE_TIMEOUT);
     while !stop.load(Ordering::Acquire) {
+        if Instant::now() >= deadline {
+            return Err(error::code("NET_TIMEOUT"));
+        }
         wire.flush().map_err(|e| e.to_string())?;
         if let Some(packet) = wire.read_packet().map_err(|e| e.to_string())? {
             return Ok(packet);
-        }
-        if Instant::now() >= deadline {
-            return Err(error::code("NET_TIMEOUT"));
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -797,8 +818,13 @@ fn connect_agent(
     local_device: DeviceId,
     stop: &AtomicBool,
     status: &Status,
+    deadline: Instant,
 ) -> NetResult<(Link, Handshake)> {
-    let socket = TcpStream::connect_timeout(&controller, CONNECT_TIMEOUT)
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() || stop.load(Ordering::Acquire) {
+        return Err(error::code("NET_TIMEOUT"));
+    }
+    let socket = TcpStream::connect_timeout(&controller, CONNECT_TIMEOUT.min(remaining))
         .map_err(|e| error::detail("NET_NO_RESPONSE", e))?;
     let mut wire =
         FramedStream::new(socket, status.clone()).map_err(|e| error::detail("E_NET_SOCKET", e))?;
@@ -818,7 +844,7 @@ fn connect_agent(
     let hello_packet = build_pake_hello(&hello, &hello_msg);
     wire.queue(hello_packet.clone())
         .map_err(|e| e.to_string())?;
-    let accept_packet = wait_packet(&mut wire, stop)?;
+    let accept_packet = wait_packet(&mut wire, stop, deadline)?;
     let (accept, accept_msg) =
         parse_pake_accept(&accept_packet, &sid).map_err(|e| e.to_string())?;
     let shared = pake
@@ -829,7 +855,7 @@ fn connect_agent(
     let mut session = Session::from_keys(&c2a, &a2c, sid, Side::Agent);
     wire.queue(session.encrypt_packet(TYPE_CONFIRM, CONFIRM_PAYLOAD))
         .map_err(|e| e.to_string())?;
-    let ack = wait_packet(&mut wire, stop)?;
+    let ack = wait_packet(&mut wire, stop, deadline)?;
     let (kind, payload) = session.decrypt_packet(&ack).map_err(|e| e.to_string())?;
     if kind != TYPE_CONFIRM_ACK || payload != CONFIRM_PAYLOAD {
         return Err(error::code("E_PAKE"));
@@ -843,6 +869,24 @@ pub fn start_agent(
     inject_tx: crossbeam_channel::Sender<InputMsg>,
     stop: Arc<AtomicBool>,
     status: Status,
+) -> NetResult<JoinHandle<()>> {
+    start_agent_with_policy(
+        config,
+        pairing_code,
+        inject_tx,
+        stop,
+        status,
+        AgentRetryPolicy::default(),
+    )
+}
+
+fn start_agent_with_policy(
+    config: &AppConfig,
+    pairing_code: &str,
+    inject_tx: crossbeam_channel::Sender<InputMsg>,
+    stop: Arc<AtomicBool>,
+    status: Status,
+    retry: AgentRetryPolicy,
 ) -> NetResult<JoinHandle<()>> {
     let invite = Invite::decode(pairing_code).map_err(|_| error::code("E_PAIRING_CODE"))?;
     let controller = SocketAddr::new(IpAddr::V4(invite.ip), invite.port);
@@ -873,7 +917,9 @@ pub fn start_agent(
         .spawn(move || {
             crate::sched::boost_current_thread();
             let _guard = crate::sched::SessionGuard::begin();
-            while !stop.load(Ordering::Acquire) {
+            let mut deadline = Instant::now() + retry.connect_window;
+            let mut last_error = None;
+            while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
                 let result = connect_agent(
                     controller,
                     &code,
@@ -881,9 +927,15 @@ pub fn start_agent(
                     local_device,
                     &stop,
                     &status,
+                    deadline,
                 )
                 .and_then(|(link, accept)| {
-                    run_agent(link, accept, controller, &inject_tx, &stop, &status)
+                    let result = run_agent(link, accept, controller, &inject_tx, &stop, &status);
+                    // A working authenticated link gets a longer recovery
+                    // window after it disconnects. Failed attempts never extend
+                    // either deadline, including stalled handshakes.
+                    deadline = Instant::now() + retry.reconnect_window;
+                    result
                 });
                 // Reset before backoff, including authentication/transport failures.
                 let _ = inject_tx.send(InputMsg::Reset);
@@ -892,20 +944,36 @@ pub fn start_agent(
                     s.remote_active = false;
                     s.latency_ms = None;
                     s.jitter_ms = None;
+                    s.input_interval_ms = None;
+                    s.packet_loss_percent = None;
+                    s.remote_screen = None;
+                    s.peer_platform = None;
                     s.devices.clear();
                     s.target_device = None;
                 });
                 if let Err(e) = result {
                     log::debug!("agent connection ended: {e}");
                     if !stop.load(Ordering::Acquire) {
+                        last_error = Some(e.clone());
                         status.set_error("NET_PEER_DISCONNECTED", Some(e));
                     }
                 }
-                let retry_at = Instant::now() + Duration::from_millis(250);
+                let retry_at = (Instant::now() + retry.retry_delay).min(deadline);
                 while !stop.load(Ordering::Acquire) && Instant::now() < retry_at {
                     thread::sleep(POLL_INTERVAL);
                 }
             }
+            let expired = !stop.load(Ordering::Acquire);
+            let _ = inject_tx.send(InputMsg::Reset);
+            stop.store(true, Ordering::Release);
+            status.finish_session(
+                if expired {
+                    Some("NET_CONNECTION_EXPIRED")
+                } else {
+                    None
+                },
+                if expired { last_error } else { None },
+            );
         })
         .map_err(|e| error::detail("E_NET_THREAD", e))
 }
@@ -1018,6 +1086,42 @@ mod tests {
         }
     }
 
+    fn test_agent(code: &str, retry: AgentRetryPolicy) -> (Worker, Receiver<InputMsg>) {
+        let config = AppConfig {
+            role: Role::Agent,
+            device_id: device_id_to_hex(&device(0x71)),
+            ..AppConfig::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let status = Status::new(Some(ScreenInfo::new(1920, 1080)));
+        let (tx, rx) = unbounded();
+        let join = start_agent_with_policy(&config, code, tx, stop.clone(), status.clone(), retry)
+            .unwrap();
+        (
+            Worker {
+                stop,
+                join: Some(join),
+                status,
+            },
+            rx,
+        )
+    }
+
+    fn quick_retry() -> AgentRetryPolicy {
+        AgentRetryPolicy {
+            connect_window: Duration::from_millis(300),
+            reconnect_window: Duration::from_millis(500),
+            retry_delay: Duration::from_millis(30),
+        }
+    }
+
+    fn test_listener() -> TcpListener {
+        (PORT_RANGE_START..=PORT_RANGE_END)
+            .rev()
+            .find_map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok())
+            .expect("no local test port available")
+    }
+
     struct Controller {
         worker: Worker,
         tx: Sender<CaptureMsg>,
@@ -1028,10 +1132,15 @@ mod tests {
 
     impl Controller {
         fn new() -> Self {
+            Self::with_code("")
+        }
+
+        fn with_code(code: &str) -> Self {
             let config = AppConfig {
                 role: Role::Controller,
                 local_ip: "127.0.0.1".into(),
                 device_id: device_id_to_hex(&device(0x10)),
+                last_invite: code.to_string(),
                 ..AppConfig::default()
             };
             let path =
@@ -1342,6 +1451,205 @@ mod tests {
     }
 
     #[test]
+    fn stale_pairing_endpoint_ends_session_and_clears_connection_state() {
+        let listener = test_listener();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let code = Invite::generate(Ipv4Addr::LOCALHOST, port).encode();
+        let (agent, rx) = test_agent(&code, quick_retry());
+        let local_screen = agent.status.snapshot().local_screen;
+        assert!(wait_until(|| !agent.status.snapshot().running));
+        let status = agent.status.snapshot();
+        assert!(agent.stop.load(Ordering::Acquire));
+        assert!(!status.connected && !status.remote_active);
+        assert_eq!(
+            status.last_error_code.as_deref(),
+            Some("NET_CONNECTION_EXPIRED")
+        );
+        assert!(status.last_error_detail.is_some());
+        assert!(status.peer.is_none() && status.peer_platform.is_none());
+        assert!(status.remote_screen.is_none() && status.pairing_code.is_none());
+        assert!(status.started_at_ms.is_none() && status.devices.is_empty());
+        assert_eq!(status.local_screen, local_screen);
+        recv_matching(&rx, |message| matches!(message, InputMsg::Reset));
+    }
+
+    #[test]
+    fn stalled_handshake_cannot_extend_the_initial_connect_window() {
+        let listener = test_listener();
+        listener.set_nonblocking(true).unwrap();
+        let code =
+            Invite::generate(Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()).encode();
+        let started = Instant::now();
+        let (agent, _rx) = test_agent(&code, quick_retry());
+        let mut accepted = None;
+        assert!(wait_until(|| {
+            accepted = listener.accept().ok();
+            accepted.is_some()
+        }));
+        // Keep the socket open but never send ACCEPT. This exercises the same
+        // deadline through TCP establishment and the PAKE packet wait.
+        assert!(wait_until(|| !agent.status.snapshot().running));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            agent.status.snapshot().last_error_code.as_deref(),
+            Some("NET_CONNECTION_EXPIRED")
+        );
+        drop(accepted);
+    }
+
+    #[test]
+    fn failed_attempts_retry_multiple_times_without_extending_the_deadline() {
+        let listener = test_listener();
+        listener.set_nonblocking(true).unwrap();
+        let code =
+            Invite::generate(Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()).encode();
+        let (agent, _rx) = test_agent(&code, quick_retry());
+        let mut attempts = 0;
+        assert!(wait_until(|| {
+            if let Ok((socket, _)) = listener.accept() {
+                attempts += 1;
+                drop(socket);
+            }
+            !agent.status.snapshot().running
+        }));
+        assert!(attempts >= 3, "only {attempts} connection attempts");
+        assert_eq!(
+            agent.status.snapshot().last_error_code.as_deref(),
+            Some("NET_CONNECTION_EXPIRED")
+        );
+    }
+
+    #[test]
+    fn disconnected_link_releases_input_before_the_reconnect_window_expires() {
+        let controller = Controller::new();
+        let (agent, rx) = test_agent(
+            &controller.code,
+            AgentRetryPolicy {
+                connect_window: Duration::from_secs(2),
+                ..quick_retry()
+            },
+        );
+        assert!(wait_until(|| agent.status.snapshot().connected
+            && controller
+                .layout
+                .snapshot()
+                .1
+                .screen_spec(crate::layout::ScreenId::Device(device(0x71)))
+                .is_some_and(|screen| screen.online)));
+        controller.send(0x71, active());
+        controller.send(0x71, key(true));
+        controller.send(
+            0x71,
+            InputMsg::Event(InputEvent::Button {
+                button: BUTTON_LEFT,
+                down: true,
+            }),
+        );
+        assert_eq!(
+            recv_event(&rx),
+            InputEvent::Key {
+                hid: 0x04,
+                down: true
+            }
+        );
+        assert_eq!(
+            recv_event(&rx),
+            InputEvent::Button {
+                button: BUTTON_LEFT,
+                down: true
+            }
+        );
+        drop(controller);
+        recv_matching(&rx, |message| matches!(message, InputMsg::Reset));
+        let status = agent.status.snapshot();
+        assert!(status.running && !status.connected && !status.remote_active);
+        assert!(wait_until(|| !agent.status.snapshot().running));
+        assert_eq!(
+            agent.status.snapshot().last_error_code.as_deref(),
+            Some("NET_CONNECTION_EXPIRED")
+        );
+    }
+
+    #[test]
+    fn temporary_outage_reconnects_within_grace_period_without_held_keys() {
+        let controller = Controller::new();
+        let code = controller.code.clone();
+        let (agent, rx) = controller.agent(0x72);
+        controller.send(0x72, active());
+        controller.send(0x72, key(true));
+        assert_eq!(
+            recv_event(&rx),
+            InputEvent::Key {
+                hid: 0x04,
+                down: true
+            }
+        );
+        drop(controller);
+        recv_matching(&rx, |message| matches!(message, InputMsg::Reset));
+        assert!(agent.status.snapshot().running);
+        let replacement = Controller::with_code(&code);
+        assert_eq!(replacement.code, code);
+        assert!(wait_until(|| agent.status.snapshot().connected));
+        recv_matching(
+            &rx,
+            |message| matches!(message, InputMsg::Reconcile(state) if !state.active && state.keys.is_empty()),
+        );
+        assert!(!agent.status.snapshot().remote_active);
+        assert!(agent.status.snapshot().last_error_code.is_none());
+    }
+
+    #[test]
+    fn manual_stop_interrupts_reconnect_backoff_without_waiting_for_the_window() {
+        let controller = Controller::new();
+        let (mut agent, rx) = test_agent(
+            &controller.code,
+            AgentRetryPolicy {
+                connect_window: Duration::from_secs(5),
+                reconnect_window: Duration::from_secs(30),
+                retry_delay: Duration::from_secs(30),
+            },
+        );
+        assert!(wait_until(|| agent.status.snapshot().connected));
+        drop(controller);
+        recv_matching(&rx, |message| matches!(message, InputMsg::Reset));
+        assert!(wait_until(|| !agent.status.snapshot().connected));
+        let started = Instant::now();
+        agent.stop.store(true, Ordering::Release);
+        agent.join.take().unwrap().join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!agent.status.snapshot().running);
+        assert!(agent.status.snapshot().last_error_code.is_none());
+    }
+
+    #[test]
+    fn manual_stop_interrupts_an_incomplete_handshake() {
+        let listener = test_listener();
+        listener.set_nonblocking(true).unwrap();
+        let code =
+            Invite::generate(Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()).encode();
+        let (mut agent, _rx) = test_agent(
+            &code,
+            AgentRetryPolicy {
+                connect_window: Duration::from_secs(30),
+                ..AgentRetryPolicy::default()
+            },
+        );
+        let mut accepted = None;
+        assert!(wait_until(|| {
+            accepted = listener.accept().ok();
+            accepted.is_some()
+        }));
+        let started = Instant::now();
+        agent.stop.store(true, Ordering::Release);
+        agent.join.take().unwrap().join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!agent.status.snapshot().running);
+        assert!(agent.status.snapshot().last_error_code.is_none());
+        drop(accepted);
+    }
+
+    #[test]
     fn wrong_version_and_pairing_code_never_become_online() {
         let controller = Controller::new();
         let invite = Invite::decode(&controller.code).unwrap();
@@ -1367,7 +1675,8 @@ mod tests {
             },
             device(0x51),
             &stop,
-            &Status::default()
+            &Status::default(),
+            Instant::now() + HANDSHAKE_TIMEOUT
         )
         .is_err());
         assert!(controller.worker.status.snapshot().devices.is_empty());

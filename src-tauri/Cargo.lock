@@ -1188,28 +1188,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glidelink"
-version = "0.1.0"
-dependencies = [
- "chacha20poly1305",
- "crossbeam-channel",
- "hmac",
- "if-addrs",
- "log",
- "objc2",
- "objc2-foundation",
- "rand",
- "serde",
- "serde_json",
- "sha2",
- "spake2",
- "tauri",
- "tauri-build",
- "thiserror 2.0.21",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2690,6 +2668,28 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rx-switch"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "crossbeam-channel",
+ "hmac",
+ "if-addrs",
+ "log",
+ "objc2",
+ "objc2-foundation",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "spake2",
+ "tauri",
+ "tauri-build",
+ "thiserror 2.0.21",
+ "windows-sys 0.59.0",
+]
 
 [[package]]
 name = "same-file"

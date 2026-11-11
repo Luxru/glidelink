@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "GlideLink",
+  "productName": "rx-switch",
   "version": "0.1.0",
   "identifier": "io.glidelink.desktop",
   "build": {
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "GlideLink",
+        "title": "rx-switch",
         "width": 1040,
         "height": 760,
         "minWidth": 900,

@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 pub(crate) mod keymap;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_source;
+#[cfg(target_os = "macos")]
+pub use macos_source::initialize;
 #[cfg(windows)]
 mod win;
 
@@ -94,6 +98,11 @@ pub struct KeyOwnership {
 }
 
 impl KeyOwnership {
+    pub fn release_chord_pressed(&self) -> bool {
+        let held = |hid| self.remote.contains(hid) || self.local.contains(hid);
+        (held(0xE0) || held(0xE4)) && (held(0xE2) || held(0xE6))
+    }
+
     pub fn begin(&mut self, held: KeyState) {
         self.remote = KeyState::default();
         self.local = held;
@@ -173,6 +182,9 @@ pub(crate) enum InjectStep {
     KeyPress(u8),
     KeyRelease(u8),
     CapsLock(bool),
+    /// An intentional Caps Lock press. Unlike state repair, this must notify
+    /// the receiver's input system even when its hardware state already agrees.
+    CapsLockTap(bool),
     Reset,
 }
 
@@ -267,7 +279,7 @@ fn apply_event(cursor: &mut InjectCursor, event: InputEvent, out: &mut Vec<Injec
         }
         InputEvent::CapsLock { locked } => {
             if locked != cursor.caps_lock {
-                out.push(InjectStep::CapsLock(locked));
+                out.push(InjectStep::CapsLockTap(locked));
                 cursor.caps_lock = locked;
             }
         }
@@ -674,6 +686,84 @@ mod tests {
     }
 
     #[test]
+    fn release_shortcut_works_when_the_os_never_sees_swallowed_modifiers() {
+        let mut ownership = KeyOwnership::default();
+        assert_eq!(ownership.key_down(true, 0xE0), KeyAction::Down);
+        assert!(!ownership.release_chord_pressed());
+        assert_eq!(ownership.key_down(true, 0xE6), KeyAction::Down);
+        assert!(ownership.release_chord_pressed());
+        ownership.key_up(true, 0xE0);
+        assert!(!ownership.release_chord_pressed());
+        ownership.begin(key_state(&[0xE4]));
+        ownership.key_down(true, 0xE2);
+        assert!(ownership.release_chord_pressed());
+    }
+
+    #[test]
+    fn caps_press_is_distinct_from_reconnect_state_repair_and_not_replayed() {
+        let mut cursor = InjectCursor::default();
+        let repair = InputMsg::Reconcile(ReconcileState {
+            active: true,
+            caps_lock: true,
+            buttons: 0,
+            keys: KeyState::EMPTY,
+        });
+        assert_eq!(
+            plan(&[repair, repair], &mut cursor),
+            vec![InjectStep::CapsLock(true)]
+        );
+        let press = InputMsg::Event(InputEvent::CapsLock { locked: false });
+        assert_eq!(
+            plan(&[press, press], &mut cursor),
+            vec![InjectStep::CapsLockTap(false)]
+        );
+        assert_eq!(
+            plan(
+                &[InputMsg::Reconcile(ReconcileState {
+                    active: true,
+                    caps_lock: false,
+                    buttons: 0,
+                    keys: KeyState::EMPTY,
+                })],
+                &mut cursor
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn state_repair_releases_a_missing_command_up_before_the_next_click() {
+        let mut cursor = InjectCursor::default();
+        let steps = plan(
+            &[
+                InputMsg::Event(InputEvent::Key {
+                    hid: 0xE3,
+                    down: true,
+                }),
+                InputMsg::Reconcile(ReconcileState {
+                    active: true,
+                    caps_lock: false,
+                    buttons: 0,
+                    keys: KeyState::EMPTY,
+                }),
+                down(BUTTON_LEFT),
+            ],
+            &mut cursor,
+        );
+        assert_eq!(
+            steps,
+            vec![
+                InjectStep::KeyPress(0xE3),
+                InjectStep::KeyRelease(0xE3),
+                InjectStep::Buttons {
+                    from: 0,
+                    to: BUTTON_LEFT
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn every_semantic_command_is_a_motion_barrier() {
         for command in [
             InputMsg::Event(InputEvent::Key {
@@ -734,7 +824,7 @@ mod tests {
         assert_eq!(
             steps,
             vec![
-                InjectStep::CapsLock(true),
+                InjectStep::CapsLockTap(true),
                 InjectStep::KeyPress(0x04),
                 InjectStep::Buttons {
                     from: 0,
