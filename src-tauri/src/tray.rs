@@ -30,6 +30,9 @@ fn show_about(app: &AppHandle) -> tauri::Result<()> {
         if let Some(window) = app.get_webview_window("about") {
             window.emit("rx-switch:about-open", ())?;
         }
+        // Content is already populated. Show immediately, including a click
+        // arriving while the frontend is receiving its initial ready reply.
+        about_ready(app)?;
     }
     Ok(())
 }
