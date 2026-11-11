@@ -33,5 +33,5 @@ TCP loss can delay input during retransmission; position merging only reduces ap
 - `net/`: sessions, handshake, TCP framing, encryption, and heartbeat.
 - `layout.rs`: world coordinates, routing, and layout.
 - `config.rs`, `state.rs`: settings and runtime lifecycle.
-- `tray.rs`: tray menus, window restoration, and menu language.
+- `tray.rs`: tray menus, window restoration, and menu language. macOS uses an SF Symbol template image; closing the window switches to Accessory activation policy to hide its Dock icon, and restoring the window switches back to Regular.
 - `ui/`: HTML, CSS, and JavaScript interface.

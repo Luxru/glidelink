@@ -38,7 +38,6 @@
       "status.online": "在线",
       "status.offline": "离线",
 
-      "common.minimizeToTray": "收起到托盘",
       "common.stop": "停止",
       "common.notConnected": "未连接",
       "common.waitingConnection": "等待连接",
@@ -72,8 +71,6 @@
       "settings.adaptModifiers": "自动对应 ⌘ / Ctrl",
       "settings.releaseShortcut": "释放控制",
       "settings.releaseShortcutValue": "Ctrl + Alt + Backspace",
-      "settings.windowGroup": "窗口",
-      "settings.closeToTray": "关闭窗口后在托盘继续运行",
       "settings.networkGroup": "网络",
       "logs.group": "运行日志",
       "logs.level": "日志级别",
@@ -223,7 +220,6 @@
       "status.online": "Online",
       "status.offline": "Offline",
 
-      "common.minimizeToTray": "Minimize to tray",
       "common.stop": "Stop",
       "common.notConnected": "Not connected",
       "common.waitingConnection": "Waiting for connection",
@@ -257,8 +253,6 @@
       "settings.adaptModifiers": "Auto-map ⌘ / Ctrl",
       "settings.releaseShortcut": "Release control",
       "settings.releaseShortcutValue": "Ctrl + Alt + Backspace",
-      "settings.windowGroup": "Window",
-      "settings.closeToTray": "Keep running in tray when the window closes",
       "settings.networkGroup": "Network",
       "logs.group": "Runtime logs",
       "logs.level": "Log level",

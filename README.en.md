@@ -17,7 +17,7 @@ Initial connection attempts last up to 5 seconds. An established session release
 
 Allow the controller's TCP listening port through the firewall. On macOS, grant Accessibility permission. Treat the pairing code as a connection credential and use it only on trusted LANs.
 
-Use “Minimize to tray” to hide the window while a session continues. Closing the window also keeps it running by default; change this under Settings → Window. The tray menu can show the window, stop the session, or quit.
+Closing the window keeps the session running in the tray. On macOS, a monochrome menu-bar icon adapts to the system appearance, and the Dock icon hides while the window is closed. Use the tray menu to restore the window and Dock icon, stop the session, or quit.
 
 rx-switch was previously named GlideLink. Its application identifier and settings directory are retained to preserve permissions, pairing, and layouts. Settings live in `~/.glidelink/settings.json` (Windows: `C:\Users\<you>\.glidelink\settings.json`). The UI provides log viewing, level selection, and copying.
 

@@ -33,5 +33,5 @@ TCP 丢包时会等待重传，位置合并只能减少应用积压。监听端�
 - `net/`：会话、握手、TCP 分帧、加密和心跳。
 - `layout.rs`：世界坐标、目标切换和布局。
 - `config.rs`、`state.rs`：设置和运行生命周期。
-- `tray.rs`：托盘菜单、窗口恢复与界面语言同步。
+- `tray.rs`：托盘菜单、窗口恢复与界面语言同步。macOS 使用 SF Symbol 模板图标；关闭窗口切换到 Accessory 模式以隐藏 Dock 图标，恢复窗口切回 Regular 模式。
 - `ui/`：HTML、CSS 和 JavaScript 界面。

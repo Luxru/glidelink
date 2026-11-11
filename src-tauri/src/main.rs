@@ -172,11 +172,6 @@ fn open_permissions() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn minimize_to_tray(window: tauri::WebviewWindow) -> Result<(), String> {
-    window.hide().map_err(|err| err.to_string())
-}
-
-#[tauri::command]
 fn set_tray_language(app: tauri::AppHandle, language: String) {
     tray::update_language(&app, &language);
 }
@@ -236,19 +231,8 @@ fn main() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let close_to_tray = window
-                    .state::<AppState>()
-                    .config
-                    .snapshot()
-                    .map(|config| config.close_to_tray)
-                    .unwrap_or(true);
-                if close_to_tray {
-                    // Keep a visible window if hiding unexpectedly fails.
-                    if let Err(err) = window.hide() {
-                        log::error!("could not hide window: {err}");
-                    }
-                } else {
-                    window.app_handle().exit(0);
+                if let Err(err) = tray::hide_window(window) {
+                    log::error!("could not hide window in the tray: {err}");
                 }
             }
         })
@@ -263,7 +247,6 @@ fn main() {
             get_logs,
             clear_logs,
             reopen_app,
-            minimize_to_tray,
             set_tray_language
         ])
         .build(tauri::generate_context!())

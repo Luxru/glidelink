@@ -20,10 +20,23 @@ fn labels(language: &str) -> [&'static str; 3] {
 
 pub fn show_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        #[cfg(target_os = "macos")]
+        if let Err(err) = app.set_activation_policy(tauri::ActivationPolicy::Regular) {
+            log::error!("could not restore Dock visibility: {err}");
+        }
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+pub fn hide_window(window: &tauri::Window) -> tauri::Result<()> {
+    window.hide()?;
+    #[cfg(target_os = "macos")]
+    window
+        .app_handle()
+        .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+    Ok(())
 }
 
 pub fn update_language(app: &AppHandle, language: &str) {
@@ -66,6 +79,13 @@ pub fn setup(app: &AppHandle, language: &str) -> tauri::Result<()> {
                 show_window(tray.app_handle());
             }
         });
+    #[cfg(target_os = "macos")]
+    {
+        tray = tray
+            .icon(tauri::include_image!("icons/tray-template.png"))
+            .icon_as_template(true);
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Some(icon) = app.default_window_icon() {
         tray = tray.icon(icon.clone());
     }
