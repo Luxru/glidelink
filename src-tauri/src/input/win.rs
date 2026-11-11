@@ -745,7 +745,7 @@ pub fn permissions() -> super::InputPermissions {
     }
 }
 
-pub fn open_permissions(_role: crate::config::Role) -> Result<(), String> {
+pub fn open_permissions() -> Result<(), String> {
     Ok(())
 }
 

@@ -34,7 +34,6 @@ const els = {
   deviceCount: document.getElementById("deviceCount"),
   permissionCard: document.getElementById("permissionCard"),
   permissionBtn: document.getElementById("permissionBtn"),
-  reopenBtn: document.getElementById("reopenBtn"),
   copyPasscode: document.getElementById("copyPasscode"),
   sessionState: document.getElementById("sessionState"),
   statsRole: document.getElementById("statsRole"),
@@ -243,10 +242,8 @@ function translateError(raw) {
 
 function permissionErrorResolved(raw, permissions) {
   const code = String(raw || "").split("|")[0];
-  if (code === "E_MAC_PERMISSIONS_CAPTURE") return permissions?.capture === true;
-  if (code === "E_MAC_PERMISSIONS_INJECT") return permissions?.inject === true;
-  return code === "errors.PERMISSIONS_BLOCKED"
-    && (ui.role === "agent" ? permissions?.inject : permissions?.capture) === true;
+  return permissions?.capture === true && permissions?.inject === true
+    && ["E_MAC_PERMISSIONS_CAPTURE", "E_MAC_PERMISSIONS_INJECT", "errors.PERMISSIONS_BLOCKED"].includes(code);
 }
 
 function showToast(message) {
@@ -860,8 +857,8 @@ function applyState(state) {
 
   if (ui.running) setDisabledControls(true);
 
-  const permissionGranted = ui.role === "agent" ? permissions?.inject : permissions?.capture;
-  const permissionBlocked = platform === "macos" && permissionGranted === false;
+  const permissionBlocked = platform === "macos"
+    && (permissions?.capture === false || permissions?.inject === false);
   els.permissionCard.hidden = !permissionBlocked;
   if (permissionErrorResolved(ui.startError, permissions)) setError(null);
 
@@ -1147,15 +1144,7 @@ function initEvents() {
   els.stopBtn.addEventListener("click", stopSession);
   els.permissionBtn.addEventListener("click", async () => {
     try {
-      await invoke("open_permissions", { role: ui.role });
-    } catch (error) {
-      setError(errorToRaw(error));
-    }
-  });
-
-  els.reopenBtn.addEventListener("click", async () => {
-    try {
-      await invoke("reopen_app");
+      await invoke("open_permissions");
     } catch (error) {
       setError(errorToRaw(error));
     }
@@ -1184,6 +1173,10 @@ function initEvents() {
       if (ui.running || ui.loading) return;
       els.form.requestSubmit();
     }
+  });
+  window.addEventListener("focus", refresh);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refresh();
   });
 }
 

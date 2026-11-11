@@ -349,8 +349,8 @@ fn post_event_access() -> bool {
 pub fn permissions() -> super::InputPermissions {
     let capture = accessibility_trusted();
     let inject = post_event_access();
-    // Capture and posting have separate authoritative checks. An agent never
-    // uses AXUIElement or an event tap, so AX trust must not gate its injector.
+    // Read both capabilities on every check so the UI follows permission
+    // changes while the application remains open.
     static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
     let bits = u8::from(capture) | (u8::from(inject) << 1);
     if LAST.swap(bits, Ordering::AcqRel) != bits {
@@ -364,8 +364,8 @@ pub fn permissions() -> super::InputPermissions {
     super::InputPermissions { capture, inject }
 }
 
-/// Ask macOS to show its permission prompt. Returns the current accessibility
-/// status; the user's answer is asynchronous and usually requires a relaunch.
+/// Ask macOS to show its permission prompt. The user's answer is asynchronous;
+/// subsequent permission checks pick up the updated status.
 fn request_accessibility_prompt() -> bool {
     unsafe {
         let key = kAXTrustedCheckOptionPrompt;
@@ -380,17 +380,16 @@ fn request_accessibility_prompt() -> bool {
     }
 }
 
-pub fn open_permissions(role: crate::config::Role) -> Result<(), String> {
+pub fn open_permissions() -> Result<(), String> {
     // Both our filtering tap and event posting use Accessibility. Requesting
     // ListenEvent separately can send users to an empty/unnecessary pane.
-    match role {
-        crate::config::Role::Controller if !accessibility_trusted() => {
-            let _ = request_accessibility_prompt();
-        }
-        crate::config::Role::Agent if !post_event_access() => unsafe {
+    if !accessibility_trusted() {
+        let _ = request_accessibility_prompt();
+    }
+    if !post_event_access() {
+        unsafe {
             CGRequestPostEventAccess();
-        },
-        _ => {}
+        }
     }
     let pane = "Privacy_Accessibility";
 
@@ -1231,7 +1230,8 @@ pub fn start_injector(
     stop: Arc<AtomicBool>,
     _status: Status,
 ) -> Result<JoinHandle<()>, String> {
-    if !post_event_access() {
+    let granted = permissions();
+    if !granted.capture || !granted.inject {
         return Err(error::code("E_MAC_PERMISSIONS_INJECT"));
     }
     let bounds = virtual_bounds().ok_or_else(|| error::code("E_MAC_DISPLAYS"))?;
@@ -1918,7 +1918,7 @@ pub fn self_test() -> bool {
         ok = false;
     }
 
-    if post {
+    if ax && post {
         match test_injection(bounds) {
             Ok(()) => println!("injection:              PASS"),
             Err(e) => {
@@ -1941,9 +1941,9 @@ pub fn self_test() -> bool {
             }
         }
     } else {
-        println!("injection:              SKIP (needs event posting)");
-        println!("caps lock:              SKIP (needs event posting)");
-        println!("modifiers:              SKIP (needs event posting)");
+        println!("injection:              SKIP (needs Accessibility + event posting)");
+        println!("caps lock:              SKIP (needs Accessibility + event posting)");
+        println!("modifiers:              SKIP (needs Accessibility + event posting)");
         ok = false;
     }
 
@@ -1954,7 +1954,7 @@ pub fn self_test() -> bool {
         println!("result: FAIL");
         println!();
         println!("Open System Settings -> Privacy & Security and grant rx-switch the");
-        println!("permissions reported above, then relaunch and rerun this test.");
+        println!("permissions reported above, then rerun this test.");
     }
     ok
 }

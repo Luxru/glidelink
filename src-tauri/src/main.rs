@@ -156,19 +156,14 @@ fn clear_logs() {
 }
 
 #[tauri::command]
-fn reopen_app(app: tauri::AppHandle) {
-    app.restart()
-}
-
-#[tauri::command]
 fn stop_session(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.engine.stop();
     Ok(())
 }
 
 #[tauri::command]
-fn open_permissions(role: Role) -> Result<(), String> {
-    input::open_permissions(role)
+fn open_permissions() -> Result<(), String> {
+    input::open_permissions()
 }
 
 #[tauri::command]
@@ -282,7 +277,6 @@ fn main() {
             preview_pairing_code,
             get_logs,
             clear_logs,
-            reopen_app,
             set_tray_language,
             close_about,
             get_about,

@@ -48,9 +48,8 @@
 
       "error.title": "无法开始",
       "permission.title": "需要 macOS 辅助功能权限",
-      "permission.text": "在辅助功能中允许 rx-switch 控制键盘和鼠标。若已勾选仍提示，请移除该项，重新添加当前应用后再打开软件。",
+      "permission.text": "在辅助功能中允许 rx-switch 控制键盘和鼠标，授权状态会自动检测并更新。",
       "permission.open": "打开系统设置",
-      "permission.reopen": "重新打开",
 
       "session.lede": "选择这台电脑的角色，两台设备使用相同的配对码建立一条仅限局域网的会话。",
       "roles.group": "设备角色",
@@ -236,9 +235,8 @@
 
       "error.title": "Could not start",
       "permission.title": "macOS Accessibility permission required",
-      "permission.text": "Allow rx-switch in Accessibility. If it is already enabled, remove the entry, add the current app again, then reopen it.",
+      "permission.text": "Allow rx-switch in Accessibility. Permission status updates automatically.",
       "permission.open": "Open System Settings",
-      "permission.reopen": "Reopen",
 
       "session.lede": "Choose this computer's role. Both devices use the same pairing code to create a local-only session.",
       "roles.group": "Device role",

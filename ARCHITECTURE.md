@@ -11,7 +11,7 @@
 - 输入统一为位置、离散事件和状态快照。连续位置可合并；其他消息先提交前面的位置，保留点击、拖动和按键顺序。
 - 每 500ms 同步状态。切屏释放旧目标，传递鼠标键和 Caps 状态；仍按住的键盘键需重新按下。
 - 断线或会话异常时释放输入并返回本机。重连从 inactive 开始，旧会话消息不会进入新会话。
-- Windows 使用低层钩子捕获、绝对 `SendInput` 注入；Raw Input 只判断本机边缘移动方向。Tauri 的设备事件过滤设为 `Always`，由捕获线程独立注册 Raw Input，避免窗口焦点影响键盘钩子。macOS 控制端用 `AXIsProcessTrusted` 检查事件捕获权限，被控端用 `CGPreflightPostEventAccess` 检查注入权限；界面按角色提示，权限生效后清除对应的旧错误。
+- Windows 使用低层钩子捕获、绝对 `SendInput` 注入；Raw Input 只判断本机边缘移动方向。Tauri 的设备事件过滤设为 `Always`，由捕获线程独立注册 Raw Input，避免窗口焦点影响键盘钩子。macOS 使用 `CGEventTap` 和 `CGEventPost`，统一申请、检测辅助功能及事件注入权限；界面持续刷新状态，权限生效后清除对应的旧错误。
 - Caps Lock 按键与锁定状态修正分开处理。macOS 启用 Caps Lock 切换输入源时，按键在主线程通过 TIS 切换到最近使用的 ASCII / 非 ASCII 输入源，注入线程等待结果并支持取消；状态同步只修正锁定值。普通锁定通知使用原生 `FlagsChanged`。
 - macOS 的键盘、鼠标与滚轮共用私有事件源，每个事件显式携带同一份修饰键状态；修饰键松开按实际 key-up 构造后发送 `FlagsChanged`，避免键盘已释放而鼠标仍继承 Cmd。
 

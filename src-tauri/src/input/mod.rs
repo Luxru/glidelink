@@ -491,7 +491,7 @@ mod unsupported {
         }
     }
 
-    pub fn open_permissions(_role: crate::config::Role) -> Result<(), String> {
+    pub fn open_permissions() -> Result<(), String> {
         Err(crate::error::code("E_UNSUPPORTED"))
     }
 
