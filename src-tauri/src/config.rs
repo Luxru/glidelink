@@ -167,9 +167,8 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Keep settings that `start_session` does not own. The UI sends a full
-    /// config record, but older clients (and controller starts) omit the
-    /// language and the agent-only interface choice.
+    /// Keep persisted settings omitted by the session form, including the
+    /// stable device identity, saved layout, log level, and other role's code.
     pub fn inherit_persisted_settings(&mut self, previous: &AppConfig) {
         if self.language.trim().is_empty() {
             self.language = previous.language.clone();
@@ -240,22 +239,6 @@ fn normalize_language(value: &str) -> String {
     }
 }
 
-pub fn load_or_migrate(
-    settings_path: &Path,
-    previous_path: Option<&Path>,
-) -> Result<AppConfig, String> {
-    if !settings_path.exists() {
-        if let Some(previous) = previous_path.filter(|path| path.is_file()) {
-            let mut config = read(previous)?;
-            config.normalize();
-            config.ensure_device_id();
-            save(settings_path, &config)?;
-            log::info!("migrated settings to rx-switch");
-        }
-    }
-    load_or_create(settings_path)
-}
-
 pub fn load_or_create(settings_path: &Path) -> Result<AppConfig, String> {
     if settings_path.exists() {
         let mut config = match read(settings_path) {
@@ -270,7 +253,7 @@ pub fn load_or_create(settings_path: &Path) -> Result<AppConfig, String> {
         if config.ensure_device_id() {
             let _ = save(settings_path, &config);
         }
-        // Drop unknown fields from older formats.
+        // Persist normalized settings.
         let _ = save(settings_path, &config);
         return Ok(config);
     }
@@ -317,15 +300,8 @@ mod tests {
     }
 
     #[test]
-    fn old_config_fields_get_safe_defaults() {
-        let old = r#"{
-            "role": "agent",
-            "peerAddr": "192.168.1.42:45890",
-            "listenPort": 45890,
-            "passcode": "oldlongpasscode",
-            "edge": "right"
-        }"#;
-        let cfg: AppConfig = serde_json::from_str(old).expect("old config parses");
+    fn optional_settings_use_defaults() {
+        let cfg: AppConfig = serde_json::from_str(r#"{"role":"agent"}"#).unwrap();
         assert!(cfg.local_ip.is_empty());
         assert!(cfg.layout.is_empty());
         assert!(cfg.device_id.is_empty());
@@ -453,51 +429,6 @@ mod tests {
         assert_eq!(recovered.role, Role::Controller);
 
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn migrates_settings_without_changing_identity_or_previous_file() {
-        let dir = test_dir("migrate");
-        let previous = dir.join("previous/settings.json");
-        let current = dir.join("rx-switch/settings.json");
-        let mut config = AppConfig {
-            role: Role::Agent,
-            language: "zh".into(),
-            last_pairing_code: "saved-pairing-code".into(),
-            ..AppConfig::default()
-        };
-        config.ensure_device_id();
-        save(&previous, &config).unwrap();
-        let original = fs::read(&previous).unwrap();
-        let migrated = load_or_migrate(&current, Some(&previous)).unwrap();
-        assert_eq!(migrated.device_id, config.device_id);
-        assert_eq!(migrated.last_pairing_code, config.last_pairing_code);
-        assert_eq!(migrated.language, "zh");
-        assert_eq!(migrated.role, Role::Agent);
-        assert_eq!(fs::read(&previous).unwrap(), original);
-        assert!(current.is_file());
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn migration_keeps_new_settings_and_does_not_replace_corrupt_previous_data() {
-        let dir = test_dir("migration-priority");
-        let previous = dir.join("previous.json");
-        let current = dir.join("current.json");
-        fs::write(&previous, "{invalid").unwrap();
-        assert!(load_or_migrate(&current, Some(&previous)).is_err());
-        assert!(!current.exists());
-        assert_eq!(fs::read_to_string(&previous).unwrap(), "{invalid");
-        let mut config = AppConfig {
-            language: "en".into(),
-            ..AppConfig::default()
-        };
-        config.ensure_device_id();
-        save(&current, &config).unwrap();
-        let loaded = load_or_migrate(&current, Some(&previous)).unwrap();
-        assert_eq!(loaded.device_id, config.device_id);
-        assert_eq!(loaded.language, "en");
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

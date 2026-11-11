@@ -37,24 +37,23 @@ const els = {
   reopenBtn: document.getElementById("reopenBtn"),
   copyPasscode: document.getElementById("copyPasscode"),
   sessionState: document.getElementById("sessionState"),
-  aboutRole: document.getElementById("aboutRole"),
-  aboutState: document.getElementById("aboutState"),
-  aboutDuration: document.getElementById("aboutDuration"),
-  aboutPeer: document.getElementById("aboutPeer"),
-  aboutDeviceCount: document.getElementById("aboutDeviceCount"),
-  aboutPeerPlatform: document.getElementById("aboutPeerPlatform"),
-  aboutLinkState: document.getElementById("aboutLinkState"),
-  aboutRtt: document.getElementById("aboutRtt"),
-  aboutJitter: document.getElementById("aboutJitter"),
-  aboutLoss: document.getElementById("aboutLoss"),
-  aboutRate: document.getElementById("aboutRate"),
-  aboutLocalScreen: document.getElementById("aboutLocalScreen"),
-  aboutRemoteScreen: document.getElementById("aboutRemoteScreen"),
-  aboutPacketsSent: document.getElementById("aboutPacketsSent"),
-  aboutPacketsReceived: document.getElementById("aboutPacketsReceived"),
-  aboutBytesSent: document.getElementById("aboutBytesSent"),
-  aboutBytesReceived: document.getElementById("aboutBytesReceived"),
-  aboutBuild: document.getElementById("aboutBuild"),
+  statsRole: document.getElementById("statsRole"),
+  statsState: document.getElementById("statsState"),
+  statsDuration: document.getElementById("statsDuration"),
+  statsPeer: document.getElementById("statsPeer"),
+  statsDeviceCount: document.getElementById("statsDeviceCount"),
+  statsPeerPlatform: document.getElementById("statsPeerPlatform"),
+  statsLinkState: document.getElementById("statsLinkState"),
+  statsRtt: document.getElementById("statsRtt"),
+  statsJitter: document.getElementById("statsJitter"),
+  statsLoss: document.getElementById("statsLoss"),
+  statsRate: document.getElementById("statsRate"),
+  statsLocalScreen: document.getElementById("statsLocalScreen"),
+  statsRemoteScreen: document.getElementById("statsRemoteScreen"),
+  statsPacketsSent: document.getElementById("statsPacketsSent"),
+  statsPacketsReceived: document.getElementById("statsPacketsReceived"),
+  statsBytesSent: document.getElementById("statsBytesSent"),
+  statsBytesReceived: document.getElementById("statsBytesReceived"),
   logLevel: document.getElementById("logLevel"),
   logPanel: document.getElementById("logPanel"),
   logCount: document.getElementById("logCount"),
@@ -102,7 +101,7 @@ const PAGES = {
   layout: "page.layout.title",
   settings: "page.settings.title",
   logs: "page.logs.title",
-  about: "page.about.title",
+  stats: "page.stats.title",
 };
 
 const PAIRING_CODE_LENGTH = 20;
@@ -175,41 +174,40 @@ function sessionStateLabel() {
   return status.connected ? t("status.connected") : t("status.waitingPeer");
 }
 
-function updateAboutStats(status) {
+function updateStats(status) {
   const running = Boolean(status?.running);
   const connected = Boolean(status?.connected);
   const latency = status?.latencyMs == null ? null : Number(status.latencyMs);
-  els.aboutRole.textContent = ui.role === "agent" ? t("role.agent") : t("role.controller");
-  els.aboutState.textContent = sessionStateLabel();
-  els.aboutDuration.textContent = running && status?.startedAtMs
+  els.statsRole.textContent = ui.role === "agent" ? t("role.agent") : t("role.controller");
+  els.statsState.textContent = sessionStateLabel();
+  els.statsDuration.textContent = running && status?.startedAtMs
     ? formatDuration(Date.now() - status.startedAtMs)
     : "—";
-  els.aboutPeer.textContent = status?.peer || "—";
-  els.aboutDeviceCount.textContent = String(Array.isArray(status?.devices) ? status.devices.length : 0);
+  els.statsPeer.textContent = status?.peer || "—";
+  els.statsDeviceCount.textContent = String(Array.isArray(status?.devices) ? status.devices.length : 0);
   const peerPlatform = { 1: "platform.macos", 2: "platform.windows" }[status?.peerPlatform];
-  els.aboutPeerPlatform.textContent = peerPlatform ? t(peerPlatform) : "—";
-  els.aboutLinkState.textContent = connected
+  els.statsPeerPlatform.textContent = peerPlatform ? t(peerPlatform) : "—";
+  els.statsLinkState.textContent = connected
     ? t("status.connected")
     : running
       ? t("status.waiting")
       : t("status.notRunning");
-  els.aboutRtt.textContent = latency == null ? "—" : `${latency.toFixed(1)} ms`;
-  els.aboutJitter.textContent = status?.jitterMs == null
+  els.statsRtt.textContent = latency == null ? "—" : `${latency.toFixed(1)} ms`;
+  els.statsJitter.textContent = status?.jitterMs == null
     ? "—"
     : `${Number(status.jitterMs).toFixed(1)} ms`;
-  els.aboutLoss.textContent = status?.packetLossPercent == null
+  els.statsLoss.textContent = status?.packetLossPercent == null
     ? "—"
     : `${Number(status.packetLossPercent).toFixed(1)} %`;
-  els.aboutRate.textContent = status?.inputIntervalMs == null
+  els.statsRate.textContent = status?.inputIntervalMs == null
     ? "—"
     : `${Number(status.inputIntervalMs).toFixed(1)} ms`;
-  els.aboutLocalScreen.textContent = formatScreen(status?.localScreen);
-  els.aboutRemoteScreen.textContent = formatScreen(status?.remoteScreen);
-  els.aboutPacketsSent.textContent = formatCount(status?.packetsSent);
-  els.aboutPacketsReceived.textContent = formatCount(status?.packetsReceived);
-  els.aboutBytesSent.textContent = formatBytes(status?.bytesSent);
-  els.aboutBytesReceived.textContent = formatBytes(status?.bytesReceived);
-  els.aboutBuild.textContent = ui.lastState?.build || "—";
+  els.statsLocalScreen.textContent = formatScreen(status?.localScreen);
+  els.statsRemoteScreen.textContent = formatScreen(status?.remoteScreen);
+  els.statsPacketsSent.textContent = formatCount(status?.packetsSent);
+  els.statsPacketsReceived.textContent = formatCount(status?.packetsReceived);
+  els.statsBytesSent.textContent = formatBytes(status?.bytesSent);
+  els.statsBytesReceived.textContent = formatBytes(status?.bytesReceived);
 }
 
 function errorToRaw(error) {
@@ -268,6 +266,7 @@ function updatePageChrome() {
 
 function setPage(page) {
   if (!PAGES[page]) return;
+  window.AppSelect.close();
   ui.page = page;
   for (const section of document.querySelectorAll(".page")) {
     section.hidden = section.dataset.page !== page;
@@ -702,6 +701,7 @@ function updateSettingsControls() {
   const busy = ui.running || ui.loading;
   els.adaptModifiers.disabled = busy;
   els.interfaceSelect.disabled = busy;
+  window.AppSelect.sync(els.interfaceSelect);
 }
 
 function syncLanguage(configLanguage) {
@@ -710,7 +710,6 @@ function syncLanguage(configLanguage) {
   const fromSettings = configLanguage === "zh" || configLanguage === "en"
     ? configLanguage
     : "";
-  const cached = i18n.getStoredLocale();
   ui.languageSyncGuard = true;
   try {
     if (fromSettings) {
@@ -718,13 +717,12 @@ function syncLanguage(configLanguage) {
       i18n.setLocale(fromSettings);
     } else {
       ui.language = i18n.getLocale();
-      // Import an explicit choice made in a pre-settings build once.
-      if (cached) saveSettings({ language: cached });
     }
   } finally {
     ui.languageSyncGuard = false;
   }
   els.languageSelect.value = ui.language;
+  window.AppSelect.sync();
 }
 
 function syncTrayLanguage() {
@@ -745,6 +743,7 @@ function revertSettingsFromSaved() {
     i18n.setLocale(config.language);
   }
   els.languageSelect.value = ui.language;
+  window.AppSelect.sync();
 }
 
 async function saveSettings(patch) {
@@ -760,6 +759,7 @@ async function saveSettings(patch) {
         ui.language = config.language;
         els.languageSelect.value = config.language;
       }
+      window.AppSelect.sync();
       return config;
     })
     .catch((error) => {
@@ -914,7 +914,8 @@ function applyState(state) {
     els.errorBanner.hidden = true;
   }
 
-  updateAboutStats(status);
+  window.AppSelect.sync();
+  updateStats(status);
 }
 
 async function refreshLogs() {

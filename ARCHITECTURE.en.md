@@ -1,8 +1,8 @@
 # rx-switch Architecture
 
-[Chinese](ARCHITECTURE.md) | [Usage and build](README.en.md)
+[Chinese](ARCHITECTURE.md) | [Features](README.en.md)
 
-Application 0.1.0, protocol v2, unreleased. The controller captures and routes input; agents receive and inject it. Device identity and layout persist, while each connection gets a fresh session.
+Application 0.1.0, protocol v1, unreleased. The controller captures and routes input; agents receive and inject it. Device identity and layout persist, while each connection gets a fresh session.
 
 ## Input
 
@@ -23,7 +23,7 @@ Frames contain a big-endian `u16` length followed by a protocol packet, limited 
 
 The controller sends heartbeats every 100 ms to the active target and every 500 ms to other agents. Agents send every 500 ms; 3 seconds without messages ends the connection. Send queues have capacity and timeout limits. Logs report queue state and injection timing; the UI shows RTT and RTT variation, without estimating IP packet loss.
 
-Initial agent connection attempts share a 5-second window. After an authenticated link disconnects, input is released on detection and recovery lasts up to 30 seconds, with a 1-second delay after each failed attempt. TCP connection and handshake waits share the same deadline; failed attempts never extend it. The user can stop from the window or tray at any time. Expiry ends the session, preserves an actionable error, and reaps old workers so a new pairing code can be used.
+Initial agent connection attempts share a 5-second window. After an authenticated link disconnects, input is released on detection and recovery lasts up to 30 seconds, with a 1-second delay after each failed attempt. TCP connection and handshake waits share the same deadline; failed attempts never extend it. The user can stop from the window at any time. Expiry ends the session, preserves an actionable error, and reaps old workers so a new pairing code can be used.
 
 TCP loss can delay input during retransmission; position merging only reduces application backlog. Listening ports are chosen from 45890–45999. Both endpoints use the same build.
 
@@ -33,5 +33,5 @@ TCP loss can delay input during retransmission; position merging only reduces ap
 - `net/`: sessions, handshake, TCP framing, encryption, and heartbeat.
 - `layout.rs`: world coordinates, routing, and layout.
 - `config.rs`, `state.rs`: settings and runtime lifecycle.
-- `tray.rs`: tray menus, window restoration, and menu language. macOS uses an SF Symbol template image; closing the window switches to Accessory activation policy to hide its Dock icon, and restoring the window switches back to Regular.
+- `tray.rs`: left-click restores the main window; the right-click menu offers About and Quit, with labels following the UI language. macOS uses an SF Symbol template image; closing the main window switches to Accessory activation policy to hide its Dock icon, and restoring it switches back to Regular. About is a separate Webview showing version, build, and system information.
 - `ui/`: HTML, CSS, and JavaScript interface.

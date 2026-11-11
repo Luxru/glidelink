@@ -44,8 +44,8 @@ const SLOW_INPUT_INTERVAL: Duration = Duration::from_millis(8);
 const MAX_PEERS: usize = 8;
 const MAX_PENDING: usize = 8;
 const POLL_BUDGET: usize = 64;
-const PAKE_ID_CONTROLLER: &[u8] = b"rx-switch v2 controller";
-const PAKE_ID_AGENT: &[u8] = b"rx-switch v2 agent";
+const PAKE_ID_CONTROLLER: &[u8] = b"rx-switch v1 controller";
+const PAKE_ID_AGENT: &[u8] = b"rx-switch v1 agent";
 
 type NetResult<T> = Result<T, String>;
 

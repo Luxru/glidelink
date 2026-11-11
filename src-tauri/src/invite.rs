@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 /// Crockford base32: unambiguous digits and uppercase letters.
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 pub const CODE_LEN: usize = 20;
-const VERSION: u8 = 2;
+const VERSION: u8 = 1;
 pub const PORT_RANGE_START: u16 = 45_890;
 pub const PORT_RANGE_END: u16 = 45_999;
 

@@ -176,6 +176,14 @@ fn set_tray_language(app: tauri::AppHandle, language: String) {
     tray::update_language(&app, &language);
 }
 
+#[tauri::command]
+fn close_about(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("about") {
+        window.close().map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
 fn main() {
     logging::init("info");
 
@@ -192,15 +200,11 @@ fn main() {
         // own mouse INPUTSINK registration and dedicated message loop.
         .device_event_filter(tauri::DeviceEventFilter::Always)
         .setup(|app| {
-            let (settings_path, previous_settings) = match app.path().home_dir() {
-                Ok(home) => (
-                    home.join(".rx-switch").join("settings.json"),
-                    // Read-only migration from the previous product name.
-                    Some(home.join(".glidelink").join("settings.json")),
-                ),
+            let settings_path = match app.path().home_dir() {
+                Ok(home) => home.join(".rx-switch").join("settings.json"),
                 Err(err) => {
                     log::warn!("home directory unavailable ({err}); using app config dir");
-                    (app.path().app_config_dir()?.join("settings.json"), None)
+                    app.path().app_config_dir()?.join("settings.json")
                 }
             };
             let screen = input::screen_info();
@@ -213,8 +217,7 @@ fn main() {
                 input::permissions_ok()
             );
 
-            let config = match config::load_or_migrate(&settings_path, previous_settings.as_deref())
-            {
+            let config = match config::load_or_create(&settings_path) {
                 Ok(config) => config,
                 Err(load_error) => {
                     log::error!("{load_error}");
@@ -233,6 +236,9 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 if let Err(err) = tray::hide_window(window) {
@@ -251,7 +257,8 @@ fn main() {
             get_logs,
             clear_logs,
             reopen_app,
-            set_tray_language
+            set_tray_language,
+            close_about
         ])
         .build(tauri::generate_context!())
         .expect("failed to build rx-switch");

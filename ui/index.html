@@ -30,6 +30,12 @@
           </span>
           <span data-i18n="nav.layout">Display Layout</span>
         </button>
+        <button class="nav-item" type="button" data-page-target="stats">
+          <span class="nav-icon nav-gray" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none"><path d="M3 16.5h14M5.5 13V9M10 13V4M14.5 13V6.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </span>
+          <span data-i18n="nav.stats">Statistics</span>
+        </button>
         <button class="nav-item" type="button" data-page-target="logs">
           <span class="nav-icon nav-gray" aria-hidden="true">
             <svg viewBox="0 0 20 20" fill="none"><rect x="2.7" y="3.4" width="14.6" height="13.2" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 7.2l2.4 2.3-2.4 2.3M10 12h4.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -42,16 +48,10 @@
           </span>
           <span data-i18n="nav.settings">Settings</span>
         </button>
-        <button class="nav-item" type="button" data-page-target="about">
-          <span class="nav-icon nav-gray" aria-hidden="true">
-            <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7.1" stroke="currentColor" stroke-width="1.5"/><path d="M10 9v4.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="10" cy="6.6" r="1.05" fill="currentColor"/></svg>
-          </span>
-          <span data-i18n="nav.about">About</span>
-        </button>
       </nav>
 
       <div class="sidebar-footer">
-        <div class="sidebar-version">rx-switch 0.1.0</div>
+        <div class="sidebar-version">rx-switch 0.1</div>
       </div>
     </aside>
 
@@ -206,7 +206,7 @@
             <div class="group-card">
               <div class="setting-row">
                 <label for="languageSelect" data-i18n="settings.language">Interface language</label>
-                <select id="languageSelect" class="control-input interface-select" data-i18n-aria-label="settings.language" aria-label="Interface language">
+                <select id="languageSelect" hidden data-i18n-aria-label="settings.language" aria-label="Interface language">
                   <option value="zh" data-i18n="language.zh">Chinese</option>
                   <option value="en" data-i18n="language.en">English</option>
                 </select>
@@ -234,7 +234,7 @@
             <div class="group-card">
               <div class="setting-row">
                 <label for="interfaceSelect" data-i18n="settings.interface">Network interface</label>
-                <select id="interfaceSelect" class="control-input interface-select"></select>
+                <select id="interfaceSelect" hidden></select>
               </div>
             </div>
           </div>
@@ -246,7 +246,7 @@
             <div class="group-card">
               <div class="setting-row">
                 <label for="logLevel" data-i18n="logs.level">Log level</label>
-                <select id="logLevel" class="control-input interface-select" data-i18n-aria-label="logs.level" aria-label="Log level">
+                <select id="logLevel" hidden data-i18n-aria-label="logs.level" aria-label="Log level">
                   <option value="error">Error</option>
                   <option value="warn">Warn</option>
                   <option value="info">Info</option>
@@ -264,115 +264,103 @@
             </div>
           </div>
         </section>
-        <section class="page" data-page="about" hidden>
-          <div class="about-hero">
-            <img class="about-icon" src="app-icon.png" alt="" />
-            <h2>rx-switch</h2>
-            <p data-i18n="about.tagline">Low-latency software KVM</p>
-            <span class="version-pill" data-i18n="about.version">Version 0.1.0</span>
-          </div>
-
+        <section class="page" data-page="stats" hidden>
           <div class="group">
-            <div class="group-header"><h2 data-i18n="about.sessionGroup">Session</h2></div>
+            <div class="group-header"><h2 data-i18n="stats.sessionGroup">Session</h2></div>
             <div class="group-card">
               <div class="setting-row">
-                <span data-i18n="about.role">Role</span>
-                <span class="value" id="aboutRole">—</span>
+                <span data-i18n="stats.role">Role</span>
+                <span class="value" id="statsRole">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.state">State</span>
-                <span class="value" id="aboutState">—</span>
+                <span data-i18n="stats.state">State</span>
+                <span class="value" id="statsState">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.duration">Duration</span>
-                <span class="value" id="aboutDuration">—</span>
+                <span data-i18n="stats.duration">Duration</span>
+                <span class="value" id="statsDuration">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.peer">Peer</span>
-                <span class="value" id="aboutPeer">—</span>
+                <span data-i18n="stats.peer">Peer</span>
+                <span class="value" id="statsPeer">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.devices">Devices</span>
-                <span class="value" id="aboutDeviceCount">—</span>
+                <span data-i18n="stats.devices">Devices</span>
+                <span class="value" id="statsDeviceCount">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.peerPlatform">Peer system</span>
-                <span class="value" id="aboutPeerPlatform">—</span>
+                <span data-i18n="stats.peerPlatform">Peer system</span>
+                <span class="value" id="statsPeerPlatform">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.linkState">Link</span>
-                <span class="value" id="aboutLinkState">—</span>
-              </div>
-              <div class="separator"></div>
-              <div class="setting-row">
-                <span data-i18n="about.build">Build</span>
-                <span class="value" id="aboutBuild">—</span>
+                <span data-i18n="stats.linkState">Link</span>
+                <span class="value" id="statsLinkState">—</span>
               </div>
             </div>
           </div>
 
           <div class="group">
-            <div class="group-header"><h2 data-i18n="about.linkGroup">Link</h2></div>
+            <div class="group-header"><h2 data-i18n="stats.linkGroup">Link</h2></div>
             <div class="group-card">
               <div class="setting-row">
-                <span data-i18n="about.rtt">Round-trip time</span>
-                <span class="value" id="aboutRtt">—</span>
+                <span data-i18n="stats.rtt">Round-trip time</span>
+                <span class="value" id="statsRtt">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.jitter">Jitter</span>
-                <span class="value" id="aboutJitter">—</span>
+                <span data-i18n="stats.jitter">Jitter</span>
+                <span class="value" id="statsJitter">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.loss">Packet loss</span>
-                <span class="value" id="aboutLoss">—</span>
+                <span data-i18n="stats.loss">Packet loss</span>
+                <span class="value" id="statsLoss">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.inputRate">Input interval</span>
-                <span class="value" id="aboutRate">—</span>
+                <span data-i18n="stats.inputRate">Input interval</span>
+                <span class="value" id="statsRate">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.localScreen">This screen</span>
-                <span class="value" id="aboutLocalScreen">—</span>
+                <span data-i18n="stats.localScreen">This screen</span>
+                <span class="value" id="statsLocalScreen">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.remoteScreen">Active screen</span>
-                <span class="value" id="aboutRemoteScreen">—</span>
+                <span data-i18n="stats.remoteScreen">Active screen</span>
+                <span class="value" id="statsRemoteScreen">—</span>
               </div>
             </div>
           </div>
 
           <div class="group">
-            <div class="group-header"><h2 data-i18n="about.trafficGroup">Session traffic</h2></div>
+            <div class="group-header"><h2 data-i18n="stats.trafficGroup">Session traffic</h2></div>
             <div class="group-card">
               <div class="setting-row">
-                <span data-i18n="about.packetsSent">Packets sent</span>
-                <span class="value" id="aboutPacketsSent">—</span>
+                <span data-i18n="stats.packetsSent">Packets sent</span>
+                <span class="value" id="statsPacketsSent">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.packetsReceived">Packets received</span>
-                <span class="value" id="aboutPacketsReceived">—</span>
+                <span data-i18n="stats.packetsReceived">Packets received</span>
+                <span class="value" id="statsPacketsReceived">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.bytesSent">Data sent</span>
-                <span class="value" id="aboutBytesSent">—</span>
+                <span data-i18n="stats.bytesSent">Data sent</span>
+                <span class="value" id="statsBytesSent">—</span>
               </div>
               <div class="separator"></div>
               <div class="setting-row">
-                <span data-i18n="about.bytesReceived">Data received</span>
-                <span class="value" id="aboutBytesReceived">—</span>
+                <span data-i18n="stats.bytesReceived">Data received</span>
+                <span class="value" id="statsBytesReceived">—</span>
               </div>
             </div>
           </div>
@@ -383,6 +371,7 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="i18n.js"></script>
+  <script src="select.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

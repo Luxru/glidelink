@@ -1,21 +1,39 @@
-use crate::state::AppState;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 struct TrayMenu {
-    show: MenuItem<tauri::Wry>,
-    stop: MenuItem<tauri::Wry>,
+    about: MenuItem<tauri::Wry>,
     quit: MenuItem<tauri::Wry>,
 }
 
-fn labels(language: &str) -> [&'static str; 3] {
+fn labels(language: &str) -> [&'static str; 2] {
     let chinese = language == "zh";
     if chinese {
-        ["显示 rx-switch", "停止会话", "退出 rx-switch"]
+        ["关于 rx-switch", "退出 rx-switch"]
     } else {
-        ["Show rx-switch", "Stop session", "Quit rx-switch"]
+        ["About rx-switch", "Quit rx-switch"]
     }
+}
+
+fn show_about(app: &AppHandle) -> tauri::Result<()> {
+    let window = if let Some(window) = app.get_webview_window("about") {
+        window
+    } else {
+        WebviewWindowBuilder::new(app, "about", WebviewUrl::App("about.html".into()))
+            .title("rx-switch")
+            .inner_size(420.0, 390.0)
+            .theme(Some(tauri::Theme::Light))
+            .resizable(false)
+            .minimizable(false)
+            .maximizable(false)
+            .skip_taskbar(true)
+            .visible(false)
+            .center()
+            .build()?
+    };
+    window.show()?;
+    window.set_focus()
 }
 
 pub fn show_window(app: &AppHandle) {
@@ -41,41 +59,44 @@ pub fn hide_window(window: &tauri::Window) -> tauri::Result<()> {
 
 pub fn update_language(app: &AppHandle, language: &str) {
     if let Some(menu) = app.try_state::<TrayMenu>() {
-        let [show, stop, quit] = labels(language);
-        let _ = menu.show.set_text(show);
-        let _ = menu.stop.set_text(stop);
+        let [about, quit] = labels(language);
+        let _ = menu.about.set_text(about);
         let _ = menu.quit.set_text(quit);
     }
 }
 
 pub fn setup(app: &AppHandle, language: &str) -> tauri::Result<()> {
-    let [show, stop, quit] = labels(language);
-    let show = MenuItem::with_id(app, "show", show, true, None::<&str>)?;
-    let stop = MenuItem::with_id(app, "stop", stop, true, None::<&str>)?;
+    let [about, quit] = labels(language);
+    let about = MenuItem::with_id(app, "about", about, true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", quit, true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&show, &stop, &separator, &quit])?;
+    let menu = Menu::with_items(app, &[&about, &separator, &quit])?;
     let mut tray = TrayIconBuilder::with_id("main")
         .tooltip("rx-switch")
         .menu(&menu)
-        .show_menu_on_left_click(cfg!(target_os = "macos"))
+        .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => show_window(app),
-            "stop" => app.state::<AppState>().engine.stop(),
+            "about" => {
+                let app = app.clone();
+                // WebView2 window creation must run outside event handlers.
+                tauri::async_runtime::spawn_blocking(move || {
+                    if let Err(err) = show_about(&app) {
+                        log::error!("could not show About window: {err}");
+                    }
+                });
+            }
             "quit" => app.exit(0),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            if !cfg!(target_os = "macos")
-                && matches!(
-                    event,
-                    TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    }
-                )
-            {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
                 show_window(tray.app_handle());
             }
         });
@@ -90,6 +111,6 @@ pub fn setup(app: &AppHandle, language: &str) -> tauri::Result<()> {
         tray = tray.icon(icon.clone());
     }
     tray.build(app)?;
-    app.manage(TrayMenu { show, stop, quit });
+    app.manage(TrayMenu { about, quit });
     Ok(())
 }
