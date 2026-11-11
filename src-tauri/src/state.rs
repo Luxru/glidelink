@@ -239,7 +239,7 @@ pub struct StateView {
     pub platform: &'static str,
     /// Short git commit (plus `-dirty`) the binary was built from.
     pub build: &'static str,
-    pub permissions_ok: bool,
+    pub permissions: input::InputPermissions,
     pub local_interfaces: Vec<net::NetworkInterface>,
 }
 
@@ -256,7 +256,7 @@ impl StateView {
             status,
             platform: input::platform_name(),
             build: env!("RX_SWITCH_BUILD"),
-            permissions_ok: input::permissions_ok(),
+            permissions: input::permissions(),
             local_interfaces: net::local_interfaces(),
         }
     }

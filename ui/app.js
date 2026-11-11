@@ -241,6 +241,14 @@ function translateError(raw) {
   return detail ? t("errors.withDetail", { message, detail }) : message;
 }
 
+function permissionErrorResolved(raw, permissions) {
+  const code = String(raw || "").split("|")[0];
+  if (code === "E_MAC_PERMISSIONS_CAPTURE") return permissions?.capture === true;
+  if (code === "E_MAC_PERMISSIONS_INJECT") return permissions?.inject === true;
+  return code === "errors.PERMISSIONS_BLOCKED"
+    && (ui.role === "agent" ? permissions?.inject : permissions?.capture) === true;
+}
+
 function showToast(message) {
   els.toast.textContent = message;
   els.toast.classList.add("show");
@@ -785,7 +793,7 @@ function withTimeout(promise, ms = COMMAND_TIMEOUT_MS) {
 function applyState(state) {
   if (!state) return;
   ui.lastState = state;
-  const { config, status: incomingStatus, platform, permissionsOk } = state;
+  const { config, status: incomingStatus, platform, permissions } = state;
   const wasRunning = ui.running;
   ui.running = Boolean(incomingStatus?.running);
   ui.lastStatus = incomingStatus || null;
@@ -852,15 +860,17 @@ function applyState(state) {
 
   if (ui.running) setDisabledControls(true);
 
-  const permissionBlocked = platform === "macos" && permissionsOk === false;
+  const permissionGranted = ui.role === "agent" ? permissions?.inject : permissions?.capture;
+  const permissionBlocked = platform === "macos" && permissionGranted === false;
   els.permissionCard.hidden = !permissionBlocked;
+  if (permissionErrorResolved(ui.startError, permissions)) setError(null);
 
   const status = ui.lastStatus || {};
   const connected = Boolean(status.connected);
   const active = Boolean(status.remoteActive);
   const localScreen = status.localScreen;
   const latency = status.latencyMs == null ? null : Number(status.latencyMs);
-  const statusError = status.lastErrorCode
+  const statusError = status.lastErrorCode && !permissionErrorResolved(status.lastErrorCode, permissions)
     ? `${status.lastErrorCode}${status.lastErrorDetail ? `|${status.lastErrorDetail}` : ""}`
     : null;
   const errorRaw = ui.startError || statusError || (permissionBlocked && ui.running ? "errors.PERMISSIONS_BLOCKED" : null);
@@ -1137,7 +1147,7 @@ function initEvents() {
   els.stopBtn.addEventListener("click", stopSession);
   els.permissionBtn.addEventListener("click", async () => {
     try {
-      await invoke("open_permissions");
+      await invoke("open_permissions", { role: ui.role });
     } catch (error) {
       setError(errorToRaw(error));
     }

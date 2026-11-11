@@ -738,11 +738,14 @@ pub fn screen_info() -> Option<ScreenInfo> {
     }
 }
 
-pub fn permissions_ok() -> bool {
-    true
+pub fn permissions() -> super::InputPermissions {
+    super::InputPermissions {
+        capture: true,
+        inject: true,
+    }
 }
 
-pub fn open_permissions() -> Result<(), String> {
+pub fn open_permissions(_role: crate::config::Role) -> Result<(), String> {
     Ok(())
 }
 

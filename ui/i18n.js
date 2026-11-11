@@ -48,7 +48,7 @@
 
       "error.title": "无法开始",
       "permission.title": "需要 macOS 辅助功能权限",
-      "permission.text": "在辅助功能中允许 rx-switch 控制键盘和鼠标，然后重新启动应用。",
+      "permission.text": "在辅助功能中允许 rx-switch 控制键盘和鼠标。若已勾选仍提示，请移除该项，重新添加当前应用后再打开软件。",
       "permission.open": "打开系统设置",
       "permission.reopen": "重新打开",
 
@@ -236,7 +236,7 @@
 
       "error.title": "Could not start",
       "permission.title": "macOS Accessibility permission required",
-      "permission.text": "Allow rx-switch to control the keyboard and mouse in Accessibility, then relaunch the app.",
+      "permission.text": "Allow rx-switch in Accessibility. If it is already enabled, remove the entry, add the current app again, then reopen it.",
       "permission.open": "Open System Settings",
       "permission.reopen": "Reopen",
 

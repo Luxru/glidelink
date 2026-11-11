@@ -44,18 +44,36 @@
     }
   });
 
-  async function boot() {
-    if (!invoke) return;
+  let preparing = null;
+  function prepare() {
+    if (preparing) return preparing;
+    preparing = prepareContent().finally(() => { preparing = null; });
+    return preparing;
+  }
+
+  async function prepareContent() {
+    status.textContent = "";
     try {
-      const state = await invoke("get_state");
-      if (["zh", "en"].includes(state.config?.language)) i18n.setLocale(state.config.language);
-      build.textContent = state.build || "—";
-      system.textContent = { macos: "macOS", windows: "Windows" }[state.platform] || state.platform || "—";
+      const info = await invoke("get_about");
+      if (["zh", "en"].includes(info.language)) i18n.setLocale(info.language);
+      build.textContent = info.build || "—";
+      system.textContent = { macos: "macOS", windows: "Windows" }[info.platform] || info.platform || "—";
       document.title = t("about.title");
-      close.focus();
+      const icon = document.querySelector(".about-app-icon");
+      await Promise.all([document.fonts.ready, icon.decode().catch(() => {})]);
     } catch (error) {
       status.textContent = String(error);
     }
+    await invoke("about_ready");
+    close.focus();
   }
-  boot();
+
+  async function boot() {
+    if (!invoke) return;
+    await window.__TAURI__.event.listen("rx-switch:about-open", () => {
+      prepare().catch((error) => { status.textContent = String(error); });
+    });
+    await prepare();
+  }
+  boot().catch((error) => { status.textContent = String(error); });
 })();

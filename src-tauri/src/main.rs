@@ -167,8 +167,8 @@ fn stop_session(state: tauri::State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_permissions() -> Result<(), String> {
-    input::open_permissions()
+fn open_permissions(role: Role) -> Result<(), String> {
+    input::open_permissions(role)
 }
 
 #[tauri::command]
@@ -178,17 +178,35 @@ fn set_tray_language(app: tauri::AppHandle, language: String) {
 
 #[tauri::command]
 fn close_about(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("about") {
-        window.close().map_err(|err| err.to_string())?;
+    tray::hide_about(&app).map_err(|err| err.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct AboutInfo {
+    language: String,
+    build: &'static str,
+    platform: &'static str,
+}
+
+#[tauri::command]
+fn get_about(state: tauri::State<'_, AppState>) -> AboutInfo {
+    AboutInfo {
+        language: state.config.snapshot().unwrap_or_default().language,
+        build: env!("RX_SWITCH_BUILD"),
+        platform: input::platform_name(),
     }
-    Ok(())
+}
+
+#[tauri::command]
+fn about_ready(app: tauri::AppHandle) -> Result<(), String> {
+    tray::about_ready(&app).map_err(|err| err.to_string())
 }
 
 fn main() {
     logging::init("info");
 
     // Hardware smoke test used to validate the macOS input backend without
-    // starting the UI. See README: Development and tests.
+    // starting the UI.
     #[cfg(target_os = "macos")]
     if std::env::args().skip(1).any(|arg| arg == "--self-test") {
         std::process::exit(if input::self_test() { 0 } else { 1 });
@@ -210,11 +228,11 @@ fn main() {
             let screen = input::screen_info();
             let status = status::Status::new(screen);
             log::info!(
-                "starting on {} (build={}, screen={:?}, permissions_ok={})",
+                "starting on {} (build={}, screen={:?}, permissions={:?})",
                 input::platform_name(),
                 env!("RX_SWITCH_BUILD"),
                 screen,
-                input::permissions_ok()
+                input::permissions()
             );
 
             let config = match config::load_or_create(&settings_path) {
@@ -236,13 +254,21 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() != "main" {
-                return;
-            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                if let Err(err) = tray::hide_window(window) {
-                    log::error!("could not hide window in the tray: {err}");
+                match window.label() {
+                    "main" => {
+                        api.prevent_close();
+                        if let Err(err) = tray::hide_window(window) {
+                            log::error!("could not hide window in the tray: {err}");
+                        }
+                    }
+                    "about" => {
+                        api.prevent_close();
+                        if let Err(err) = tray::hide_about(window.app_handle()) {
+                            log::error!("could not hide About window: {err}");
+                        }
+                    }
+                    _ => {}
                 }
             }
         })
@@ -258,7 +284,9 @@ fn main() {
             clear_logs,
             reopen_app,
             set_tray_language,
-            close_about
+            close_about,
+            get_about,
+            about_ready
         ])
         .build(tauri::generate_context!())
         .expect("failed to build rx-switch");

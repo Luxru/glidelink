@@ -346,10 +346,22 @@ fn post_event_access() -> bool {
     unsafe { CGPreflightPostEventAccess() != 0 }
 }
 
-pub fn permissions_ok() -> bool {
-    // Our filtering event tap is authorized by Accessibility. Input Monitoring
-    // is for listen-only taps and must not gate an agent that only posts input.
-    accessibility_trusted() && post_event_access()
+pub fn permissions() -> super::InputPermissions {
+    let capture = accessibility_trusted();
+    let inject = post_event_access();
+    // Capture and posting have separate authoritative checks. An agent never
+    // uses AXUIElement or an event tap, so AX trust must not gate its injector.
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+    let bits = u8::from(capture) | (u8::from(inject) << 1);
+    if LAST.swap(bits, Ordering::AcqRel) != bits {
+        log::info!(
+            "macOS permissions: capture={capture}, inject={inject}, executable={}",
+            std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+    }
+    super::InputPermissions { capture, inject }
 }
 
 /// Ask macOS to show its permission prompt. Returns the current accessibility
@@ -368,20 +380,19 @@ fn request_accessibility_prompt() -> bool {
     }
 }
 
-pub fn open_permissions() -> Result<(), String> {
+pub fn open_permissions(role: crate::config::Role) -> Result<(), String> {
     // Both our filtering tap and event posting use Accessibility. Requesting
     // ListenEvent separately can send users to an empty/unnecessary pane.
-    let pane = if !accessibility_trusted() {
-        let _ = request_accessibility_prompt();
-        "Privacy_Accessibility"
-    } else {
-        if !post_event_access() {
-            unsafe {
-                CGRequestPostEventAccess();
-            }
+    match role {
+        crate::config::Role::Controller if !accessibility_trusted() => {
+            let _ = request_accessibility_prompt();
         }
-        "Privacy_Accessibility"
-    };
+        crate::config::Role::Agent if !post_event_access() => unsafe {
+            CGRequestPostEventAccess();
+        },
+        _ => {}
+    }
+    let pane = "Privacy_Accessibility";
 
     log::info!("opening macOS privacy pane: {pane}");
     std::process::Command::new("open")
@@ -1220,10 +1231,8 @@ pub fn start_injector(
     stop: Arc<AtomicBool>,
     _status: Status,
 ) -> Result<JoinHandle<()>, String> {
-    unsafe {
-        if AXIsProcessTrusted() == 0 || CGPreflightPostEventAccess() == 0 {
-            return Err(error::code("E_MAC_PERMISSIONS_INJECT"));
-        }
+    if !post_event_access() {
+        return Err(error::code("E_MAC_PERMISSIONS_INJECT"));
     }
     let bounds = virtual_bounds().ok_or_else(|| error::code("E_MAC_DISPLAYS"))?;
 
@@ -1909,7 +1918,7 @@ pub fn self_test() -> bool {
         ok = false;
     }
 
-    if ax && post {
+    if post {
         match test_injection(bounds) {
             Ok(()) => println!("injection:              PASS"),
             Err(e) => {
@@ -1932,9 +1941,9 @@ pub fn self_test() -> bool {
             }
         }
     } else {
-        println!("injection:              SKIP (needs Accessibility + event posting)");
-        println!("caps lock:              SKIP (needs Accessibility + event posting)");
-        println!("modifiers:              SKIP (needs Accessibility + event posting)");
+        println!("injection:              SKIP (needs event posting)");
+        println!("caps lock:              SKIP (needs event posting)");
+        println!("modifiers:              SKIP (needs event posting)");
         ok = false;
     }
 

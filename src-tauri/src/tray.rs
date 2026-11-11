@@ -1,6 +1,13 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+
+#[derive(Default)]
+struct AboutWindow {
+    ready: AtomicBool,
+    requested: AtomicBool,
+}
 
 struct TrayMenu {
     about: MenuItem<tauri::Wry>,
@@ -10,30 +17,43 @@ struct TrayMenu {
 fn labels(language: &str) -> [&'static str; 2] {
     let chinese = language == "zh";
     if chinese {
-        ["关于 rx-switch", "退出 rx-switch"]
+        ["关于", "退出"]
     } else {
-        ["About rx-switch", "Quit rx-switch"]
+        ["About", "Quit"]
     }
 }
 
 fn show_about(app: &AppHandle) -> tauri::Result<()> {
-    let window = if let Some(window) = app.get_webview_window("about") {
-        window
-    } else {
-        WebviewWindowBuilder::new(app, "about", WebviewUrl::App("about.html".into()))
-            .title("rx-switch")
-            .inner_size(420.0, 390.0)
-            .theme(Some(tauri::Theme::Light))
-            .resizable(false)
-            .minimizable(false)
-            .maximizable(false)
-            .skip_taskbar(true)
-            .visible(false)
-            .center()
-            .build()?
-    };
-    window.show()?;
-    window.set_focus()
+    let state = app.state::<AboutWindow>();
+    state.requested.store(true, Ordering::Release);
+    if state.ready.load(Ordering::Acquire) {
+        if let Some(window) = app.get_webview_window("about") {
+            window.emit("rx-switch:about-open", ())?;
+        }
+    }
+    Ok(())
+}
+
+pub fn about_ready(app: &AppHandle) -> tauri::Result<()> {
+    let state = app.state::<AboutWindow>();
+    state.ready.store(true, Ordering::Release);
+    if state.requested.swap(false, Ordering::AcqRel) {
+        if let Some(window) = app.get_webview_window("about") {
+            window.show()?;
+            window.set_focus()?;
+        }
+    }
+    Ok(())
+}
+
+pub fn hide_about(app: &AppHandle) -> tauri::Result<()> {
+    app.state::<AboutWindow>()
+        .requested
+        .store(false, Ordering::Release);
+    if let Some(window) = app.get_webview_window("about") {
+        window.hide()?;
+    }
+    Ok(())
 }
 
 pub fn show_window(app: &AppHandle) {
@@ -66,6 +86,21 @@ pub fn update_language(app: &AppHandle, language: &str) {
 }
 
 pub fn setup(app: &AppHandle, language: &str) -> tauri::Result<()> {
+    app.manage(AboutWindow::default());
+    // Build once during setup (safe for WebView2), then keep the page loaded.
+    // Its frontend acknowledges content readiness before the first display.
+    WebviewWindowBuilder::new(app, "about", WebviewUrl::App("about.html".into()))
+        .title("rx-switch")
+        .inner_size(420.0, 390.0)
+        .theme(Some(tauri::Theme::Light))
+        .background_color(tauri::window::Color(236, 236, 237, 255))
+        .resizable(false)
+        .minimizable(false)
+        .maximizable(false)
+        .skip_taskbar(true)
+        .visible(false)
+        .center()
+        .build()?;
     let [about, quit] = labels(language);
     let about = MenuItem::with_id(app, "about", about, true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", quit, true, None::<&str>)?;
@@ -77,13 +112,9 @@ pub fn setup(app: &AppHandle, language: &str) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "about" => {
-                let app = app.clone();
-                // WebView2 window creation must run outside event handlers.
-                tauri::async_runtime::spawn_blocking(move || {
-                    if let Err(err) = show_about(&app) {
-                        log::error!("could not show About window: {err}");
-                    }
-                });
+                if let Err(err) = show_about(app) {
+                    log::error!("could not show About window: {err}");
+                }
             }
             "quit" => app.exit(0),
             _ => {}

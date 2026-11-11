@@ -469,11 +469,11 @@ impl CaptureHandle {
 }
 
 #[cfg(windows)]
-pub use win::{open_permissions, permissions_ok, screen_info, start_capture, start_injector};
+pub use win::{open_permissions, permissions, screen_info, start_capture, start_injector};
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    open_permissions, permissions_ok, screen_info, self_test, start_capture, start_injector,
+    open_permissions, permissions, screen_info, self_test, start_capture, start_injector,
 };
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -484,11 +484,14 @@ mod unsupported {
         None
     }
 
-    pub fn permissions_ok() -> bool {
-        false
+    pub fn permissions() -> InputPermissions {
+        InputPermissions {
+            capture: false,
+            inject: false,
+        }
     }
 
-    pub fn open_permissions() -> Result<(), String> {
+    pub fn open_permissions(_role: crate::config::Role) -> Result<(), String> {
         Err(crate::error::code("E_UNSUPPORTED"))
     }
 
@@ -509,9 +512,13 @@ mod unsupported {
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-pub use unsupported::{
-    open_permissions, permissions_ok, screen_info, start_capture, start_injector,
-};
+pub use unsupported::{open_permissions, permissions, screen_info, start_capture, start_injector};
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct InputPermissions {
+    pub capture: bool,
+    pub inject: bool,
+}
 
 pub fn platform_name() -> &'static str {
     if cfg!(windows) {
