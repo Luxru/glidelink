@@ -44,8 +44,8 @@ const SLOW_INPUT_INTERVAL: Duration = Duration::from_millis(8);
 const MAX_PEERS: usize = 8;
 const MAX_PENDING: usize = 8;
 const POLL_BUDGET: usize = 64;
-const PAKE_ID_CONTROLLER: &[u8] = b"GlideLink v1 controller";
-const PAKE_ID_AGENT: &[u8] = b"GlideLink v1 agent";
+const PAKE_ID_CONTROLLER: &[u8] = b"rx-switch v2 controller";
+const PAKE_ID_AGENT: &[u8] = b"rx-switch v2 agent";
 
 type NetResult<T> = Result<T, String>;
 
@@ -756,7 +756,7 @@ pub fn start_controller(
     };
     log::info!("controller listening on {ip} via TCP");
     thread::Builder::new()
-        .name("glidelink-controller-hub".into())
+        .name("rx-switch-controller-hub".into())
         .spawn(move || run_hub(hub, capture_rx, stop))
         .map_err(|e| error::detail("E_NET_THREAD", e))
 }
@@ -913,7 +913,7 @@ fn start_agent_with_policy(
         s.started_at_ms = Some(protocol::now_ms());
     });
     thread::Builder::new()
-        .name("glidelink-agent-connect".into())
+        .name("rx-switch-agent-connect".into())
         .spawn(move || {
             crate::sched::boost_current_thread();
             let _guard = crate::sched::SessionGuard::begin();
@@ -1144,7 +1144,7 @@ mod tests {
                 ..AppConfig::default()
             };
             let path =
-                std::env::temp_dir().join(format!("glidelink-tcp-{}.json", rand::random::<u64>()));
+                std::env::temp_dir().join(format!("rx-switch-tcp-{}.json", rand::random::<u64>()));
             let handle = ConfigHandle::new(path.clone(), config.clone());
             let layout = LayoutStore::new(WorldLayout::new(
                 ScreenInfo {

@@ -192,12 +192,15 @@ fn main() {
         // own mouse INPUTSINK registration and dedicated message loop.
         .device_event_filter(tauri::DeviceEventFilter::Always)
         .setup(|app| {
-            // Settings live in `~/.glidelink/settings.json`.
-            let settings_path = match app.path().home_dir() {
-                Ok(home) => home.join(".glidelink").join("settings.json"),
+            let (settings_path, previous_settings) = match app.path().home_dir() {
+                Ok(home) => (
+                    home.join(".rx-switch").join("settings.json"),
+                    // Read-only migration from the previous product name.
+                    Some(home.join(".glidelink").join("settings.json")),
+                ),
                 Err(err) => {
                     log::warn!("home directory unavailable ({err}); using app config dir");
-                    app.path().app_config_dir()?.join("settings.json")
+                    (app.path().app_config_dir()?.join("settings.json"), None)
                 }
             };
             let screen = input::screen_info();
@@ -210,7 +213,8 @@ fn main() {
                 input::permissions_ok()
             );
 
-            let config = match config::load_or_create(&settings_path) {
+            let config = match config::load_or_migrate(&settings_path, previous_settings.as_deref())
+            {
                 Ok(config) => config,
                 Err(load_error) => {
                     log::error!("{load_error}");

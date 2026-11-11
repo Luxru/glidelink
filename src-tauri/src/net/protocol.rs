@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-pub const MAGIC: &[u8; 4] = b"GLNK";
-pub const VERSION: u8 = 1;
+pub const MAGIC: &[u8; 4] = b"RXSW";
+pub const VERSION: u8 = 2;
 
 pub const TYPE_HELLO: u8 = 1;
 pub const TYPE_ACCEPT: u8 = 2;
@@ -33,7 +33,7 @@ pub const HELLO_LEN: usize = HEADER_LEN + 4 + 4 + 8 + 1 + DEVICE_ID_LEN + PAKE_M
 pub const INPUT_LEN: usize = 4;
 pub const EVENT_LEN: usize = 16;
 pub const RECONCILE_LEN: usize = 36;
-pub const CONFIRM_PAYLOAD: &[u8] = b"GlideLink/v1/confirm";
+pub const CONFIRM_PAYLOAD: &[u8] = b"rx-switch/v2/confirm";
 
 const EVENT_BUTTON: u8 = 1;
 const EVENT_WHEEL: u8 = 2;
@@ -49,8 +49,8 @@ pub const PLATFORM_MACOS: u8 = 1;
 #[allow(dead_code)]
 pub const PLATFORM_WINDOWS: u8 = 2;
 
-const C2A_LABEL: &[u8] = b"GlideLink/v1/controller-to-agent";
-const A2C_LABEL: &[u8] = b"GlideLink/v1/agent-to-controller";
+const C2A_LABEL: &[u8] = b"rx-switch/v2/controller-to-agent";
+const A2C_LABEL: &[u8] = b"rx-switch/v2/agent-to-controller";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Side {
@@ -545,6 +545,23 @@ mod tests {
         assert_eq!(c2a, c2a_other);
         assert_eq!(a2c, a2c_other);
         assert_ne!(c2a, a2c);
+    }
+
+    #[test]
+    fn v2_rejects_previous_version_and_foreign_protocol_prefixes() {
+        let mut packet = header_prefix(TYPE_HELLO, &[0; SID_LEN], HEADER_LEN);
+        assert!(validate_prefix(&packet, None).is_ok());
+        packet[4] = 1;
+        assert!(matches!(
+            validate_prefix(&packet, None),
+            Err(ProtocolError::Malformed)
+        ));
+        packet[4] = VERSION;
+        packet[..4].copy_from_slice(b"OLD!");
+        assert!(matches!(
+            validate_prefix(&packet, None),
+            Err(ProtocolError::Malformed)
+        ));
     }
 
     #[test]

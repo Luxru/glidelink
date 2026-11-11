@@ -1097,7 +1097,7 @@ pub fn start_capture(
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let thread_shared = Arc::clone(&shared);
     let join = thread::Builder::new()
-        .name("glidelink-input-capture".into())
+        .name("rx-switch-input-capture".into())
         .spawn(move || run_capture_thread(thread_shared, tx, bounds, ready_tx))
         .map_err(|e| error::detail("E_CAPTURE_THREAD", e))?;
 
@@ -1230,7 +1230,7 @@ pub fn start_injector(
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let thread_stop = Arc::clone(&stop);
     let join = thread::Builder::new()
-        .name("glidelink-input-injector".into())
+        .name("rx-switch-input-injector".into())
         .spawn(move || injector_loop(rx, thread_stop, bounds, ready_tx))
         .map_err(|e| error::detail("E_INJECTOR_THREAD", e))?;
 

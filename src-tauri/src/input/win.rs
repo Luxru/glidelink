@@ -753,7 +753,7 @@ pub fn start_capture(
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let thread_shared = Arc::clone(&shared);
     let join = thread::Builder::new()
-        .name("glidelink-input-capture".into())
+        .name("rx-switch-input-capture".into())
         .spawn(move || run_capture_thread(thread_shared, tx, ready_tx))
         .map_err(|e| error::detail("E_CAPTURE_THREAD", e))?;
 
@@ -787,7 +787,7 @@ fn run_capture_thread(
         return;
     }
 
-    let class_name = wide("GlideLinkHiddenInputWindow");
+    let class_name = wide("RxSwitchHiddenInputWindow");
     let hinstance = unsafe { GetModuleHandleW(null()) };
     if hinstance.is_null() {
         let _ = ready_tx.send(Err(error::code("E_MODULE_HANDLE")));
@@ -966,7 +966,7 @@ pub fn start_injector(
 ) -> Result<JoinHandle<()>, String> {
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let join = thread::Builder::new()
-        .name("glidelink-input-injector".into())
+        .name("rx-switch-input-injector".into())
         .spawn(move || injector_loop(rx, stop, ready_tx))
         .map_err(|e| error::detail("E_INJECTOR_THREAD", e))?;
     match ready_rx.recv_timeout(Duration::from_secs(2)) {

@@ -19,7 +19,7 @@ Allow the controller's TCP listening port through the firewall. On macOS, grant 
 
 Closing the window keeps the session running in the tray. On macOS, a monochrome menu-bar icon adapts to the system appearance, and the Dock icon hides while the window is closed. Use the tray menu to restore the window and Dock icon, stop the session, or quit.
 
-rx-switch was previously named GlideLink. Its application identifier and settings directory are retained to preserve permissions, pairing, and layouts. Settings live in `~/.glidelink/settings.json` (Windows: `C:\Users\<you>\.glidelink\settings.json`). The UI provides log viewing, level selection, and copying.
+Settings live in `~/.rx-switch/settings.json` (Windows: `C:\Users\<you>\.rx-switch\settings.json`). The first launch migrates the previous settings while preserving device identity, pairing codes, and layouts. The UI provides log viewing, level selection, and copying. Both endpoints need the new protocol v2 build.
 
 ## Development
 
@@ -30,6 +30,6 @@ cargo test
 cargo build --release
 ```
 
-No Node.js or frontend build step is needed. See the [architecture](ARCHITECTURE.en.md) for backend details.
+No frontend build step is needed. To bundle the macOS app, run `npx @tauri-apps/cli@2 build --bundles app`; the result is `src-tauri/target/release/bundle/macos/rx-switch.app`. See the [architecture](ARCHITECTURE.en.md) for backend details.
 
 Merge feature branches into `dev` following the [development workflow](CONTRIBUTING.md).

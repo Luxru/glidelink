@@ -366,7 +366,7 @@
   };
 
   const supported = ["zh", "en"];
-  const storageKey = "glidelink.locale";
+  const storageKey = "rx-switch.locale";
 
   /// The language the user explicitly picked in an older build. Used once to
   /// seed `settings.json`; the system locale is not reported here.
@@ -428,10 +428,10 @@
       // ignore storage failures
     }
     apply();
-    document.dispatchEvent(new CustomEvent("glidelink:locale", { detail: { locale } }));
+    document.dispatchEvent(new CustomEvent("rx-switch:locale", { detail: { locale } }));
   }
 
-  window.glidelinkI18n = {
+  window.rxSwitchI18n = {
     t: translate,
     setLocale,
     getLocale: () => locale,

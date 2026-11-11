@@ -2,7 +2,7 @@
 
 [Chinese](ARCHITECTURE.md) | [Usage and build](README.en.md)
 
-Application 0.1.0, protocol v1, unreleased. The controller captures and routes input; agents receive and inject it. Device identity and layout persist, while each connection gets a fresh session.
+Application 0.1.0, protocol v2, unreleased. The controller captures and routes input; agents receive and inject it. Device identity and layout persist, while each connection gets a fresh session.
 
 ## Input
 

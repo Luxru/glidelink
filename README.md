@@ -18,7 +18,7 @@
 
 控制端需放行 TCP 监听端口；macOS 需授予辅助功能权限。配对码等同连接凭证，请只在可信局域网使用并妥善保管。
 
-rx-switch 原名 GlideLink，继续沿用原有应用标识和设置目录以保留权限、配对与布局。设置保存在 `~/.glidelink/settings.json`（Windows：`C:\Users\<用户>\.glidelink\settings.json`）。日志可在界面中查看、调整级别和复制。
+设置保存在 `~/.rx-switch/settings.json`（Windows：`C:\Users\<用户>\.rx-switch\settings.json`），首次启动会迁移旧版本配置，保留设备身份、配对码和布局。日志可在界面中查看、调整级别和复制。两端需使用新的协议 v2 构建。
 
 ## 开发
 
@@ -29,6 +29,6 @@ cargo test
 cargo build --release
 ```
 
-无需 Node.js 或前端构建步骤。后端设计见 [架构说明](ARCHITECTURE.md)。
+无需前端构建步骤。生成 macOS 应用包可运行 `npx @tauri-apps/cli@2 build --bundles app`，产物为 `src-tauri/target/release/bundle/macos/rx-switch.app`。后端设计见 [架构说明](ARCHITECTURE.md)。
 
 采用功能分支合并到 `dev` 的流程，详见 [开发约定](CONTRIBUTING.md)。

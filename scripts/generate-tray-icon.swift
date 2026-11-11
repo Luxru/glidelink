@@ -5,7 +5,7 @@
 import AppKit
 
 guard CommandLine.arguments.count == 2,
-      let symbol = NSImage(systemSymbolName: "rectangle.connected.to.line.below", accessibilityDescription: nil),
+      let symbol = NSImage(systemSymbolName: "cursorarrow", accessibilityDescription: nil),
       let configured = symbol.withSymbolConfiguration(
         NSImage.SymbolConfiguration(pointSize: 16, weight: .medium)
           .applying(NSImage.SymbolConfiguration(paletteColors: [.black]))

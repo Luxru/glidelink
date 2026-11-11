@@ -1,5 +1,5 @@
 const invoke = window.__TAURI__?.core?.invoke;
-const i18n = window.glidelinkI18n;
+const i18n = window.rxSwitchI18n;
 const t = (key, vars) => i18n.t(key, vars);
 
 const els = {
@@ -587,7 +587,7 @@ async function onDevicePointerUp(event) {
   renderLayout();
 }
 
-const INTERFACE_STORAGE_KEY = "glidelink.interface";
+const INTERFACE_STORAGE_KEY = "rx-switch.interface";
 
 function updateInterfaces(interfaces, preferredIp) {
   const list = Array.isArray(interfaces) ? interfaces : [];
@@ -1157,7 +1157,7 @@ function initEvents() {
     saveSettings({ language: next });
   });
 
-  document.addEventListener("glidelink:locale", () => {
+  document.addEventListener("rx-switch:locale", () => {
     syncTrayLanguage();
     if (ui.languageSyncGuard) return;
     updatePageChrome();
