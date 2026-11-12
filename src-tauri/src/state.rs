@@ -1,6 +1,6 @@
 use crate::config::{AppConfig, ConfigHandle, Role};
 use crate::error;
-use crate::input::{self, CaptureHandle, CaptureMsg, CaptureShared, InjectMsg};
+use crate::input::{self, CaptureHandle, CaptureMsg, CaptureShared, InputMsg};
 use crate::layout::{DevicePlacement, LayoutStore};
 use crate::net;
 use crate::status::{ScreenInfo, Status};
@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 pub struct AppState {
     pub config: ConfigHandle,
@@ -47,6 +46,22 @@ struct Running {
     layout: Option<LayoutStore>,
 }
 
+impl Running {
+    fn shutdown(mut self) {
+        // Capture releases state while transport is still alive. Injectors also
+        // release their held input before exiting on stop.
+        if let Some(capture) = self.capture.take() {
+            capture.stop_and_join();
+        }
+        self.stop.store(true, Ordering::Release);
+        for handle in self.threads {
+            if handle.join().is_err() {
+                log::error!("worker thread panicked");
+            }
+        }
+    }
+}
+
 impl Engine {
     pub fn new(status: Status) -> Self {
         Self {
@@ -56,10 +71,28 @@ impl Engine {
     }
 
     pub fn is_running(&self) -> bool {
+        self.reap_stopped();
         self.inner
             .lock()
             .map(|slot| slot.is_some())
             .unwrap_or(false)
+    }
+
+    fn reap_stopped(&self) {
+        let Ok(mut slot) = self.inner.lock() else {
+            return;
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|running| running.stop.load(Ordering::Acquire))
+        {
+            if let Some(running) = slot.take() {
+                // Keep the slot locked until all old workers finish, so a new
+                // session cannot race their final status updates. Preserve the
+                // connection error published by the worker for the UI.
+                running.shutdown();
+            }
+        }
     }
 
     pub fn start(
@@ -68,6 +101,7 @@ impl Engine {
         pairing_code: &str,
         config_handle: ConfigHandle,
     ) -> Result<(), String> {
+        self.reap_stopped();
         let mut slot = self.inner.lock().map_err(|_| error::code("E_INTERNAL"))?;
         if slot.is_some() {
             return Err(error::code("E_SESSION_RUNNING"));
@@ -118,7 +152,7 @@ impl Engine {
                 });
             }
             Role::Agent => {
-                let (inject_tx, inject_rx) = unbounded::<InjectMsg>();
+                let (inject_tx, inject_rx) = unbounded::<InputMsg>();
                 let injector =
                     match input::start_injector(inject_rx, Arc::clone(&stop), status.clone()) {
                         Ok(handle) => handle,
@@ -171,7 +205,7 @@ impl Engine {
             .screens
             .iter()
             .filter(|screen| screen.online)
-            .map(|screen| screen.id)
+            .map(|screen| (screen.id, screen.session))
             .collect();
         let world = crate::layout::world_from_placements(host, placements, &online);
         layout.replace(world);
@@ -182,22 +216,11 @@ impl Engine {
             Ok(mut slot) => slot.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         };
-        let Some(mut running) = running else {
+        let Some(running) = running else {
             return;
         };
 
-        // Capture must stop first so it can emit a final button-release state
-        // while the network thread is still draining input.
-        if let Some(capture) = running.capture.take() {
-            capture.stop_and_join();
-            std::thread::sleep(Duration::from_millis(3));
-        }
-        running.stop.store(true, Ordering::Release);
-        for handle in running.threads {
-            if handle.join().is_err() {
-                log::error!("worker thread panicked");
-            }
-        }
+        running.shutdown();
         self.status.reset();
     }
 }
@@ -216,12 +239,13 @@ pub struct StateView {
     pub platform: &'static str,
     /// Short git commit (plus `-dirty`) the binary was built from.
     pub build: &'static str,
-    pub permissions_ok: bool,
+    pub permissions: input::InputPermissions,
     pub local_interfaces: Vec<net::NetworkInterface>,
 }
 
 impl StateView {
     pub fn build(state: &AppState) -> Self {
+        state.engine.reap_stopped();
         let config = state.config.snapshot().unwrap_or_default();
         let mut status = state.status.snapshot();
         if status.local_screen.is_none() {
@@ -231,9 +255,63 @@ impl StateView {
             config,
             status,
             platform: input::platform_name(),
-            build: env!("GLIDELINK_BUILD"),
-            permissions_ok: input::permissions_ok(),
+            build: env!("RX_SWITCH_BUILD"),
+            permissions: input::permissions(),
             local_interfaces: net::local_interfaces(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn expired_session_is_reaped_without_erasing_the_connection_error() {
+        let status = Status::new(None);
+        let engine = Engine::new(status.clone());
+        let stop = Arc::new(AtomicBool::new(true));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let worker_finished = finished.clone();
+        let worker_status = status.clone();
+        let join = std::thread::spawn(move || {
+            worker_status
+                .finish_session(Some("NET_CONNECTION_EXPIRED"), Some("old address".into()));
+            worker_finished.fetch_add(1, Ordering::Release);
+        });
+        *engine.inner.lock().unwrap() = Some(Running {
+            stop,
+            capture: None,
+            threads: vec![join],
+            layout: None,
+        });
+        // Checks and subsequent starts must both see a free slot after joining
+        // the old workers; their final writes cannot overwrite a new session.
+        assert!(!engine.is_running());
+        assert_eq!(finished.load(Ordering::Acquire), 1);
+        assert!(engine.inner.lock().unwrap().is_none());
+        assert_eq!(
+            status.snapshot().last_error_code.as_deref(),
+            Some("NET_CONNECTION_EXPIRED")
+        );
+    }
+
+    #[test]
+    fn reaping_a_live_session_does_not_disconnect_it() {
+        let status = Status::new(None);
+        let engine = Engine::new(status);
+        let stop = Arc::new(AtomicBool::new(false));
+        *engine.inner.lock().unwrap() = Some(Running {
+            stop: stop.clone(),
+            capture: None,
+            threads: vec![],
+            layout: None,
+        });
+        assert!(engine.is_running());
+        assert!(!stop.load(Ordering::Acquire));
+        engine.stop();
+        assert!(!engine.is_running());
+        assert!(stop.load(Ordering::Acquire));
     }
 }

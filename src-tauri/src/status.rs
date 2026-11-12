@@ -133,11 +133,18 @@ impl Status {
     }
 
     pub fn reset(&self) {
-        let local = self.snapshot().local_screen;
+        self.finish_session(None, None);
+    }
+
+    /// End a session atomically while retaining its actionable failure for the
+    /// UI. Traffic counters are independent and remain available for inspection.
+    pub fn finish_session(&self, error_code: Option<&str>, error_detail: Option<String>) {
         self.update(|s| {
             *s = RuntimeStatus {
                 running: false,
-                local_screen: local,
+                local_screen: s.local_screen,
+                last_error_code: error_code.map(str::to_string),
+                last_error_detail: error_detail,
                 ..RuntimeStatus::default()
             };
         });

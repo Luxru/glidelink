@@ -1,8 +1,8 @@
 use super::{
     keymap::{hid_to_mac, is_caps, is_modifier, mac_to_hid, KeyState, CAPS_LOCK, KEY_DEFS},
-    plan_injection_batch, CaptureHandle, CaptureMsg, CaptureShared, InjectCursor, InjectMsg,
-    InjectStep, InputEvent, KeyAction, KeyOwnership, KeyRepeater, ReconcileState, RemoteInput,
-    WarpInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
+    plan_injection_batch, CaptureHandle, CaptureMsg, CaptureShared, InjectCursor, InjectStep,
+    InputEvent, InputMsg, KeyAction, KeyOwnership, KeyRepeater, PointerPosition, ReconcileState,
+    BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_X1, BUTTON_X2,
 };
 use crate::error;
 use crate::layout::{
@@ -120,6 +120,8 @@ const NX_DEVICE_R_ALT: u64 = 0x0000_0040;
 const NX_DEVICE_R_CTRL: u64 = 0x0000_2000;
 
 const CG_EVENT_SOURCE_STATE_HID_SYSTEM: i32 = 1;
+const CG_EVENT_SOURCE_STATE_PRIVATE: i32 = -1;
+const CG_EVENT_SOURCE_STATE_COMBINED_SESSION: i32 = 0;
 const CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
 
 const CG_MOUSE_BUTTON_LEFT: u32 = 0;
@@ -177,6 +179,10 @@ unsafe extern "C" {
     ) -> CGEventRef;
     fn CGEventCreateKeyboardEvent(source: *mut c_void, key: u16, key_down: u8) -> CGEventRef;
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
+    #[cfg(test)]
+    fn CGEventGetFlags(event: CGEventRef) -> u64;
+    #[cfg(test)]
+    fn CGEventGetType(event: CGEventRef) -> u32;
     fn CGEventSourceCreate(state_id: i32) -> *mut c_void;
     fn CGEventSourceButtonState(state_id: i32, button: u32) -> u8;
     fn CGEventSourceFlagsState(state_id: i32) -> u64;
@@ -224,7 +230,6 @@ unsafe extern "C" {
     fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
     fn CGPreflightListenEventAccess() -> u8;
     fn CGPreflightPostEventAccess() -> u8;
-    fn CGRequestListenEventAccess() -> u8;
     fn CGRequestPostEventAccess() -> u8;
     static kAXTrustedCheckOptionPrompt: CFStringRef;
 }
@@ -341,45 +346,52 @@ fn post_event_access() -> bool {
     unsafe { CGPreflightPostEventAccess() != 0 }
 }
 
-pub fn permissions_ok() -> bool {
-    accessibility_trusted() && listen_event_access() && post_event_access()
+pub fn permissions() -> super::InputPermissions {
+    let capture = accessibility_trusted();
+    let inject = post_event_access();
+    // Read both capabilities on every check so the UI follows permission
+    // changes while the application remains open.
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+    let bits = u8::from(capture) | (u8::from(inject) << 1);
+    if LAST.swap(bits, Ordering::AcqRel) != bits {
+        log::info!(
+            "macOS permissions: capture={capture}, inject={inject}, executable={}",
+            std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+    }
+    super::InputPermissions { capture, inject }
 }
 
-/// Ask macOS to show its permission prompt. Returns the current accessibility
-/// status; the user's answer is asynchronous and usually requires a relaunch.
+/// Ask macOS to show its permission prompt. The user's answer is asynchronous;
+/// subsequent permission checks pick up the updated status.
 fn request_accessibility_prompt() -> bool {
     unsafe {
-        let key = kAXTrustedCheckOptionPrompt as *const c_void;
+        let key = kAXTrustedCheckOptionPrompt;
         let value = kCFBooleanTrue;
         let options = CFDictionaryCreate(null(), &key, &value, 1, null(), null());
         if options.is_null() {
             return accessibility_trusted();
         }
         let trusted = AXIsProcessTrustedWithOptions(options);
-        CFRelease(options as *const c_void);
+        CFRelease(options);
         trusted != 0
     }
 }
 
 pub fn open_permissions() -> Result<(), String> {
-    // Trigger the system prompt for whichever permission is missing, then open
-    // the matching pane. Input Monitoring is a separate pane from Accessibility.
-    let pane = if !accessibility_trusted() {
+    // Both our filtering tap and event posting use Accessibility. Requesting
+    // ListenEvent separately can send users to an empty/unnecessary pane.
+    if !accessibility_trusted() {
         let _ = request_accessibility_prompt();
-        "Privacy_Accessibility"
-    } else if !listen_event_access() {
+    }
+    if !post_event_access() {
         unsafe {
-            CGRequestListenEventAccess();
+            CGRequestPostEventAccess();
         }
-        "Privacy_ListenEvent"
-    } else {
-        if !post_event_access() {
-            unsafe {
-                CGRequestPostEventAccess();
-            }
-        }
-        "Privacy_Accessibility"
-    };
+    }
+    let pane = "Privacy_Accessibility";
 
     log::info!("opening macOS privacy pane: {pane}");
     std::process::Command::new("open")
@@ -533,6 +545,7 @@ struct CaptureState {
     world_layout: Arc<WorldLayout>,
     active: bool,
     target: Option<DeviceId>,
+    target_session: u64,
     hidden: bool,
     buttons: u8,
     point: WorldPoint,
@@ -573,43 +586,29 @@ impl CaptureState {
         self.target
             .map(|device| {
                 self.world_layout
-                    .is_online(crate::layout::ScreenId::Device(device))
+                    .screen_spec(crate::layout::ScreenId::Device(device))
+                    .is_some_and(|screen| screen.online && screen.session == self.target_session)
             })
             .unwrap_or(false)
     }
 
-    fn local_point(&self) -> Option<NormPoint> {
-        let device = self.target?;
-        self.world_layout
-            .world_to_local(crate::layout::ScreenId::Device(device), self.point)
-    }
-
-    fn send_relative(&self, dx: i32, dy: i32) {
-        if dx == 0 && dy == 0 {
-            return;
-        }
+    fn send_position(&self, world: WorldPoint) {
         let Some(device) = self.target else {
             return;
         };
-        let _ = self.tx.try_send(CaptureMsg::Move {
-            device,
-            input: RemoteInput { dx, dy },
-        });
-    }
-
-    fn send_warp(&self) {
-        let Some(device) = self.target else {
+        let Some(local) = self
+            .world_layout
+            .world_to_local(crate::layout::ScreenId::Device(device), world)
+        else {
             return;
         };
-        let Some(local) = self.local_point() else {
-            return;
-        };
-        let _ = self.tx.try_send(CaptureMsg::Warp {
+        let _ = self.tx.try_send(CaptureMsg {
             device,
-            input: WarpInput {
+            session: self.target_session,
+            input: InputMsg::Pointer(PointerPosition {
                 x: local.x,
                 y: local.y,
-            },
+            }),
         });
     }
 
@@ -617,7 +616,11 @@ impl CaptureState {
         let Some(device) = self.target else {
             return;
         };
-        let _ = self.tx.try_send(CaptureMsg::Event { device, event });
+        let _ = self.tx.try_send(CaptureMsg {
+            device,
+            session: self.target_session,
+            input: InputMsg::Event(event),
+        });
     }
 
     fn send_reconcile(&self, active: bool) {
@@ -634,7 +637,11 @@ impl CaptureState {
                 KeyState::EMPTY
             },
         };
-        let _ = self.tx.try_send(CaptureMsg::Reconcile { device, state });
+        let _ = self.tx.try_send(CaptureMsg {
+            device,
+            session: self.target_session,
+            input: InputMsg::Reconcile(state),
+        });
     }
 
     fn apply_key_action(&mut self, action: KeyAction, hid: u8, event: CGEventRef) -> CGEventRef {
@@ -671,7 +678,10 @@ impl CaptureState {
             };
         };
 
-        if event_type == CG_EVENT_KEY_DOWN && hid == 0x2A && ctrl_alt_pressed() {
+        if event_type == CG_EVENT_KEY_DOWN
+            && hid == 0x2A
+            && (self.keys.release_chord_pressed() || ctrl_alt_pressed())
+        {
             self.deactivate_to_host(true, None);
             return std::ptr::null_mut();
         }
@@ -781,7 +791,6 @@ impl CaptureState {
                 }
             }
             if self.active {
-                self.send_event(InputEvent::ReleaseAll);
                 self.buttons = 0;
                 let held = current_held_keys();
                 self.keys.rebind(held);
@@ -817,23 +826,15 @@ impl CaptureState {
                     let Some(device) = self.target else {
                         return null_mut();
                     };
-                    let old = self.point;
-                    let host_w_f = host_w as f32;
                     match step_active(&self.world_layout, device, self.point, dx, dy, host_w) {
                         StepResult::Stay { world, .. } | StepResult::Wall { world, .. } => {
                             self.point = world;
-                            self.send_relative(
-                                ((world.x - old.x) * host_w_f).round() as i32,
-                                ((world.y - old.y) * host_w_f).round() as i32,
-                            );
+                            self.send_position(world);
                         }
                         StepResult::ReturnHost {
                             world, consumed, ..
                         } => {
-                            self.send_relative(
-                                ((consumed.x - old.x) * host_w_f).round() as i32,
-                                ((consumed.y - old.y) * host_w_f).round() as i32,
-                            );
+                            self.send_position(consumed);
                             self.point = world;
                             self.deactivate_to_host(true, Some(world));
                         }
@@ -843,10 +844,7 @@ impl CaptureState {
                             consumed,
                             ..
                         } => {
-                            self.send_relative(
-                                ((consumed.x - old.x) * host_w_f).round() as i32,
-                                ((consumed.y - old.y) * host_w_f).round() as i32,
-                            );
+                            self.send_position(consumed);
                             self.switch_target(target, world);
                         }
                     }
@@ -911,8 +909,16 @@ impl CaptureState {
         }
         self.active = true;
         self.target = Some(device);
+        self.target_session = self
+            .world_layout
+            .screen_spec(crate::layout::ScreenId::Device(device))
+            .map_or(0, |screen| screen.session);
         self.point = world;
         self.host_anchor = host_anchor;
+        log::info!(
+            "input target activate {}",
+            crate::layout::device_id_to_hex(&device)
+        );
         self.buttons = current_buttons();
         self.keys.begin(current_held_keys());
         self.caps_lock = current_caps_lock();
@@ -925,7 +931,7 @@ impl CaptureState {
             }
             self.hidden = true;
         }
-        self.send_warp();
+        self.send_position(self.point);
         self.send_reconcile(true);
     }
 
@@ -933,22 +939,30 @@ impl CaptureState {
         if self.target == Some(device) {
             return;
         }
-        if let Some(old) = self.target {
-            let _ = self.tx.try_send(CaptureMsg::Event {
+        let old = self.target;
+        if let Some(old) = old {
+            let _ = self.tx.try_send(CaptureMsg {
                 device: old,
-                event: InputEvent::ReleaseAll,
-            });
-            let _ = self.tx.try_send(CaptureMsg::Reconcile {
-                device: old,
-                state: ReconcileState {
+                session: self.target_session,
+                input: InputMsg::Reconcile(ReconcileState {
                     active: false,
                     caps_lock: self.caps_lock,
                     buttons: 0,
                     keys: KeyState::EMPTY,
-                },
+                }),
             });
         }
+        log::info!(
+            "input target switch {} -> {}",
+            old.map(|value| crate::layout::device_id_to_hex(&value))
+                .unwrap_or_else(|| "host".to_string()),
+            crate::layout::device_id_to_hex(&device)
+        );
         self.target = Some(device);
+        self.target_session = self
+            .world_layout
+            .screen_spec(crate::layout::ScreenId::Device(device))
+            .map_or(0, |screen| screen.session);
         self.point = world;
         self.buttons = current_buttons();
         self.keys.deactivate();
@@ -956,26 +970,29 @@ impl CaptureState {
         self.caps_lock = current_caps_lock();
         self.caps_down = false;
         self.shared.set_active(true);
-        self.send_warp();
+        self.send_position(self.point);
         self.send_reconcile(true);
     }
 
     fn deactivate_to_host(&mut self, warp_back: bool, world: Option<WorldPoint>) {
         let old = self.target.take();
         if let Some(device) = old {
-            let _ = self.tx.try_send(CaptureMsg::Event {
+            let _ = self.tx.try_send(CaptureMsg {
                 device,
-                event: InputEvent::ReleaseAll,
-            });
-            let _ = self.tx.try_send(CaptureMsg::Reconcile {
-                device,
-                state: ReconcileState {
+                session: self.target_session,
+                input: InputMsg::Reconcile(ReconcileState {
                     active: false,
                     caps_lock: self.caps_lock,
                     buttons: 0,
                     keys: KeyState::EMPTY,
-                },
+                }),
             });
+        }
+        if let Some(device) = old {
+            log::info!(
+                "input target leave {}",
+                crate::layout::device_id_to_hex(&device)
+            );
         }
         self.active = false;
         self.buttons = 0;
@@ -1081,7 +1098,7 @@ pub fn start_capture(
     tx: Sender<CaptureMsg>,
 ) -> Result<CaptureHandle, String> {
     unsafe {
-        if AXIsProcessTrusted() == 0 || CGPreflightListenEventAccess() == 0 {
+        if AXIsProcessTrusted() == 0 {
             return Err(error::code("E_MAC_PERMISSIONS_CAPTURE"));
         }
     }
@@ -1090,7 +1107,7 @@ pub fn start_capture(
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let thread_shared = Arc::clone(&shared);
     let join = thread::Builder::new()
-        .name("glidelink-input-capture".into())
+        .name("rx-switch-input-capture".into())
         .spawn(move || run_capture_thread(thread_shared, tx, bounds, ready_tx))
         .map_err(|e| error::detail("E_CAPTURE_THREAD", e))?;
 
@@ -1128,6 +1145,7 @@ fn run_capture_thread(
         world_layout,
         active: false,
         target: None,
+        target_session: 0,
         hidden: false,
         buttons: 0,
         point: WorldPoint::default(),
@@ -1208,21 +1226,20 @@ fn run_capture_thread(
 }
 
 pub fn start_injector(
-    rx: Receiver<InjectMsg>,
+    rx: Receiver<InputMsg>,
     stop: Arc<AtomicBool>,
     _status: Status,
 ) -> Result<JoinHandle<()>, String> {
-    unsafe {
-        if AXIsProcessTrusted() == 0 || CGPreflightPostEventAccess() == 0 {
-            return Err(error::code("E_MAC_PERMISSIONS_INJECT"));
-        }
+    let granted = permissions();
+    if !granted.capture || !granted.inject {
+        return Err(error::code("E_MAC_PERMISSIONS_INJECT"));
     }
     let bounds = virtual_bounds().ok_or_else(|| error::code("E_MAC_DISPLAYS"))?;
 
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let thread_stop = Arc::clone(&stop);
     let join = thread::Builder::new()
-        .name("glidelink-input-injector".into())
+        .name("rx-switch-input-injector".into())
         .spawn(move || injector_loop(rx, thread_stop, bounds, ready_tx))
         .map_err(|e| error::detail("E_INJECTOR_THREAD", e))?;
 
@@ -1241,12 +1258,22 @@ pub fn start_injector(
 }
 
 fn injector_loop(
-    rx: Receiver<InjectMsg>,
+    rx: Receiver<InputMsg>,
     stop: Arc<AtomicBool>,
     bounds: CGRect,
     ready_tx: mpsc::Sender<Result<(), String>>,
 ) {
     crate::sched::boost_current_thread();
+    // All injected devices share private state. A default/HID source can
+    // inherit modifiers left behind by earlier synthetic events or local input.
+    let event_source = unsafe { CGEventSourceCreate(CG_EVENT_SOURCE_STATE_PRIVATE) };
+    if event_source.is_null() {
+        let _ = ready_tx.send(Err(error::detail(
+            "E_INJECTOR_THREAD",
+            "CGEventSourceCreate failed",
+        )));
+        return;
+    }
     let _ = ready_tx.send(Ok(()));
     let mut applied_buttons = 0u8;
     let mut applied_position: Option<(u16, u16)> = None;
@@ -1255,7 +1282,6 @@ fn injector_loop(
     let mut caps_actual = unsafe {
         CGEventSourceFlagsState(CG_EVENT_SOURCE_STATE_HID_SYSTEM) & CG_FLAG_ALPHA_SHIFT != 0
     };
-    let key_source = unsafe { CGEventSourceCreate(CG_EVENT_SOURCE_STATE_HID_SYSTEM) };
     let caps_connection = open_caps_lock_connection();
     let mut repeater = KeyRepeater::default();
     let mut cursor = InjectCursor {
@@ -1269,7 +1295,7 @@ fn injector_loop(
         let now = Instant::now();
         if let Some(hid) = repeater.poll(now) {
             if applied_keys.contains(hid) && !is_modifier(hid) {
-                post_key_event(key_source, hid, true, true, &applied_keys, caps_actual);
+                post_key_event(event_source, hid, true, true, &applied_keys, caps_actual);
             }
         }
 
@@ -1289,35 +1315,46 @@ fn injector_loop(
             }
         }
 
+        let batch_started = Instant::now();
         steps.clear();
         plan_injection_batch(&batch, &mut cursor, &mut steps);
         for step in steps.iter().copied() {
             match step {
-                InjectStep::Move { dx, dy, buttons } => {
-                    if let Some(point) = inject_relative_move(dx, dy, buttons, bounds) {
-                        applied_position = Some(normalized_from_point(point, bounds));
-                    }
-                }
-                InjectStep::Warp { x, y, buttons } => {
+                InjectStep::Pointer { x, y, buttons } => {
                     let point = point_from_normalized(x, y, bounds);
                     let (event_type, button) =
                         drag_event(buttons).unwrap_or((CG_EVENT_MOUSE_MOVED, CG_MOUSE_BUTTON_LEFT));
-                    post_mouse_event(event_type, point, button);
+                    let previous =
+                        applied_position.map(|(px, py)| point_from_normalized(px, py, bounds));
+                    post_mouse_event(
+                        EventContext::new(event_source, &applied_keys, caps_actual),
+                        event_type,
+                        point,
+                        previous,
+                        button,
+                    );
                     applied_position = Some((x, y));
                 }
                 InjectStep::Buttons { from, to } => {
                     let point = applied_point_or_origin(applied_position, bounds);
-                    apply_button_transitions(from, to, point, &mut clicks);
+                    apply_button_transitions(
+                        EventContext::new(event_source, &applied_keys, caps_actual),
+                        from,
+                        to,
+                        point,
+                        &mut clicks,
+                    );
                     applied_buttons = to;
                 }
                 InjectStep::Wheel(delta) => unsafe {
                     let event = CGEventCreateScrollWheelEvent(
-                        null_mut(),
+                        event_source,
                         CG_SCROLL_EVENT_UNIT_LINE,
                         1,
                         delta as i32,
                     );
                     if !event.is_null() {
+                        CGEventSetFlags(event, mac_event_flags(&applied_keys, caps_actual));
                         CGEventPost(CG_TAP_LOCATION_HID, event);
                         CFRelease(event as *const c_void);
                     }
@@ -1327,10 +1364,10 @@ fn injector_loop(
                         applied_keys.insert(hid);
                         repeater.press(hid, Instant::now());
                         if is_modifier(hid) {
-                            post_modifier_event(key_source, hid, &applied_keys, caps_actual);
+                            post_modifier_event(event_source, hid, &applied_keys, caps_actual);
                         } else {
                             post_key_event(
-                                key_source,
+                                event_source,
                                 hid,
                                 true,
                                 false,
@@ -1345,10 +1382,10 @@ fn injector_loop(
                     if applied_keys.contains(hid) {
                         applied_keys.remove(hid);
                         if is_modifier(hid) {
-                            post_modifier_event(key_source, hid, &applied_keys, caps_actual);
+                            post_modifier_event(event_source, hid, &applied_keys, caps_actual);
                         } else {
                             post_key_event(
-                                key_source,
+                                event_source,
                                 hid,
                                 false,
                                 false,
@@ -1359,27 +1396,54 @@ fn injector_loop(
                     }
                 }
                 InjectStep::CapsLock(desired) => {
-                    // Caps Lock is a locking modifier on macOS, and the same
-                    // key may be configured to switch input sources. Prefer
-                    // setting the hardware lock state directly so a remote
-                    // lock request cannot accidentally switch the agent's IME.
+                    // Reconciliation repairs the lock without simulating a
+                    // physical press (which could switch the input source).
                     caps_actual = current_caps_lock();
                     if desired != caps_actual {
-                        if let Some(connect) = caps_connection {
-                            if set_caps_lock_state(connect, desired) {
-                                caps_actual = desired;
-                                continue;
-                            }
+                        if !caps_connection
+                            .is_some_and(|connect| set_caps_lock_state(connect, desired))
+                        {
+                            log::warn!("could not reconcile macOS Caps Lock hardware state");
                         }
-                        inject_caps_tap(key_source, desired, &applied_keys);
                         caps_actual = desired;
                     }
                 }
+                InjectStep::CapsLockTap(desired) => {
+                    if !applied_keys.iter().any(is_modifier)
+                        && super::macos_source::switch_for_caps_lock(&stop)
+                    {
+                        if let Some(connect) = caps_connection {
+                            let _ = set_caps_lock_state(connect, false);
+                        }
+                        caps_actual = false;
+                        continue;
+                    }
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if !caps_connection.is_some_and(|connect| set_caps_lock_state(connect, desired))
+                    {
+                        log::warn!(
+                            "could not update macOS Caps Lock LED; posting native flags change"
+                        );
+                    }
+                    // Hardware state alone doesn't notify AppKit/IME clients.
+                    // Caps is a FlagsChanged modifier, not an ordinary pair of
+                    // keyDown/keyUp events. Let the receiver process that event.
+                    inject_caps_tap(event_source, desired, &applied_keys);
+                    caps_actual = desired;
+                }
                 InjectStep::Reset => {
-                    release_keys(key_source, &mut applied_keys, caps_actual);
+                    release_keys(event_source, &mut applied_keys, caps_actual);
                     repeater.release_all();
                     let point = applied_point_or_origin(applied_position, bounds);
-                    apply_button_transitions(applied_buttons, 0, point, &mut clicks);
+                    apply_button_transitions(
+                        EventContext::new(event_source, &applied_keys, caps_actual),
+                        applied_buttons,
+                        0,
+                        point,
+                        &mut clicks,
+                    );
                     applied_buttons = 0;
                     applied_position = None;
                     caps_actual = current_caps_lock();
@@ -1387,16 +1451,31 @@ fn injector_loop(
                 }
             }
         }
+        let elapsed = batch_started.elapsed();
+        if elapsed >= Duration::from_millis(4) || rx.len() > 64 {
+            log::debug!(
+                "injection batch inputs={} queue={} elapsed_ms={:.1}",
+                batch.len(),
+                rx.len(),
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
     }
 
-    release_keys(key_source, &mut applied_keys, caps_actual);
+    release_keys(event_source, &mut applied_keys, caps_actual);
     if applied_buttons != 0 {
         let point = applied_point_or_origin(applied_position, bounds);
-        apply_button_transitions(applied_buttons, 0, point, &mut clicks);
+        apply_button_transitions(
+            EventContext::new(event_source, &applied_keys, caps_actual),
+            applied_buttons,
+            0,
+            point,
+            &mut clicks,
+        );
     }
-    if !key_source.is_null() {
+    if !event_source.is_null() {
         unsafe {
-            CFRelease(key_source);
+            CFRelease(event_source);
         }
     }
     if let Some(connect) = caps_connection {
@@ -1434,24 +1513,35 @@ fn post_key_event(
     keys: &KeyState,
     caps_lock: bool,
 ) {
+    let event = create_key_event(source, hid, down, repeat, keys, caps_lock);
+    post_and_release(event);
+}
+
+fn create_key_event(
+    source: *mut c_void,
+    hid: u8,
+    down: bool,
+    repeat: bool,
+    keys: &KeyState,
+    caps_lock: bool,
+) -> CGEventRef {
     let Some(keycode) = hid_to_mac(hid) else {
-        return;
+        return null_mut();
     };
     unsafe {
         let event = CGEventCreateKeyboardEvent(source, keycode, if down { 1 } else { 0 });
         if event.is_null() {
-            return;
+            return event;
         }
-        let mut flags = mac_flags(keys, caps_lock);
-        if matches!(keycode, 0x7B | 0x7C | 0x7D | 0x7E) {
+        let mut flags = mac_event_flags(keys, caps_lock);
+        if matches!(keycode, 0x7B..=0x7E) {
             flags |= CG_FLAG_NUMERIC_PAD | CG_FLAG_SECONDARY_FN;
         }
         CGEventSetFlags(event, flags);
         if repeat {
             CGEventSetIntegerValueField(event, CG_KEYBOARD_EVENT_AUTOREPEAT, 1);
         }
-        CGEventPost(CG_TAP_LOCATION_HID, event);
-        CFRelease(event as *const c_void);
+        event
     }
 }
 
@@ -1485,37 +1575,83 @@ fn mac_device_flags(keys: &KeyState) -> u64 {
 }
 
 fn post_modifier_event(source: *mut c_void, hid: u8, keys: &KeyState, caps_lock: bool) {
+    log::debug!(
+        "inject modifier hid={hid:#04x} down={} flags={:#x}",
+        keys.contains(hid),
+        mac_event_flags(keys, caps_lock)
+    );
+    post_and_release(create_modifier_event(source, hid, keys, caps_lock));
+}
+
+fn create_modifier_event(
+    source: *mut c_void,
+    hid: u8,
+    keys: &KeyState,
+    caps_lock: bool,
+) -> CGEventRef {
     let Some(keycode) = hid_to_mac(hid) else {
-        return;
+        return null_mut();
     };
     unsafe {
-        let event = CGEventCreateKeyboardEvent(source, keycode, 1);
+        let event = CGEventCreateKeyboardEvent(source, keycode, u8::from(keys.contains(hid)));
         if event.is_null() {
-            return;
+            return event;
         }
         CGEventSetType(event, CG_EVENT_FLAGS_CHANGED);
         CGEventSetFlags(
             event,
-            mac_flags(keys, caps_lock) | mac_device_flags(keys) | CG_FLAG_NON_COALESCED,
+            mac_event_flags(keys, caps_lock) | CG_FLAG_NON_COALESCED,
         );
-        CGEventPost(CG_TAP_LOCATION_HID, event);
-        CFRelease(event as *const c_void);
+        event
+    }
+}
+
+fn mac_event_flags(keys: &KeyState, caps_lock: bool) -> u64 {
+    mac_flags(keys, caps_lock) | mac_device_flags(keys)
+}
+
+fn post_and_release(event: CGEventRef) {
+    if !event.is_null() {
+        unsafe {
+            CGEventPost(CG_TAP_LOCATION_HID, event);
+            CFRelease(event as *const c_void);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EventContext {
+    source: *mut c_void,
+    flags: u64,
+}
+
+impl EventContext {
+    fn new(source: *mut c_void, keys: &KeyState, caps_lock: bool) -> Self {
+        Self {
+            source,
+            flags: mac_event_flags(keys, caps_lock),
+        }
     }
 }
 
 fn inject_caps_tap(source: *mut c_void, caps_after: bool, keys: &KeyState) {
+    post_and_release(create_caps_event(source, caps_after, keys));
+}
+
+fn create_caps_event(source: *mut c_void, caps_after: bool, keys: &KeyState) -> CGEventRef {
     let Some(keycode) = hid_to_mac(CAPS_LOCK) else {
-        return;
+        return null_mut();
     };
     unsafe {
-        for down in [1u8, 0u8] {
-            let event = CGEventCreateKeyboardEvent(source, keycode, down);
-            if !event.is_null() {
-                CGEventSetFlags(event, mac_flags(keys, caps_after));
-                CGEventPost(CG_TAP_LOCATION_HID, event);
-                CFRelease(event as *const c_void);
-            }
+        let event = CGEventCreateKeyboardEvent(source, keycode, u8::from(caps_after));
+        if !event.is_null() {
+            CGEventSetType(event, CG_EVENT_FLAGS_CHANGED);
+            CGEventSetFlags(
+                event,
+                mac_event_flags(keys, caps_after) | CG_FLAG_NON_COALESCED,
+            );
         }
+        event
     }
 }
 
@@ -1530,52 +1666,6 @@ fn release_keys(source: *mut c_void, keys: &mut KeyState, caps_lock: bool) {
         keys.remove(hid);
         post_modifier_event(source, hid, keys, caps_lock);
     }
-}
-
-fn current_cursor_point() -> Option<CGPoint> {
-    unsafe {
-        let event = CGEventCreate(null_mut());
-        if event.is_null() {
-            return None;
-        }
-        let point = CGEventGetLocation(event);
-        CFRelease(event as *const c_void);
-        Some(point)
-    }
-}
-
-fn inject_relative_move(dx: i32, dy: i32, buttons: u8, bounds: CGRect) -> Option<CGPoint> {
-    let mut point = current_cursor_point()?;
-    point.x = (point.x + dx as f64).clamp(
-        bounds.min_x(),
-        bounds.max_x().max(bounds.min_x() + 1.0) - 1.0,
-    );
-    point.y = (point.y + dy as f64).clamp(
-        bounds.min_y(),
-        bounds.max_y().max(bounds.min_y() + 1.0) - 1.0,
-    );
-    let (event_type, button) =
-        drag_event(buttons).unwrap_or((CG_EVENT_MOUSE_MOVED, CG_MOUSE_BUTTON_LEFT));
-    unsafe {
-        let event = CGEventCreateMouseEvent(null_mut(), event_type, point, button);
-        if event.is_null() {
-            return None;
-        }
-        CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_X, dx as i64);
-        CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_Y, dy as i64);
-        CGEventPost(CG_TAP_LOCATION_HID, event);
-        CFRelease(event as *const c_void);
-    }
-    Some(point)
-}
-
-fn normalized_from_point(point: CGPoint, bounds: CGRect) -> (u16, u16) {
-    let width = (bounds.size.width - 1.0).max(1.0);
-    let height = (bounds.size.height - 1.0).max(1.0);
-    (
-        (((point.x - bounds.min_x()) / width).clamp(0.0, 1.0) * u16::MAX as f64).round() as u16,
-        (((point.y - bounds.min_y()) / height).clamp(0.0, 1.0) * u16::MAX as f64).round() as u16,
-    )
 }
 
 fn point_from_normalized(x: u16, y: u16, bounds: CGRect) -> CGPoint {
@@ -1594,19 +1684,58 @@ fn applied_point_or_origin(position: Option<(u16, u16)>, bounds: CGRect) -> CGPo
         })
 }
 
-fn post_mouse_event(event_type: u32, point: CGPoint, button: u32) {
+fn create_mouse_event(
+    context: EventContext,
+    event_type: u32,
+    point: CGPoint,
+    button: u32,
+) -> CGEventRef {
     unsafe {
-        let event = CGEventCreateMouseEvent(null_mut(), event_type, point, button);
+        let event = CGEventCreateMouseEvent(context.source, event_type, point, button);
         if !event.is_null() {
+            CGEventSetFlags(event, context.flags);
+        }
+        event
+    }
+}
+
+fn post_mouse_event(
+    context: EventContext,
+    event_type: u32,
+    point: CGPoint,
+    previous: Option<CGPoint>,
+    button: u32,
+) {
+    unsafe {
+        let event = create_mouse_event(context, event_type, point, button);
+        if !event.is_null() {
+            if let Some(previous) = previous {
+                CGEventSetIntegerValueField(
+                    event,
+                    CG_MOUSE_EVENT_DELTA_X,
+                    (point.x - previous.x).round() as i64,
+                );
+                CGEventSetIntegerValueField(
+                    event,
+                    CG_MOUSE_EVENT_DELTA_Y,
+                    (point.y - previous.y).round() as i64,
+                );
+            }
             CGEventPost(CG_TAP_LOCATION_HID, event);
             CFRelease(event as *const c_void);
         }
     }
 }
 
-fn post_mouse_event_with_click(event_type: u32, point: CGPoint, button: u32, click_state: i64) {
+fn post_mouse_event_with_click(
+    context: EventContext,
+    event_type: u32,
+    point: CGPoint,
+    button: u32,
+    click_state: i64,
+) {
     unsafe {
-        let event = CGEventCreateMouseEvent(null_mut(), event_type, point, button);
+        let event = create_mouse_event(context, event_type, point, button);
         if !event.is_null() {
             CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_CLICK_STATE, click_state);
             CGEventPost(CG_TAP_LOCATION_HID, event);
@@ -1642,9 +1771,19 @@ fn drag_event(buttons: u8) -> Option<(u32, u32)> {
     }
 }
 
-fn apply_button_transitions(previous: u8, current: u8, point: CGPoint, clicks: &mut ClickTracker) {
+fn apply_button_transitions(
+    context: EventContext,
+    previous: u8,
+    current: u8,
+    point: CGPoint,
+    clicks: &mut ClickTracker,
+) {
     let changed = previous ^ current;
+    if changed != 0 {
+        log::debug!("agent buttons {previous:#04x} -> {current:#04x}");
+    }
     post_transition(
+        context,
         changed,
         current,
         BUTTON_LEFT,
@@ -1655,6 +1794,7 @@ fn apply_button_transitions(previous: u8, current: u8, point: CGPoint, clicks: &
         clicks,
     );
     post_transition(
+        context,
         changed,
         current,
         BUTTON_RIGHT,
@@ -1665,6 +1805,7 @@ fn apply_button_transitions(previous: u8, current: u8, point: CGPoint, clicks: &
         clicks,
     );
     post_transition(
+        context,
         changed,
         current,
         BUTTON_MIDDLE,
@@ -1675,6 +1816,7 @@ fn apply_button_transitions(previous: u8, current: u8, point: CGPoint, clicks: &
         clicks,
     );
     post_transition(
+        context,
         changed,
         current,
         BUTTON_X1,
@@ -1685,6 +1827,7 @@ fn apply_button_transitions(previous: u8, current: u8, point: CGPoint, clicks: &
         clicks,
     );
     post_transition(
+        context,
         changed,
         current,
         BUTTON_X2,
@@ -1698,6 +1841,7 @@ fn apply_button_transitions(previous: u8, current: u8, point: CGPoint, clicks: &
 
 #[allow(clippy::too_many_arguments)]
 fn post_transition(
+    context: EventContext,
     changed: u8,
     current: u8,
     bit: u8,
@@ -1717,7 +1861,7 @@ fn post_transition(
         clicks.up(bit)
     };
     let event_type = if is_down { down } else { up };
-    post_mouse_event_with_click(event_type, point, button, click_state);
+    post_mouse_event_with_click(context, event_type, point, button, click_state);
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -1736,7 +1880,7 @@ fn yes_no(value: bool) -> &'static str {
 /// from the terminal/app that will actually be granted access. The user's cursor
 /// is restored afterwards.
 pub fn self_test() -> bool {
-    println!("GlideLink macOS input self-test");
+    println!("rx-switch macOS input self-test");
     println!("Permissions are granted per executable. Grant them to the");
     println!("application you run this from, then rerun with --self-test.");
     println!();
@@ -1761,7 +1905,7 @@ pub fn self_test() -> bool {
     println!();
 
     let mut ok = true;
-    if ax && listen {
+    if ax {
         match test_capture(bounds) {
             Ok(()) => println!("capture:                PASS"),
             Err(e) => {
@@ -1770,7 +1914,7 @@ pub fn self_test() -> bool {
             }
         }
     } else {
-        println!("capture:                SKIP (needs Accessibility + Input Monitoring)");
+        println!("capture:                SKIP (needs Accessibility)");
         ok = false;
     }
 
@@ -1809,8 +1953,8 @@ pub fn self_test() -> bool {
     } else {
         println!("result: FAIL");
         println!();
-        println!("Open System Settings -> Privacy & Security and grant GlideLink the");
-        println!("permissions reported above, then relaunch and rerun this test.");
+        println!("Open System Settings -> Privacy & Security and grant rx-switch the");
+        println!("permissions reported above, then rerun this test.");
     }
     ok
 }
@@ -1826,9 +1970,9 @@ fn test_capture(bounds: CGRect) -> Result<(), String> {
         host,
         vec![crate::layout::ScreenSpec {
             id: device,
-            label: "self-test".into(),
             rect: crate::layout::screen_rect(host, 1.0, 0.0),
             online: true,
+            session: 1,
         }],
     );
     let shared = CaptureShared::new(status, LayoutStore::new(world));
@@ -1863,7 +2007,11 @@ fn test_capture(bounds: CGRect) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(CaptureMsg::Warp { device: target, .. }) if target == device => return Ok(()),
+                Ok(CaptureMsg {
+                    device: target,
+                    input: InputMsg::Pointer(_),
+                    ..
+                }) if target == device => return Ok(()),
                 Ok(_) => continue,
                 Err(_) => {
                     return Err("no input was captured after a synthetic edge crossing".to_string())
@@ -1883,12 +2031,12 @@ fn test_capture(bounds: CGRect) -> Result<(), String> {
 fn test_caps_injection() -> Result<(), String> {
     let status = Status::new(screen_info());
     let stop = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = crossbeam_channel::unbounded::<InjectMsg>();
+    let (tx, rx) = crossbeam_channel::unbounded::<InputMsg>();
     let handle = start_injector(rx, Arc::clone(&stop), status)?;
     let before = current_caps_lock();
 
     let send_caps = |desired: bool| {
-        tx.send(InjectMsg::Event(InputEvent::CapsLock { locked: desired }))
+        tx.send(InputMsg::Event(InputEvent::CapsLock { locked: desired }))
             .map_err(|_| "injector thread stopped".to_string())
     };
     let wait_caps = |desired: bool| {
@@ -1903,7 +2051,7 @@ fn test_caps_injection() -> Result<(), String> {
 
     let flipped = send_caps(!before).is_ok() && wait_caps(!before);
     let restored = send_caps(before).is_ok() && wait_caps(before);
-    let _ = tx.send(InjectMsg::Reset);
+    let _ = tx.send(InputMsg::Reset);
     stop.store(true, Ordering::Release);
     let _ = handle.join();
 
@@ -1931,17 +2079,17 @@ fn test_caps_injection() -> Result<(), String> {
 fn test_modifier_injection() -> Result<(), String> {
     let status = Status::new(screen_info());
     let stop = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = crossbeam_channel::unbounded::<InjectMsg>();
+    let (tx, rx) = crossbeam_channel::unbounded::<InputMsg>();
     let handle = start_injector(rx, Arc::clone(&stop), status)?;
 
     let send_shift = |down: bool| {
-        tx.send(InjectMsg::Event(InputEvent::Key { hid: 0xE1, down }))
+        tx.send(InputMsg::Event(InputEvent::Key { hid: 0xE1, down }))
             .map_err(|_| "injector thread stopped".to_string())
     };
     let wait_shift = |desired: bool| {
         for _ in 0..50 {
             let shift = unsafe {
-                CGEventSourceFlagsState(CG_EVENT_SOURCE_STATE_HID_SYSTEM) & CG_FLAG_SHIFT != 0
+                CGEventSourceFlagsState(CG_EVENT_SOURCE_STATE_COMBINED_SESSION) & CG_FLAG_SHIFT != 0
             };
             if shift == desired {
                 return true;
@@ -1954,7 +2102,7 @@ fn test_modifier_injection() -> Result<(), String> {
     let pressed = send_shift(true).is_ok() && wait_shift(true);
     let released = send_shift(false).is_ok() && wait_shift(false);
 
-    let _ = tx.send(InjectMsg::Reset);
+    let _ = tx.send(InputMsg::Reset);
     stop.store(true, Ordering::Release);
     let _ = handle.join();
 
@@ -1970,7 +2118,7 @@ fn test_modifier_injection() -> Result<(), String> {
 fn test_injection(bounds: CGRect) -> Result<(), String> {
     let status = Status::new(screen_info());
     let stop = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = crossbeam_channel::unbounded::<InjectMsg>();
+    let (tx, rx) = crossbeam_channel::unbounded::<InputMsg>();
     let handle = start_injector(rx, Arc::clone(&stop), status)?;
     let saved = cursor_location();
 
@@ -1983,7 +2131,7 @@ fn test_injection(bounds: CGRect) -> Result<(), String> {
     };
     let norm_x = (target.x - bounds.min_x()) / (bounds.size.width - 1.0).max(1.0);
     let norm_y = (target.y - bounds.min_y()) / (bounds.size.height - 1.0).max(1.0);
-    tx.send(InjectMsg::Warp(WarpInput {
+    tx.send(InputMsg::Pointer(PointerPosition {
         x: norm_x as f32,
         y: norm_y as f32,
     }))
@@ -1999,13 +2147,16 @@ fn test_injection(bounds: CGRect) -> Result<(), String> {
     }
     let warped = (actual.x - target.x).abs() < 8.0 && (actual.y - target.y).abs() < 8.0;
 
-    let _ = tx.send(InjectMsg::Move(RemoteInput { dx: 8, dy: 4 }));
+    let _ = tx.send(InputMsg::Pointer(PointerPosition {
+        x: ((target.x + 8.0 - bounds.min_x()) / (bounds.size.width - 1.0).max(1.0)) as f32,
+        y: ((target.y + 4.0 - bounds.min_y()) / (bounds.size.height - 1.0).max(1.0)) as f32,
+    }));
     thread::sleep(Duration::from_millis(100));
-    let relative = cursor_location();
-    let moved =
-        (relative.x - actual.x - 8.0).abs() < 8.0 && (relative.y - actual.y - 4.0).abs() < 8.0;
+    let moved_position = cursor_location();
+    let moved = (moved_position.x - actual.x - 8.0).abs() < 8.0
+        && (moved_position.y - actual.y - 4.0).abs() < 8.0;
 
-    let _ = tx.send(InjectMsg::Reset);
+    let _ = tx.send(InputMsg::Reset);
     stop.store(true, Ordering::Release);
     let _ = handle.join();
     warp_cursor(saved);
@@ -2014,8 +2165,8 @@ fn test_injection(bounds: CGRect) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "cursor warp/relative failed: actual=({:.0}, {:.0}) target=({:.0}, {:.0}) relative=({:.0}, {:.0})",
-            actual.x, actual.y, target.x, target.y, relative.x, relative.y
+            "cursor absolute movement failed: actual=({:.0}, {:.0}) target=({:.0}, {:.0}) moved=({:.0}, {:.0})",
+            actual.x, actual.y, target.x, target.y, moved_position.x, moved_position.y
         ))
     }
 }
@@ -2023,6 +2174,94 @@ fn test_injection(bounds: CGRect) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These tests construct events and inspect their fields without posting
+    // them, so they cannot type, click, or change the user's modifier state.
+    struct NativeRef(*mut c_void);
+
+    impl NativeRef {
+        fn new(value: *mut c_void) -> Self {
+            assert!(!value.is_null());
+            Self(value)
+        }
+    }
+
+    impl Drop for NativeRef {
+        fn drop(&mut self) {
+            unsafe { CFRelease(self.0) };
+        }
+    }
+
+    #[test]
+    fn released_modifiers_clear_from_both_keyboard_and_mouse_events() {
+        let source = NativeRef::new(unsafe { CGEventSourceCreate(CG_EVENT_SOURCE_STATE_PRIVATE) });
+        for (hid, mask, device_mask) in [
+            (0xE3, CG_FLAG_COMMAND, NX_DEVICE_L_CMD),
+            (0xE7, CG_FLAG_COMMAND, NX_DEVICE_R_CMD),
+            (0xE0, CG_FLAG_CONTROL, NX_DEVICE_L_CTRL),
+            (0xE6, CG_FLAG_ALTERNATE, NX_DEVICE_R_ALT),
+            (0xE1, CG_FLAG_SHIFT, NX_DEVICE_L_SHIFT),
+        ] {
+            let mut keys = KeyState::EMPTY;
+            keys.insert(hid);
+            for held in [true, false] {
+                if !held {
+                    keys.remove(hid);
+                }
+                let modifier = NativeRef::new(create_modifier_event(source.0, hid, &keys, false));
+                let key =
+                    NativeRef::new(create_key_event(source.0, 0x19, true, false, &keys, false));
+                let mouse = NativeRef::new(create_mouse_event(
+                    EventContext::new(source.0, &keys, false),
+                    CG_EVENT_LEFT_MOUSE_DOWN,
+                    CGPoint::default(),
+                    CG_MOUSE_BUTTON_LEFT,
+                ));
+                unsafe {
+                    assert_eq!(CGEventGetType(modifier.0), CG_EVENT_FLAGS_CHANGED);
+                    assert_eq!(
+                        CGEventGetIntegerValueField(modifier.0, CG_KEYBOARD_EVENT_KEYCODE),
+                        hid_to_mac(hid).unwrap() as i64
+                    );
+                    for event in [modifier.0, key.0, mouse.0] {
+                        assert_eq!(
+                            CGEventGetFlags(event) & (mask | device_mask),
+                            if held { mask | device_mask } else { 0 },
+                            "hid={hid:#x} held={held}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn releasing_one_command_key_keeps_the_other_side_held() {
+        let source = NativeRef::new(unsafe { CGEventSourceCreate(CG_EVENT_SOURCE_STATE_PRIVATE) });
+        let mut keys = KeyState::EMPTY;
+        keys.insert(0xE7);
+        let event = NativeRef::new(create_modifier_event(source.0, 0xE3, &keys, false));
+        let flags = unsafe { CGEventGetFlags(event.0) };
+        assert_ne!(flags & CG_FLAG_COMMAND, 0);
+        assert_eq!(flags & NX_DEVICE_L_CMD, 0);
+        assert_ne!(flags & NX_DEVICE_R_CMD, 0);
+    }
+
+    #[test]
+    fn caps_notifications_are_native_flags_changes_with_the_real_keycode() {
+        let source = NativeRef::new(unsafe { CGEventSourceCreate(CG_EVENT_SOURCE_STATE_PRIVATE) });
+        for locked in [true, false] {
+            let event = NativeRef::new(create_caps_event(source.0, locked, &KeyState::EMPTY));
+            unsafe {
+                assert_eq!(CGEventGetType(event.0), CG_EVENT_FLAGS_CHANGED);
+                assert_eq!(
+                    CGEventGetIntegerValueField(event.0, CG_KEYBOARD_EVENT_KEYCODE),
+                    0x39
+                );
+                assert_eq!(CGEventGetFlags(event.0) & CG_FLAG_ALPHA_SHIFT != 0, locked);
+            }
+        }
+    }
 
     #[test]
     fn maps_other_mouse_buttons() {

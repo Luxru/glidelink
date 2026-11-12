@@ -1,5 +1,5 @@
 const invoke = window.__TAURI__?.core?.invoke;
-const i18n = window.glidelinkI18n;
+const i18n = window.rxSwitchI18n;
 const t = (key, vars) => i18n.t(key, vars);
 
 const els = {
@@ -34,27 +34,30 @@ const els = {
   deviceCount: document.getElementById("deviceCount"),
   permissionCard: document.getElementById("permissionCard"),
   permissionBtn: document.getElementById("permissionBtn"),
-  reopenBtn: document.getElementById("reopenBtn"),
   copyPasscode: document.getElementById("copyPasscode"),
   sessionState: document.getElementById("sessionState"),
-  aboutRole: document.getElementById("aboutRole"),
-  aboutState: document.getElementById("aboutState"),
-  aboutDuration: document.getElementById("aboutDuration"),
-  aboutPeer: document.getElementById("aboutPeer"),
-  aboutDeviceCount: document.getElementById("aboutDeviceCount"),
-  aboutPeerPlatform: document.getElementById("aboutPeerPlatform"),
-  aboutLinkState: document.getElementById("aboutLinkState"),
-  aboutRtt: document.getElementById("aboutRtt"),
-  aboutJitter: document.getElementById("aboutJitter"),
-  aboutLoss: document.getElementById("aboutLoss"),
-  aboutRate: document.getElementById("aboutRate"),
-  aboutLocalScreen: document.getElementById("aboutLocalScreen"),
-  aboutRemoteScreen: document.getElementById("aboutRemoteScreen"),
-  aboutPacketsSent: document.getElementById("aboutPacketsSent"),
-  aboutPacketsReceived: document.getElementById("aboutPacketsReceived"),
-  aboutBytesSent: document.getElementById("aboutBytesSent"),
-  aboutBytesReceived: document.getElementById("aboutBytesReceived"),
-  aboutBuild: document.getElementById("aboutBuild"),
+  statsRole: document.getElementById("statsRole"),
+  statsState: document.getElementById("statsState"),
+  statsDuration: document.getElementById("statsDuration"),
+  statsPeer: document.getElementById("statsPeer"),
+  statsDeviceCount: document.getElementById("statsDeviceCount"),
+  statsPeerPlatform: document.getElementById("statsPeerPlatform"),
+  statsLinkState: document.getElementById("statsLinkState"),
+  statsRtt: document.getElementById("statsRtt"),
+  statsJitter: document.getElementById("statsJitter"),
+  statsLoss: document.getElementById("statsLoss"),
+  statsRate: document.getElementById("statsRate"),
+  statsLocalScreen: document.getElementById("statsLocalScreen"),
+  statsRemoteScreen: document.getElementById("statsRemoteScreen"),
+  statsPacketsSent: document.getElementById("statsPacketsSent"),
+  statsPacketsReceived: document.getElementById("statsPacketsReceived"),
+  statsBytesSent: document.getElementById("statsBytesSent"),
+  statsBytesReceived: document.getElementById("statsBytesReceived"),
+  logLevel: document.getElementById("logLevel"),
+  logPanel: document.getElementById("logPanel"),
+  logCount: document.getElementById("logCount"),
+  copyLogs: document.getElementById("copyLogs"),
+  clearLogs: document.getElementById("clearLogs"),
   toast: document.getElementById("toast"),
 };
 
@@ -73,6 +76,8 @@ const ui = {
   configLocalIp: "",
   lastPairingCode: "",
   lastListenCode: "",
+  previewListenIp: "",
+  previewListenPromise: null,
   devices: [],
   peers: [],
   targetDevice: null,
@@ -94,7 +99,8 @@ const PAGES = {
   session: "page.session.title",
   layout: "page.layout.title",
   settings: "page.settings.title",
-  about: "page.about.title",
+  logs: "page.logs.title",
+  stats: "page.stats.title",
 };
 
 const PAIRING_CODE_LENGTH = 20;
@@ -167,41 +173,40 @@ function sessionStateLabel() {
   return status.connected ? t("status.connected") : t("status.waitingPeer");
 }
 
-function updateAboutStats(status) {
+function updateStats(status) {
   const running = Boolean(status?.running);
   const connected = Boolean(status?.connected);
   const latency = status?.latencyMs == null ? null : Number(status.latencyMs);
-  els.aboutRole.textContent = ui.role === "agent" ? t("role.agent") : t("role.controller");
-  els.aboutState.textContent = sessionStateLabel();
-  els.aboutDuration.textContent = running && status?.startedAtMs
+  els.statsRole.textContent = ui.role === "agent" ? t("role.agent") : t("role.controller");
+  els.statsState.textContent = sessionStateLabel();
+  els.statsDuration.textContent = running && status?.startedAtMs
     ? formatDuration(Date.now() - status.startedAtMs)
     : "—";
-  els.aboutPeer.textContent = status?.peer || "—";
-  els.aboutDeviceCount.textContent = String(Array.isArray(status?.devices) ? status.devices.length : 0);
+  els.statsPeer.textContent = status?.peer || "—";
+  els.statsDeviceCount.textContent = String(Array.isArray(status?.devices) ? status.devices.length : 0);
   const peerPlatform = { 1: "platform.macos", 2: "platform.windows" }[status?.peerPlatform];
-  els.aboutPeerPlatform.textContent = peerPlatform ? t(peerPlatform) : "—";
-  els.aboutLinkState.textContent = connected
+  els.statsPeerPlatform.textContent = peerPlatform ? t(peerPlatform) : "—";
+  els.statsLinkState.textContent = connected
     ? t("status.connected")
     : running
       ? t("status.waiting")
       : t("status.notRunning");
-  els.aboutRtt.textContent = latency == null ? "—" : `${latency.toFixed(1)} ms`;
-  els.aboutJitter.textContent = status?.jitterMs == null
+  els.statsRtt.textContent = latency == null ? "—" : `${latency.toFixed(1)} ms`;
+  els.statsJitter.textContent = status?.jitterMs == null
     ? "—"
     : `${Number(status.jitterMs).toFixed(1)} ms`;
-  els.aboutLoss.textContent = status?.packetLossPercent == null
+  els.statsLoss.textContent = status?.packetLossPercent == null
     ? "—"
     : `${Number(status.packetLossPercent).toFixed(1)} %`;
-  els.aboutRate.textContent = status?.inputIntervalMs == null
+  els.statsRate.textContent = status?.inputIntervalMs == null
     ? "—"
     : `${Number(status.inputIntervalMs).toFixed(1)} ms`;
-  els.aboutLocalScreen.textContent = formatScreen(status?.localScreen);
-  els.aboutRemoteScreen.textContent = formatScreen(status?.remoteScreen);
-  els.aboutPacketsSent.textContent = formatCount(status?.packetsSent);
-  els.aboutPacketsReceived.textContent = formatCount(status?.packetsReceived);
-  els.aboutBytesSent.textContent = formatBytes(status?.bytesSent);
-  els.aboutBytesReceived.textContent = formatBytes(status?.bytesReceived);
-  els.aboutBuild.textContent = ui.lastState?.build || "—";
+  els.statsLocalScreen.textContent = formatScreen(status?.localScreen);
+  els.statsRemoteScreen.textContent = formatScreen(status?.remoteScreen);
+  els.statsPacketsSent.textContent = formatCount(status?.packetsSent);
+  els.statsPacketsReceived.textContent = formatCount(status?.packetsReceived);
+  els.statsBytesSent.textContent = formatBytes(status?.bytesSent);
+  els.statsBytesReceived.textContent = formatBytes(status?.bytesReceived);
 }
 
 function errorToRaw(error) {
@@ -235,6 +240,12 @@ function translateError(raw) {
   return detail ? t("errors.withDetail", { message, detail }) : message;
 }
 
+function permissionErrorResolved(raw, permissions) {
+  const code = String(raw || "").split("|")[0];
+  return permissions?.capture === true && permissions?.inject === true
+    && ["E_MAC_PERMISSIONS_CAPTURE", "E_MAC_PERMISSIONS_INJECT", "errors.PERMISSIONS_BLOCKED"].includes(code);
+}
+
 function showToast(message) {
   els.toast.textContent = message;
   els.toast.classList.add("show");
@@ -260,6 +271,7 @@ function updatePageChrome() {
 
 function setPage(page) {
   if (!PAGES[page]) return;
+  window.AppSelect.close();
   ui.page = page;
   for (const section of document.querySelectorAll(".page")) {
     section.hidden = section.dataset.page !== page;
@@ -273,6 +285,7 @@ function setPage(page) {
   updatePageChrome();
   els.pageScroll.scrollTop = 0;
   if (page === "layout") requestAnimationFrame(renderLayout);
+  if (page === "logs") refreshLogs();
 }
 
 function updateStartLabel() {
@@ -578,7 +591,7 @@ async function onDevicePointerUp(event) {
   renderLayout();
 }
 
-const INTERFACE_STORAGE_KEY = "glidelink.interface";
+const INTERFACE_STORAGE_KEY = "rx-switch.interface";
 
 function updateInterfaces(interfaces, preferredIp) {
   const list = Array.isArray(interfaces) ? interfaces : [];
@@ -616,6 +629,33 @@ function updateInterfaces(interfaces, preferredIp) {
   updateSettingsControls();
 }
 
+async function refreshControllerCode() {
+  if (!invoke || ui.role !== "controller" || ui.running || ui.loading) return;
+  const ip = ui.selectedIp;
+  if (!ip) return;
+  if (ui.previewListenIp === ip && getPairingCode().length === PAIRING_CODE_LENGTH) return;
+  if (ui.previewListenPromise) return ui.previewListenPromise;
+  ui.previewListenPromise = (async () => {
+    try {
+      const code = await withTimeout(invoke("preview_pairing_code", { localIp: ip }));
+      if (
+        ui.role === "controller"
+        && !ui.running
+        && ui.selectedIp === ip
+      ) {
+        setPairingCode(code);
+        ui.lastListenCode = code;
+        ui.previewListenIp = ip;
+      }
+    } catch (error) {
+      setError(errorToRaw(error));
+    } finally {
+      ui.previewListenPromise = null;
+    }
+  })();
+  return ui.previewListenPromise;
+}
+
 function setLoading(loading) {
   ui.loading = loading;
   els.startBtn.classList.toggle("loading", loading);
@@ -644,6 +684,7 @@ function setRole(role, syncControls = true) {
     setPairingCode(code);
   }
   updateInterfaces(ui.interfaces, ui.configLocalIp);
+  if (ui.role === "controller" && !ui.running) refreshControllerCode();
   renderLayout();
   updateStartLabel();
   updateSettingsControls();
@@ -665,6 +706,7 @@ function updateSettingsControls() {
   const busy = ui.running || ui.loading;
   els.adaptModifiers.disabled = busy;
   els.interfaceSelect.disabled = busy;
+  window.AppSelect.sync(els.interfaceSelect);
 }
 
 function syncLanguage(configLanguage) {
@@ -673,7 +715,6 @@ function syncLanguage(configLanguage) {
   const fromSettings = configLanguage === "zh" || configLanguage === "en"
     ? configLanguage
     : "";
-  const cached = i18n.getStoredLocale();
   ui.languageSyncGuard = true;
   try {
     if (fromSettings) {
@@ -681,13 +722,16 @@ function syncLanguage(configLanguage) {
       i18n.setLocale(fromSettings);
     } else {
       ui.language = i18n.getLocale();
-      // Import an explicit choice made in a pre-settings build once.
-      if (cached) saveSettings({ language: cached });
     }
   } finally {
     ui.languageSyncGuard = false;
   }
   els.languageSelect.value = ui.language;
+  window.AppSelect.sync();
+}
+
+function syncTrayLanguage() {
+  if (invoke) invoke("set_tray_language", { language: i18n.getLocale() }).catch(() => {});
 }
 
 function revertSettingsFromSaved() {
@@ -695,6 +739,7 @@ function revertSettingsFromSaved() {
   if (!config) return;
   els.adaptModifiers.checked = Boolean(config.adaptModifiers);
   ui.adaptModifiers = Boolean(config.adaptModifiers);
+  if (config.logLevel) els.logLevel.value = config.logLevel;
   ui.configLocalIp = config.localIp || "";
   const preferred = config.localIp || ui.selectedIp;
   updateInterfaces(ui.interfaces, preferred);
@@ -703,6 +748,7 @@ function revertSettingsFromSaved() {
     i18n.setLocale(config.language);
   }
   els.languageSelect.value = ui.language;
+  window.AppSelect.sync();
 }
 
 async function saveSettings(patch) {
@@ -712,11 +758,13 @@ async function saveSettings(patch) {
       ui.savedConfig = config;
       ui.adaptModifiers = Boolean(config.adaptModifiers);
       els.adaptModifiers.checked = ui.adaptModifiers;
+      if (config.logLevel) els.logLevel.value = config.logLevel;
       ui.configLocalIp = config.localIp || "";
       if (config.language) {
         ui.language = config.language;
         els.languageSelect.value = config.language;
       }
+      window.AppSelect.sync();
       return config;
     })
     .catch((error) => {
@@ -742,7 +790,7 @@ function withTimeout(promise, ms = COMMAND_TIMEOUT_MS) {
 function applyState(state) {
   if (!state) return;
   ui.lastState = state;
-  const { config, status: incomingStatus, platform, permissionsOk } = state;
+  const { config, status: incomingStatus, platform, permissions } = state;
   const wasRunning = ui.running;
   ui.running = Boolean(incomingStatus?.running);
   ui.lastStatus = incomingStatus || null;
@@ -763,6 +811,7 @@ function applyState(state) {
     ui.interfaces = Array.isArray(state.localInterfaces) ? state.localInterfaces : [];
     ui.adaptModifiers = Boolean(config.adaptModifiers);
     els.adaptModifiers.checked = ui.adaptModifiers;
+    if (config.logLevel) els.logLevel.value = config.logLevel;
     setRole(config.role, false);
     setPairingCode(
       config.role === "controller"
@@ -770,6 +819,7 @@ function applyState(state) {
         : (config.lastPairingCode || ""),
     );
     updateInterfaces(ui.interfaces, ui.configLocalIp);
+    if (ui.role === "controller" && !ui.running) refreshControllerCode();
     setDisabledControls(ui.running);
     ui.initialized = true;
     syncLanguage(config.language);
@@ -782,6 +832,7 @@ function applyState(state) {
     setDisabledControls(false);
     if (ui.role === "controller") {
       setPairingCode(ui.lastListenCode || "");
+      ui.previewListenIp = ui.selectedIp;
     } else {
       setPairingCode(ui.lastPairingCode || "");
     }
@@ -794,20 +845,29 @@ function applyState(state) {
 
   if (ui.role === "controller" && incomingStatus?.running && incomingStatus.pairingCode) {
     ui.lastListenCode = incomingStatus.pairingCode;
+    ui.previewListenIp = ui.selectedIp;
     setPairingCode(incomingStatus.pairingCode);
+  } else if (
+    ui.role === "controller"
+    && !ui.running
+    && getPairingCode().length !== PAIRING_CODE_LENGTH
+  ) {
+    refreshControllerCode();
   }
 
   if (ui.running) setDisabledControls(true);
 
-  const permissionBlocked = platform === "macos" && permissionsOk === false;
+  const permissionBlocked = platform === "macos"
+    && (permissions?.capture === false || permissions?.inject === false);
   els.permissionCard.hidden = !permissionBlocked;
+  if (permissionErrorResolved(ui.startError, permissions)) setError(null);
 
   const status = ui.lastStatus || {};
   const connected = Boolean(status.connected);
   const active = Boolean(status.remoteActive);
   const localScreen = status.localScreen;
   const latency = status.latencyMs == null ? null : Number(status.latencyMs);
-  const statusError = status.lastErrorCode
+  const statusError = status.lastErrorCode && !permissionErrorResolved(status.lastErrorCode, permissions)
     ? `${status.lastErrorCode}${status.lastErrorDetail ? `|${status.lastErrorDetail}` : ""}`
     : null;
   const errorRaw = ui.startError || statusError || (permissionBlocked && ui.running ? "errors.PERMISSIONS_BLOCKED" : null);
@@ -844,7 +904,7 @@ function applyState(state) {
     }
   } else if (errorRaw) {
     pillClass = "status-error";
-    text = t("status.startFailed");
+    text = t(status.lastErrorCode === "NET_CONNECTION_EXPIRED" ? "status.disconnected" : "status.startFailed");
   }
 
   els.statusPill.className = `status-pill ${pillClass}`;
@@ -861,7 +921,27 @@ function applyState(state) {
     els.errorBanner.hidden = true;
   }
 
-  updateAboutStats(status);
+  window.AppSelect.sync();
+  updateStats(status);
+}
+
+async function refreshLogs() {
+  if (!invoke || ui.page !== "logs") return;
+  try {
+    const entries = await withTimeout(invoke("get_logs"));
+    const panel = els.logPanel;
+    const atBottom = panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 8;
+    const lines = (Array.isArray(entries) ? entries : []).map((entry) => {
+      const seconds = (Number(entry.elapsedMs || 0) / 1000).toFixed(3).padStart(9, " ");
+      const level = String(entry.level || "").padEnd(5, " ");
+      return `[${seconds}s] ${level} ${entry.target || ""}: ${entry.message || ""}`;
+    });
+    panel.textContent = lines.length ? lines.join("\n") : t("logs.empty");
+    els.logCount.textContent = lines.length ? String(lines.length) : "";
+    if (atBottom) panel.scrollTop = panel.scrollHeight;
+  } catch (error) {
+    els.logPanel.textContent = errorToRaw(error);
+  }
 }
 
 async function refresh() {
@@ -984,6 +1064,26 @@ function initEvents() {
   });
 
   els.copyPasscode.addEventListener("click", copyPasscode);
+  els.logLevel.addEventListener("change", () => {
+    saveSettings({ logLevel: els.logLevel.value });
+    refreshLogs();
+  });
+  els.copyLogs.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(els.logPanel.textContent || "");
+      showToast(t("logs.copy"));
+    } catch (error) {
+      setError(errorToRaw(error));
+    }
+  });
+  els.clearLogs.addEventListener("click", async () => {
+    try {
+      await invoke("clear_logs");
+      refreshLogs();
+    } catch (error) {
+      setError(errorToRaw(error));
+    }
+  });
 
   els.codeCells.forEach((cell, index) => {
     cell.addEventListener("input", () => {
@@ -1027,8 +1127,10 @@ function initEvents() {
     ui.selectedIp = els.interfaceSelect.value;
     els.selectedIp.textContent = ui.selectedIp || "—";
     ui.lastListenCode = "";
+    ui.previewListenIp = "";
     setPairingCode("");
     saveSettings({ localIp: ui.selectedIp });
+    refreshControllerCode();
   });
 
   els.adaptModifiers.addEventListener("change", () => {
@@ -1048,14 +1150,6 @@ function initEvents() {
     }
   });
 
-  els.reopenBtn.addEventListener("click", async () => {
-    try {
-      await invoke("reopen_app");
-    } catch (error) {
-      setError(errorToRaw(error));
-    }
-  });
-
   els.languageSelect.addEventListener("change", () => {
     const next = els.languageSelect.value;
     ui.language = next;
@@ -1063,7 +1157,8 @@ function initEvents() {
     saveSettings({ language: next });
   });
 
-  document.addEventListener("glidelink:locale", () => {
+  document.addEventListener("rx-switch:locale", () => {
+    syncTrayLanguage();
     if (ui.languageSyncGuard) return;
     updatePageChrome();
     updateStartLabel();
@@ -1079,10 +1174,15 @@ function initEvents() {
       els.form.requestSubmit();
     }
   });
+  window.addEventListener("focus", refresh);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refresh();
+  });
 }
 
 async function boot() {
   initEvents();
+  syncTrayLanguage();
   els.languageSelect.value = i18n.getLocale();
   setRole("controller", false);
   setPage("session");
@@ -1097,6 +1197,9 @@ async function boot() {
     setError(errorToRaw(error));
   }
   setInterval(refresh, 500);
+  setInterval(() => {
+    if (ui.page === "logs") refreshLogs();
+  }, 1000);
 }
 
 boot();

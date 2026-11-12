@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>rx-switch</title>
+  <link rel="stylesheet" href="app.css" />
+  <link rel="stylesheet" href="about.css" />
+</head>
+<body class="about-window">
+  <main class="about-panel">
+    <img class="about-app-icon" src="app-icon.png" alt="" />
+    <h1>rx-switch</h1>
+    <p class="about-description" data-i18n="about.tagline">Low-latency software KVM</p>
+    <dl class="about-details">
+      <div><dt data-i18n="about.versionLabel">Version</dt><dd>0.1</dd></div>
+      <div><dt data-i18n="about.build">Build</dt><dd id="buildValue">—</dd></div>
+      <div><dt data-i18n="about.system">System</dt><dd id="systemValue">—</dd></div>
+    </dl>
+    <p id="copyStatus" class="about-copy-status" role="status" aria-live="polite"></p>
+    <div class="about-actions">
+      <button id="closeAbout" type="button" class="button secondary" data-i18n="about.close">OK</button>
+      <button id="copyAbout" type="button" class="button primary" data-i18n="about.copy">Copy</button>
+    </div>
+  </main>
+  <script src="i18n.js"></script>
+  <script src="about.js"></script>
+</body>
+</html>

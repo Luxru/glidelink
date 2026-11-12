@@ -38,6 +38,9 @@ pub struct AppConfig {
     /// UI follows the system locale on the next launch.
     #[serde(default)]
     pub language: String,
+    /// Runtime log level: off/error/warn/info/debug/trace.
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
     /// Stable per-installation identity used by the Controller to remember
     /// devices across reconnects and app restarts.
     #[serde(default)]
@@ -62,6 +65,25 @@ pub struct SettingsPatch {
     pub language: Option<String>,
     pub adapt_modifiers: Option<bool>,
     pub local_ip: Option<String>,
+    pub log_level: Option<String>,
+}
+
+pub fn default_log_level() -> String {
+    "info".to_string()
+}
+
+fn normalize_log_level(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "error" | "warn" | "warning" | "info" | "debug" | "trace" => {
+            let value = value.trim().to_ascii_lowercase();
+            if value == "warning" {
+                "warn".to_string()
+            } else {
+                value
+            }
+        }
+        _ => default_log_level(),
+    }
 }
 
 impl Default for AppConfig {
@@ -71,6 +93,7 @@ impl Default for AppConfig {
             local_ip: String::new(),
             adapt_modifiers: false,
             language: String::new(),
+            log_level: default_log_level(),
             device_id: String::new(),
             layout: Vec::new(),
             last_invite: String::new(),
@@ -115,6 +138,7 @@ impl AppConfig {
     pub fn normalize(&mut self) {
         self.local_ip = self.local_ip.trim().to_string();
         self.language = normalize_language(&self.language);
+        self.log_level = normalize_log_level(&self.log_level);
     }
 
     /// Apply a Settings-page change without touching session fields.
@@ -124,6 +148,9 @@ impl AppConfig {
         }
         if let Some(adapt_modifiers) = patch.adapt_modifiers {
             self.adapt_modifiers = adapt_modifiers;
+        }
+        if let Some(log_level) = &patch.log_level {
+            self.log_level = normalize_log_level(log_level);
         }
         if let Some(local_ip) = &patch.local_ip {
             let trimmed = local_ip.trim();
@@ -140,12 +167,14 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Keep settings that `start_session` does not own. The UI sends a full
-    /// config record, but older clients (and controller starts) omit the
-    /// language and the agent-only interface choice.
+    /// Keep persisted settings omitted by the session form, including the
+    /// stable device identity, saved layout, log level, and other role's code.
     pub fn inherit_persisted_settings(&mut self, previous: &AppConfig) {
         if self.language.trim().is_empty() {
             self.language = previous.language.clone();
+        }
+        if self.log_level.trim().is_empty() {
+            self.log_level = previous.log_level.clone();
         }
         if self.local_ip.trim().is_empty() {
             self.local_ip = previous.local_ip.clone();
@@ -224,7 +253,7 @@ pub fn load_or_create(settings_path: &Path) -> Result<AppConfig, String> {
         if config.ensure_device_id() {
             let _ = save(settings_path, &config);
         }
-        // Drop unknown fields from older formats.
+        // Persist normalized settings.
         let _ = save(settings_path, &config);
         return Ok(config);
     }
@@ -264,22 +293,15 @@ mod tests {
 
     fn test_dir(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("glidelink-config-{}-{name}", std::process::id()));
+            std::env::temp_dir().join(format!("rx-switch-config-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create test dir");
         dir
     }
 
     #[test]
-    fn old_config_fields_get_safe_defaults() {
-        let old = r#"{
-            "role": "agent",
-            "peerAddr": "192.168.1.42:45890",
-            "listenPort": 45890,
-            "passcode": "oldlongpasscode",
-            "edge": "right"
-        }"#;
-        let cfg: AppConfig = serde_json::from_str(old).expect("old config parses");
+    fn optional_settings_use_defaults() {
+        let cfg: AppConfig = serde_json::from_str(r#"{"role":"agent"}"#).unwrap();
         assert!(cfg.local_ip.is_empty());
         assert!(cfg.layout.is_empty());
         assert!(cfg.device_id.is_empty());
