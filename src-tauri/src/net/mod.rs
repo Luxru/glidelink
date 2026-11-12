@@ -1,30 +1,70 @@
+mod metrics;
 pub mod protocol;
+mod stream;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ConfigHandle};
 use crate::error;
-use crate::input::{self, CaptureShared, InjectMsg, RemoteInput};
-use crate::status::{ScreenInfo, Status};
-use crossbeam_channel::{Receiver, Sender};
-use protocol::{
-    build_accept, build_hello, decode_input, decode_u64, derive_master, encode_input, encode_u64,
-    hello_sid, now_ms, parse_accept, parse_hello, random_sid, Handshake, ProtocolError, Session,
-    Side, TYPE_ACCEPT, TYPE_BYE, TYPE_HELLO, TYPE_INPUT, TYPE_PING, TYPE_PONG,
+use crate::input::{
+    self, adapt_event, adapt_reconcile, CaptureMsg, InputEvent, InputMsg, PointerPosition,
+    ReconcileState,
 };
+use crate::invite::{self, Invite, PORT_RANGE_END, PORT_RANGE_START};
+use crate::layout::{
+    default_placement, device_id_to_hex, DeviceId, DevicePlacement, LayoutStore, WorldLayout,
+};
+use crate::status::{PeerStatus, ScreenInfo, Status};
+use crossbeam_channel::Receiver;
+use metrics::RttEstimator;
+use protocol::{
+    build_pake_accept, build_pake_hello, decode_u64, derive_session_keys, encode_u64,
+    parse_pake_accept, parse_pake_hello, random_sid, transcript_hash, Handshake, Session, Side,
+    CONFIRM_PAYLOAD, TYPE_BYE, TYPE_CONFIRM, TYPE_CONFIRM_ACK, TYPE_PING, TYPE_PONG,
+};
+use rand::RngCore;
+use serde::Serialize;
+use spake2::{Ed25519Group, Identity, Password, Spake2};
+use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use stream::FramedStream;
 
-const CONTROLLER_HANDSHAKE_RETRY: Duration = Duration::from_millis(500);
-const CONTROLLER_PING_INTERVAL: Duration = Duration::from_millis(250);
-const CONTROLLER_PONG_TIMEOUT: Duration = Duration::from_millis(2_500);
-const CONTROLLER_UNREACHABLE_HINT_AFTER: Duration = Duration::from_secs(8);
-const AGENT_SESSION_TIMEOUT: Duration = Duration::from_millis(3_000);
-const AGENT_ACTIVE_TIMEOUT: Duration = Duration::from_secs(1);
-const CONTROLLER_READ_TIMEOUT: Duration = Duration::from_millis(2);
-const AGENT_READ_TIMEOUT: Duration = Duration::from_millis(100);
+const POLL_INTERVAL: Duration = Duration::from_millis(1);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const PING_ACTIVE_INTERVAL: Duration = Duration::from_millis(100);
+const PING_IDLE_INTERVAL: Duration = Duration::from_millis(500);
+const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
+const SESSION_TIMEOUT: Duration = Duration::from_secs(3);
+const INPUT_INTERVAL: Duration = Duration::from_millis(4);
+const SLOW_INPUT_INTERVAL: Duration = Duration::from_millis(8);
+const MAX_PEERS: usize = 8;
+const MAX_PENDING: usize = 8;
+const POLL_BUDGET: usize = 64;
+const PAKE_ID_CONTROLLER: &[u8] = b"rx-switch v1 controller";
+const PAKE_ID_AGENT: &[u8] = b"rx-switch v1 agent";
+
+type NetResult<T> = Result<T, String>;
+
+#[derive(Clone, Copy)]
+struct AgentRetryPolicy {
+    connect_window: Duration,
+    reconnect_window: Duration,
+    retry_delay: Duration,
+}
+
+impl Default for AgentRetryPolicy {
+    fn default() -> Self {
+        Self {
+            connect_window: Duration::from_secs(5),
+            reconnect_window: Duration::from_secs(30),
+            retry_delay: Duration::from_secs(1),
+        }
+    }
+}
 
 fn local_screen_or_zero() -> ScreenInfo {
     input::screen_info().unwrap_or(ScreenInfo {
@@ -33,600 +73,1628 @@ fn local_screen_or_zero() -> ScreenInfo {
     })
 }
 
-/// Windows reports ICMP port-unreachable as `WSAECONNRESET` on an unconnected
-/// UDP socket. Sending to an agent that is not running yet must not be treated
-/// as a fatal receive error or spam the log at the handshake rate.
-fn is_benign_recv_error(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        ErrorKind::WouldBlock
-            | ErrorKind::TimedOut
-            | ErrorKind::ConnectionReset
-            | ErrorKind::ConnectionRefused
-            | ErrorKind::Interrupted
-    )
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkInterface {
+    pub name: String,
+    pub ip: String,
+}
+
+pub fn local_interfaces() -> Vec<NetworkInterface> {
+    let mut interfaces = Vec::new();
+    if let Ok(adapters) = if_addrs::get_if_addrs() {
+        for adapter in adapters {
+            if let if_addrs::IfAddr::V4(v4) = adapter.addr {
+                if !v4.ip.is_loopback() && !v4.ip.is_unspecified() {
+                    interfaces.push(NetworkInterface {
+                        name: adapter.name,
+                        ip: v4.ip.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    interfaces.sort_by(|a, b| a.name.cmp(&b.name).then(a.ip.cmp(&b.ip)));
+    interfaces.dedup_by(|a, b| a.name == b.name && a.ip == b.ip);
+    interfaces
+}
+
+struct PakeLimiter {
+    tokens: f64,
+    last: Instant,
+}
+
+impl PakeLimiter {
+    fn new() -> Self {
+        Self {
+            tokens: 8.0,
+            last: Instant::now(),
+        }
+    }
+
+    fn allow(&mut self) -> bool {
+        let now = Instant::now();
+        self.tokens = (self.tokens + now.duration_since(self.last).as_secs_f64() * 4.0).min(8.0);
+        self.last = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
+fn bind_listener(ip: Ipv4Addr, last_code: &str) -> NetResult<(TcpListener, String)> {
+    if let Ok(invite) = Invite::decode(last_code) {
+        if invite.ip == ip {
+            if let Ok(listener) = TcpListener::bind((ip, invite.port)) {
+                return Ok((listener, last_code.to_string()));
+            }
+        }
+    }
+    let count = u32::from(PORT_RANGE_END - PORT_RANGE_START + 1);
+    let offset = rand::rngs::OsRng.next_u32() % count;
+    for step in 0..count {
+        let port = PORT_RANGE_START + ((offset + step) % count) as u16;
+        match TcpListener::bind((ip, port)) {
+            Ok(listener) => return Ok((listener, Invite::generate(ip, port).encode())),
+            Err(e) if e.kind() == ErrorKind::AddrInUse => continue,
+            Err(e) => return Err(error::detail("E_NET_BIND", e)),
+        }
+    }
+    Err(error::code("E_PORT_RANGE"))
+}
+
+pub fn preview_listen_code(ip: Ipv4Addr, last_code: &str) -> NetResult<String> {
+    let (_listener, code) = bind_listener(ip, last_code)?;
+    Ok(code)
+}
+
+fn platform_label(id: u8) -> &'static str {
+    match id {
+        1 => "macOS",
+        2 => "Windows",
+        _ => "Unknown",
+    }
+}
+
+fn peer_label(platform: u8, addr: SocketAddr) -> String {
+    format!("{} · {}", platform_label(platform), addr.ip())
+}
+
+/// Shared by both roles: one cipher sequence, one framed stream, one heartbeat.
+struct Link {
+    wire: FramedStream,
+    session: Session,
+    last_received: Instant,
+    last_ping: Instant,
+    pending_pings: Vec<(u64, Instant)>,
+    next_ping: u64,
+    rtt: RttEstimator,
+    last_log: Instant,
+}
+
+impl Link {
+    fn new(wire: FramedStream, session: Session) -> Self {
+        let now = Instant::now();
+        Self {
+            wire,
+            session,
+            last_received: now,
+            last_ping: now.checked_sub(PING_IDLE_INTERVAL).unwrap_or(now),
+            pending_pings: Vec::new(),
+            next_ping: 1,
+            rtt: RttEstimator::new(),
+            last_log: now,
+        }
+    }
+
+    fn send(&mut self, kind: u8, payload: &[u8]) -> NetResult<()> {
+        self.wire
+            .queue(self.session.encrypt_packet(kind, payload))
+            .map_err(|e| e.to_string())
+    }
+
+    fn send_input(&mut self, input: InputMsg) -> NetResult<()> {
+        let (kind, payload) = protocol::encode_command(input).map_err(|e| e.to_string())?;
+        self.send(kind, &payload)
+    }
+
+    fn receive(&mut self) -> NetResult<Option<(u8, Vec<u8>)>> {
+        let Some(packet) = self.wire.read_packet().map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let message = self
+            .session
+            .decrypt_packet(&packet)
+            .map_err(|e| e.to_string())?;
+        self.last_received = Instant::now();
+        Ok(Some(message))
+    }
+
+    fn heartbeat(&mut self, kind: u8, payload: &[u8]) -> NetResult<bool> {
+        match kind {
+            TYPE_PING => {
+                let id = decode_u64(payload).map_err(|e| e.to_string())?;
+                self.send(TYPE_PONG, &encode_u64(id))?;
+            }
+            TYPE_PONG => {
+                let id = decode_u64(payload).map_err(|e| e.to_string())?;
+                if let Some(index) = self
+                    .pending_pings
+                    .iter()
+                    .position(|(pending, _)| *pending == id)
+                {
+                    let (_, sent) = self.pending_pings.remove(index);
+                    self.rtt.observe(sent.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            TYPE_BYE => return Err(error::code("NET_PEER_DISCONNECTED")),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn tick(&mut self, now: Instant, interval: Duration) -> NetResult<()> {
+        if now.saturating_duration_since(self.last_received) >= SESSION_TIMEOUT {
+            return Err("peer heartbeat timed out".into());
+        }
+        if now.saturating_duration_since(self.last_ping) >= interval {
+            let id = self.next_ping;
+            self.next_ping = self.next_ping.wrapping_add(1).max(1);
+            self.send(TYPE_PING, &encode_u64(id))?;
+            self.pending_pings.push((id, now));
+            if self.pending_pings.len() > 32 {
+                self.pending_pings.remove(0);
+            }
+            self.last_ping = now;
+        }
+        if now.saturating_duration_since(self.last_log) >= Duration::from_secs(5) {
+            log::debug!(
+                "TCP input queue={} age_ms={:.1} srtt_ms={:?} rttvar_ms={:.1}",
+                self.wire.queue_depth(),
+                self.wire.queue_age().as_secs_f64() * 1000.0,
+                self.rtt.srtt_ms(),
+                self.rtt.jitter_ms()
+            );
+            self.last_log = now;
+        }
+        self.wire.flush().map_err(|e| e.to_string())
+    }
+}
+
+struct PeerSession {
+    device_id: DeviceId,
+    addr: SocketAddr,
+    screen: ScreenInfo,
+    platform: u8,
+    link: Link,
+    pending_pointer: Option<PointerPosition>,
+    reconcile: ReconcileState,
+    last_move: Instant,
+    last_reconcile: Instant,
+}
+
+fn pointer_interval(rtt: &RttEstimator) -> Duration {
+    if rtt.jitter_ms() > 4.0 || rtt.srtt_ms().unwrap_or(0.0) > 40.0 {
+        SLOW_INPUT_INTERVAL
+    } else {
+        INPUT_INTERVAL
+    }
+}
+
+impl PeerSession {
+    fn flush_pointer(&mut self) -> NetResult<()> {
+        if let Some(input) = self.pending_pointer.take() {
+            self.link.send_input(InputMsg::Pointer(input))?;
+            self.last_move = Instant::now();
+        }
+        Ok(())
+    }
+
+    fn capture(&mut self, input: InputMsg, adapt: bool) -> NetResult<()> {
+        if let InputMsg::Pointer(position) = input {
+            self.pending_pointer = Some(position);
+            return Ok(());
+        }
+        // One common barrier for every semantic command, including activation.
+        self.flush_pointer()?;
+        let wire = match input {
+            InputMsg::Event(mut event) => {
+                apply_event_to_reconcile(&mut self.reconcile, event);
+                if adapt {
+                    adapt_event(&mut event);
+                }
+                InputMsg::Event(event)
+            }
+            InputMsg::Reconcile(mut state) => {
+                self.reconcile = state;
+                self.last_reconcile = Instant::now();
+                if adapt {
+                    adapt_reconcile(&mut state);
+                }
+                InputMsg::Reconcile(state)
+            }
+            other => other,
+        };
+        self.link.send_input(wire)
+    }
+
+    fn poll(&mut self, now: Instant, active: bool, adapt: bool) -> NetResult<()> {
+        for _ in 0..POLL_BUDGET {
+            let Some((kind, payload)) = self.link.receive()? else {
+                break;
+            };
+            if !self.link.heartbeat(kind, &payload)? {
+                return Err("unexpected agent message".into());
+            }
+        }
+        if now.saturating_duration_since(self.last_move) >= pointer_interval(&self.link.rtt) {
+            self.flush_pointer()?;
+        }
+        if now.saturating_duration_since(self.last_reconcile) >= RECONCILE_INTERVAL {
+            let mut state = self.reconcile;
+            state.active = active;
+            if !active {
+                state.buttons = 0;
+                state.keys = input::keymap::KeyState::EMPTY;
+            }
+            self.capture(InputMsg::Reconcile(state), adapt)?;
+        }
+        self.link.tick(
+            now,
+            if active {
+                PING_ACTIVE_INTERVAL
+            } else {
+                PING_IDLE_INTERVAL
+            },
+        )
+    }
+}
+
+fn apply_event_to_reconcile(state: &mut ReconcileState, event: InputEvent) {
+    match event {
+        InputEvent::Button { button, down } => {
+            if down {
+                state.buttons |= button;
+            } else {
+                state.buttons &= !button;
+            }
+        }
+        InputEvent::Key { hid, down } => {
+            if down {
+                state.keys.insert(hid);
+            } else {
+                state.keys.remove(hid);
+            }
+        }
+        InputEvent::CapsLock { locked } => state.caps_lock = locked,
+        InputEvent::Wheel { .. } => {}
+    }
+}
+
+struct PendingConnection {
+    wire: FramedStream,
+    addr: SocketAddr,
+    created: Instant,
+    auth: Option<(Handshake, Session)>,
+}
+
+impl PendingConnection {
+    fn poll(&mut self, code: &str, local_device: DeviceId, screen: ScreenInfo) -> NetResult<bool> {
+        if self.created.elapsed() >= HANDSHAKE_TIMEOUT {
+            return Err("handshake timed out".into());
+        }
+        self.wire.flush().map_err(|e| e.to_string())?;
+        let Some(packet) = self.wire.read_packet().map_err(|e| e.to_string())? else {
+            return Ok(false);
+        };
+        if let Some((_, session)) = self.auth.as_mut() {
+            let (kind, payload) = session.decrypt_packet(&packet).map_err(|e| e.to_string())?;
+            if kind != TYPE_CONFIRM || payload != CONFIRM_PAYLOAD {
+                return Err("invalid confirmation".into());
+            }
+            self.wire
+                .queue(session.encrypt_packet(TYPE_CONFIRM_ACK, CONFIRM_PAYLOAD))
+                .map_err(|e| e.to_string())?;
+            return Ok(true);
+        }
+        let (hello, pake_msg) = parse_pake_hello(&packet).map_err(|e| e.to_string())?;
+        if hello.device_id == [0; 16]
+            || hello.device_id == local_device
+            || hello.screen.width == 0
+            || hello.screen.height == 0
+        {
+            return Err("invalid peer identity or desktop".into());
+        }
+        let (pake, accept_msg) = Spake2::<Ed25519Group>::start_a(
+            &Password::new(code.as_bytes()),
+            &Identity::new(PAKE_ID_CONTROLLER),
+            &Identity::new(PAKE_ID_AGENT),
+        );
+        let shared = pake.finish(&pake_msg).map_err(|_| error::code("E_PAKE"))?;
+        let accept = Handshake {
+            sid: hello.sid,
+            screen,
+            timestamp_ms: protocol::now_ms(),
+            platform: input::platform_id(),
+            device_id: local_device,
+        };
+        let accept_packet = build_pake_accept(&accept, &accept_msg);
+        let transcript = transcript_hash(&packet, &accept_packet);
+        let (c2a, a2c) = derive_session_keys(&shared, &hello.sid, &transcript);
+        self.wire.queue(accept_packet).map_err(|e| e.to_string())?;
+        self.auth = Some((
+            hello.clone(),
+            Session::from_keys(&c2a, &a2c, hello.sid, Side::Controller),
+        ));
+        self.wire.flush().map_err(|e| e.to_string())?;
+        Ok(false)
+    }
+}
+
+struct Hub {
+    listener: TcpListener,
+    pairing_code: String,
+    local_screen: ScreenInfo,
+    local_device: DeviceId,
+    adapt_modifiers: bool,
+    config: ConfigHandle,
+    layout: LayoutStore,
+    status: Status,
+    peers: HashMap<DeviceId, PeerSession>,
+    pending: Vec<PendingConnection>,
+    active_target: Option<DeviceId>,
+    limiters: HashMap<IpAddr, PakeLimiter>,
+    last_status_refresh: Instant,
+}
+
+impl Hub {
+    fn handle_capture(&mut self, message: CaptureMsg) {
+        let device = message.device;
+        if !self
+            .peers
+            .get(&device)
+            .is_some_and(|peer| peer.link.session.id() == message.session)
+        {
+            return;
+        }
+        if let InputMsg::Reconcile(state) = message.input {
+            if state.active && self.active_target != Some(device) {
+                if let Some(old) = self.active_target {
+                    if let Some(peer) = self.peers.get_mut(&old) {
+                        if let Err(e) =
+                            peer.capture(InputMsg::Reconcile(ReconcileState::INACTIVE), false)
+                        {
+                            log::warn!("release send failed: {e}");
+                            self.remove_peer(old);
+                        }
+                    }
+                }
+                self.active_target = Some(device);
+            } else if !state.active && self.active_target == Some(device) {
+                self.active_target = None;
+            }
+        }
+        if let Some(peer) = self.peers.get_mut(&device) {
+            let adapt = self.adapt_modifiers && peer.platform != input::platform_id();
+            if let Err(e) = peer.capture(message.input, adapt) {
+                log::warn!("input connection closed: {e}");
+                self.remove_peer(device);
+            }
+        }
+    }
+
+    fn accept_connections(&mut self) {
+        // Limit work per pass so connection attempts cannot starve input.
+        for _ in 0..MAX_PENDING {
+            match self.listener.accept() {
+                Ok((socket, addr)) => {
+                    if self.pending.len() >= MAX_PENDING
+                        || !self
+                            .limiters
+                            .entry(addr.ip())
+                            .or_insert_with(PakeLimiter::new)
+                            .allow()
+                    {
+                        continue;
+                    }
+                    match FramedStream::new(socket, self.status.clone()) {
+                        Ok(wire) => self.pending.push(PendingConnection {
+                            wire,
+                            addr,
+                            created: Instant::now(),
+                            auth: None,
+                        }),
+                        Err(e) => log::debug!("TCP setup failed: {e}"),
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    log::warn!("TCP accept failed: {e}");
+                    break;
+                }
+            }
+        }
+    }
+
+    fn promote(&mut self, mut pending: PendingConnection) -> NetResult<()> {
+        let (hello, session) = pending.auth.take().ok_or("missing authentication")?;
+        let device = hello.device_id;
+        if self.peers.len() >= MAX_PEERS && !self.peers.contains_key(&device) {
+            return Err("peer limit reached".into());
+        }
+        // A new stream is a fresh input lifecycle. Never restore held keys or
+        // pending positions from a previous connection with the same device id.
+        self.remove_peer(device);
+        let now = Instant::now();
+        let mut peer = PeerSession {
+            device_id: device,
+            addr: pending.addr,
+            screen: hello.screen,
+            platform: hello.platform,
+            link: Link::new(pending.wire, session),
+            pending_pointer: None,
+            reconcile: ReconcileState::INACTIVE,
+            last_move: now,
+            last_reconcile: now,
+        };
+        peer.link
+            .send_input(InputMsg::Reconcile(ReconcileState::INACTIVE))?;
+        peer.link.wire.flush().map_err(|e| e.to_string())?;
+        self.peers.insert(device, peer);
+        self.ensure_placement(device, hello.platform, pending.addr, hello.screen);
+        self.refresh_layout();
+        self.refresh_status();
+        log::info!(
+            "agent {} connected via TCP ({}x{}, {})",
+            peer_label(hello.platform, pending.addr),
+            hello.screen.width,
+            hello.screen.height,
+            device_id_to_hex(&device)
+        );
+        Ok(())
+    }
+    fn ensure_placement(
+        &mut self,
+        device: DeviceId,
+        platform: u8,
+        addr: SocketAddr,
+        screen: ScreenInfo,
+    ) {
+        let label = peer_label(platform, addr);
+        let (_, current) = self.layout.snapshot();
+        let host = WorldLayout::host_rect(self.local_screen);
+        let saved = self.config.snapshot().unwrap_or_default();
+        let mut found = false;
+        let mut placements = saved.layout.clone();
+        for placement in placements.iter_mut() {
+            if placement.device_id() == Some(device) {
+                placement.label = label.clone();
+                placement.screen = Some(screen);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            let (x, y) = default_placement(host, &current.screens, screen);
+            placements.push(DevicePlacement {
+                id: device_id_to_hex(&device),
+                label,
+                x,
+                y,
+                screen: Some(screen),
+            });
+        }
+        if let Err(e) = self.config.update(|config| {
+            config.layout = placements;
+            Ok(())
+        }) {
+            log::warn!("could not persist device placement: {e}");
+        }
+    }
+
+    fn refresh_layout(&mut self) {
+        let config = self.config.snapshot().unwrap_or_default();
+        let connections: Vec<_> = self
+            .peers
+            .iter()
+            .map(|(id, peer)| (*id, peer.link.session.id()))
+            .collect();
+        let world =
+            crate::layout::world_from_placements(self.local_screen, &config.layout, &connections);
+        self.layout.replace(world);
+    }
+
+    fn remove_peer(&mut self, device: DeviceId) {
+        if let Some(peer) = self.peers.remove(&device) {
+            if self.active_target == Some(device) {
+                self.active_target = None;
+            }
+            self.refresh_layout();
+            self.refresh_status();
+            log::info!(
+                "agent {} disconnected",
+                peer_label(peer.platform, peer.addr)
+            );
+        }
+    }
+
+    fn refresh_status(&mut self) {
+        self.last_status_refresh = Instant::now();
+        let mut devices: Vec<_> = self
+            .peers
+            .values()
+            .map(|peer| PeerStatus {
+                device_id: device_id_to_hex(&peer.device_id),
+                label: peer_label(peer.platform, peer.addr),
+                addr: peer.addr.to_string(),
+                platform: Some(peer.platform),
+                screen: Some(peer.screen),
+                online: true,
+                active: self.active_target == Some(peer.device_id),
+                latency_ms: peer.link.rtt.srtt_ms(),
+                jitter_ms: peer.link.rtt.srtt_ms().map(|_| peer.link.rtt.jitter_ms()),
+                packet_loss_percent: None,
+                last_error_code: None,
+            })
+            .collect();
+        devices.sort_by(|a, b| a.label.cmp(&b.label));
+        let active = self.active_target.and_then(|id| self.peers.get(&id));
+        self.status.update(|s| {
+            s.running = true;
+            s.connected = !devices.is_empty();
+            s.remote_active = active.is_some();
+            s.devices = devices;
+            s.target_device = self.active_target.map(|id| device_id_to_hex(&id));
+            s.peer = active.map(|p| peer_label(p.platform, p.addr));
+            s.peer_platform = active.map(|p| p.platform);
+            s.remote_screen = active.map(|p| p.screen);
+            s.latency_ms = active.and_then(|p| p.link.rtt.srtt_ms());
+            s.jitter_ms = active.and_then(|p| p.link.rtt.srtt_ms().map(|_| p.link.rtt.jitter_ms()));
+            s.packet_loss_percent = None;
+            s.input_interval_ms =
+                active.map(|p| pointer_interval(&p.link.rtt).as_secs_f64() * 1000.0);
+        });
+    }
+
+    fn poll(&mut self) {
+        self.accept_connections();
+        for mut pending in std::mem::take(&mut self.pending) {
+            match pending.poll(&self.pairing_code, self.local_device, self.local_screen) {
+                Ok(true) => {
+                    if let Err(e) = self.promote(pending) {
+                        log::debug!("TCP promotion failed: {e}");
+                    }
+                }
+                Ok(false) => self.pending.push(pending),
+                Err(e) => log::debug!("handshake from {} rejected: {e}", pending.addr),
+            }
+        }
+        let now = Instant::now();
+        let mut remove = Vec::new();
+        for (device, peer) in &mut self.peers {
+            let adapt = self.adapt_modifiers && peer.platform != input::platform_id();
+            if let Err(e) = peer.poll(now, self.active_target == Some(*device), adapt) {
+                log::debug!("input connection {} closed: {e}", peer.addr);
+                remove.push(*device);
+            }
+        }
+        for device in remove {
+            self.remove_peer(device);
+        }
+        self.limiters
+            .retain(|_, limiter| limiter.last.elapsed() < Duration::from_secs(30));
+        if now.saturating_duration_since(self.last_status_refresh) >= Duration::from_millis(100) {
+            self.refresh_status();
+        }
+    }
+
+    fn shutdown(&mut self) {
+        for peer in self.peers.values_mut() {
+            let _ = peer.capture(InputMsg::Reconcile(ReconcileState::INACTIVE), false);
+            let _ = peer.link.send(TYPE_BYE, &[]);
+            let _ = peer.link.wire.flush();
+        }
+    }
 }
 
 pub fn start_controller(
     config: &AppConfig,
-    capture_rx: Receiver<RemoteInput>,
-    capture_shared: Arc<CaptureShared>,
+    config_handle: ConfigHandle,
+    layout: LayoutStore,
+    capture_rx: Receiver<CaptureMsg>,
     stop: Arc<AtomicBool>,
     status: Status,
-) -> Result<JoinHandle<()>, String> {
-    let peer = config.peer_socket_addr()?;
-    if peer.is_ipv6() {
-        return Err(error::code("E_IPV6_UNSUPPORTED"));
-    }
-
-    let socket =
-        UdpSocket::bind("0.0.0.0:0").map_err(|e| error::detail("E_NET_BIND", e))?;
-    socket
-        .set_read_timeout(Some(CONTROLLER_READ_TIMEOUT))
+) -> NetResult<JoinHandle<()>> {
+    let ip = config.local_ipv4()?;
+    let (listener, pairing_code) = bind_listener(ip, &config.last_invite)?;
+    listener
+        .set_nonblocking(true)
         .map_err(|e| error::detail("E_NET_SOCKET", e))?;
-
+    if let Err(e) = config_handle.update(|c| {
+        c.last_invite = pairing_code.clone();
+        Ok(())
+    }) {
+        log::warn!("could not persist listening code: {e}");
+    }
     let local_screen = local_screen_or_zero();
-    let passcode = config.passcode.clone();
-
+    let local_device = config.device_id_bytes()?;
     status.update(|s| {
         s.running = true;
-        s.peer = Some(peer.to_string());
-        s.local_screen = Some(local_screen);
         s.connected = false;
         s.remote_active = false;
+        s.local_screen = Some(local_screen);
+        s.peer = None;
+        s.peer_platform = None;
+        s.remote_screen = None;
         s.latency_ms = None;
+        s.jitter_ms = None;
+        s.input_interval_ms = None;
+        s.packet_loss_percent = None;
         s.last_error_code = None;
         s.last_error_detail = None;
+        s.pairing_code = Some(pairing_code.clone());
+        s.devices.clear();
+        s.target_device = None;
+        s.started_at_ms = Some(protocol::now_ms());
     });
-
+    let hub = Hub {
+        listener,
+        pairing_code,
+        local_screen,
+        local_device,
+        adapt_modifiers: config.adapt_modifiers,
+        config: config_handle,
+        layout,
+        status,
+        peers: HashMap::new(),
+        pending: Vec::new(),
+        active_target: None,
+        limiters: HashMap::new(),
+        last_status_refresh: Instant::now(),
+    };
+    log::info!("controller listening on {ip} via TCP");
     thread::Builder::new()
-        .name("glidelink-controller-net".into())
+        .name("rx-switch-controller-hub".into())
+        .spawn(move || run_hub(hub, capture_rx, stop))
+        .map_err(|e| error::detail("E_NET_THREAD", e))
+}
+
+fn run_hub(mut hub: Hub, capture_rx: Receiver<CaptureMsg>, stop: Arc<AtomicBool>) {
+    crate::sched::boost_current_thread();
+    let _guard = crate::sched::SessionGuard::begin();
+    while !stop.load(Ordering::Acquire) {
+        // Bounded work prevents a busy mouse or peer from starving the others.
+        for _ in 0..POLL_BUDGET {
+            match capture_rx.try_recv() {
+                Ok(message) => hub.handle_capture(message),
+                Err(_) => break,
+            }
+        }
+        hub.poll();
+        thread::sleep(POLL_INTERVAL);
+    }
+    hub.shutdown();
+    hub.layout.update(|layout| {
+        for s in &mut layout.screens {
+            s.online = false;
+        }
+        true
+    });
+    hub.status.update(|s| {
+        s.connected = false;
+        s.remote_active = false;
+        s.peer = None;
+        s.devices.clear();
+        s.target_device = None;
+    });
+}
+
+/// Wait only during PAKE. Normal traffic uses the same nonblocking framing.
+fn wait_packet(
+    wire: &mut FramedStream,
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> NetResult<Vec<u8>> {
+    let deadline = deadline.min(Instant::now() + HANDSHAKE_TIMEOUT);
+    while !stop.load(Ordering::Acquire) {
+        if Instant::now() >= deadline {
+            return Err(error::code("NET_TIMEOUT"));
+        }
+        wire.flush().map_err(|e| e.to_string())?;
+        if let Some(packet) = wire.read_packet().map_err(|e| e.to_string())? {
+            return Ok(packet);
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+    Err("stopped".into())
+}
+
+fn connect_agent(
+    controller: SocketAddr,
+    code: &str,
+    local_screen: ScreenInfo,
+    local_device: DeviceId,
+    stop: &AtomicBool,
+    status: &Status,
+    deadline: Instant,
+) -> NetResult<(Link, Handshake)> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() || stop.load(Ordering::Acquire) {
+        return Err(error::code("NET_TIMEOUT"));
+    }
+    let socket = TcpStream::connect_timeout(&controller, CONNECT_TIMEOUT.min(remaining))
+        .map_err(|e| error::detail("NET_NO_RESPONSE", e))?;
+    let mut wire =
+        FramedStream::new(socket, status.clone()).map_err(|e| error::detail("E_NET_SOCKET", e))?;
+    let sid = random_sid();
+    let (pake, hello_msg) = Spake2::<Ed25519Group>::start_b(
+        &Password::new(code.as_bytes()),
+        &Identity::new(PAKE_ID_CONTROLLER),
+        &Identity::new(PAKE_ID_AGENT),
+    );
+    let hello = Handshake {
+        sid,
+        screen: local_screen,
+        timestamp_ms: protocol::now_ms(),
+        platform: input::platform_id(),
+        device_id: local_device,
+    };
+    let hello_packet = build_pake_hello(&hello, &hello_msg);
+    wire.queue(hello_packet.clone())
+        .map_err(|e| e.to_string())?;
+    let accept_packet = wait_packet(&mut wire, stop, deadline)?;
+    let (accept, accept_msg) =
+        parse_pake_accept(&accept_packet, &sid).map_err(|e| e.to_string())?;
+    let shared = pake
+        .finish(&accept_msg)
+        .map_err(|_| error::code("E_PAKE"))?;
+    let transcript = transcript_hash(&hello_packet, &accept_packet);
+    let (c2a, a2c) = derive_session_keys(&shared, &sid, &transcript);
+    let mut session = Session::from_keys(&c2a, &a2c, sid, Side::Agent);
+    wire.queue(session.encrypt_packet(TYPE_CONFIRM, CONFIRM_PAYLOAD))
+        .map_err(|e| e.to_string())?;
+    let ack = wait_packet(&mut wire, stop, deadline)?;
+    let (kind, payload) = session.decrypt_packet(&ack).map_err(|e| e.to_string())?;
+    if kind != TYPE_CONFIRM_ACK || payload != CONFIRM_PAYLOAD {
+        return Err(error::code("E_PAKE"));
+    }
+    Ok((Link::new(wire, session), accept))
+}
+
+pub fn start_agent(
+    config: &AppConfig,
+    pairing_code: &str,
+    inject_tx: crossbeam_channel::Sender<InputMsg>,
+    stop: Arc<AtomicBool>,
+    status: Status,
+) -> NetResult<JoinHandle<()>> {
+    start_agent_with_policy(
+        config,
+        pairing_code,
+        inject_tx,
+        stop,
+        status,
+        AgentRetryPolicy::default(),
+    )
+}
+
+fn start_agent_with_policy(
+    config: &AppConfig,
+    pairing_code: &str,
+    inject_tx: crossbeam_channel::Sender<InputMsg>,
+    stop: Arc<AtomicBool>,
+    status: Status,
+    retry: AgentRetryPolicy,
+) -> NetResult<JoinHandle<()>> {
+    let invite = Invite::decode(pairing_code).map_err(|_| error::code("E_PAIRING_CODE"))?;
+    let controller = SocketAddr::new(IpAddr::V4(invite.ip), invite.port);
+    let code = invite::normalize_code(pairing_code);
+    let local_screen = local_screen_or_zero();
+    let local_device = config.device_id_bytes()?;
+    status.update(|s| {
+        s.running = true;
+        s.connected = false;
+        s.remote_active = false;
+        s.local_screen = Some(local_screen);
+        s.remote_screen = None;
+        s.peer = Some(controller.to_string());
+        s.peer_platform = None;
+        s.latency_ms = None;
+        s.jitter_ms = None;
+        s.input_interval_ms = None;
+        s.packet_loss_percent = None;
+        s.last_error_code = None;
+        s.last_error_detail = None;
+        s.pairing_code = Some(code.clone());
+        s.devices.clear();
+        s.target_device = None;
+        s.started_at_ms = Some(protocol::now_ms());
+    });
+    thread::Builder::new()
+        .name("rx-switch-agent-connect".into())
         .spawn(move || {
-            controller_loop(
-                socket,
-                peer,
-                passcode,
-                local_screen,
-                capture_rx,
-                capture_shared,
-                stop,
-                status,
+            crate::sched::boost_current_thread();
+            let _guard = crate::sched::SessionGuard::begin();
+            let mut deadline = Instant::now() + retry.connect_window;
+            let mut last_error = None;
+            while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                let result = connect_agent(
+                    controller,
+                    &code,
+                    local_screen,
+                    local_device,
+                    &stop,
+                    &status,
+                    deadline,
+                )
+                .and_then(|(link, accept)| {
+                    let result = run_agent(link, accept, controller, &inject_tx, &stop, &status);
+                    // A working authenticated link gets a longer recovery
+                    // window after it disconnects. Failed attempts never extend
+                    // either deadline, including stalled handshakes.
+                    deadline = Instant::now() + retry.reconnect_window;
+                    result
+                });
+                // Reset before backoff, including authentication/transport failures.
+                let _ = inject_tx.send(InputMsg::Reset);
+                status.update(|s| {
+                    s.connected = false;
+                    s.remote_active = false;
+                    s.latency_ms = None;
+                    s.jitter_ms = None;
+                    s.input_interval_ms = None;
+                    s.packet_loss_percent = None;
+                    s.remote_screen = None;
+                    s.peer_platform = None;
+                    s.devices.clear();
+                    s.target_device = None;
+                });
+                if let Err(e) = result {
+                    log::debug!("agent connection ended: {e}");
+                    if !stop.load(Ordering::Acquire) {
+                        last_error = Some(e.clone());
+                        status.set_error("NET_PEER_DISCONNECTED", Some(e));
+                    }
+                }
+                let retry_at = (Instant::now() + retry.retry_delay).min(deadline);
+                while !stop.load(Ordering::Acquire) && Instant::now() < retry_at {
+                    thread::sleep(POLL_INTERVAL);
+                }
+            }
+            let expired = !stop.load(Ordering::Acquire);
+            let _ = inject_tx.send(InputMsg::Reset);
+            stop.store(true, Ordering::Release);
+            status.finish_session(
+                if expired {
+                    Some("NET_CONNECTION_EXPIRED")
+                } else {
+                    None
+                },
+                if expired { last_error } else { None },
             );
         })
         .map_err(|e| error::detail("E_NET_THREAD", e))
 }
 
-struct PendingHandshake {
-    sid: [u8; protocol::SID_LEN],
-    master: [u8; 32],
-    packet: Vec<u8>,
-}
-
-fn controller_loop(
-    socket: UdpSocket,
-    peer: SocketAddr,
-    passcode: String,
-    local_screen: ScreenInfo,
-    capture_rx: Receiver<RemoteInput>,
-    capture_shared: Arc<CaptureShared>,
-    stop: Arc<AtomicBool>,
-    status: Status,
-) {
-    let started = Instant::now();
-    let mut pending: Option<PendingHandshake> = None;
-    let mut session: Option<Session> = None;
-    let mut last_hello = Instant::now()
-        .checked_sub(CONTROLLER_HANDSHAKE_RETRY)
-        .unwrap_or_else(Instant::now);
-    let mut last_ping = Instant::now();
-    let mut last_pong = Instant::now();
-    let mut pending_ping: Option<(u64, Instant)> = None;
-    let mut next_ping_id = 1u64;
-    let mut unreachable_reported = false;
-    let mut buf = [0u8; 2048];
-
-    while !stop.load(Ordering::Acquire) {
-        // Drain input first so a burst is not delayed by socket polling.
-        loop {
-            match capture_rx.try_recv() {
-                Ok(input) => {
-                    let packet = session
-                        .as_mut()
-                        .map(|active| active.encrypt_packet(TYPE_INPUT, &encode_input(&input)));
-                    let Some(packet) = packet else {
-                        continue;
-                    };
-                    if let Err(e) = socket.send_to(&packet, peer) {
-                        log::warn!("input send failed: {e}");
-                        session = None;
-                        capture_shared.clear_peer();
-                        status.update(|s| {
-                            s.connected = false;
-                            s.remote_screen = None;
-                            s.latency_ms = None;
-                            s.last_error_code = Some("NET_SEND_FAILED".into());
-                            s.last_error_detail = Some(e.to_string());
-                        });
-                        pending = None;
-                        pending_ping = None;
-                        last_hello = Instant::now();
-                        break;
-                    }
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-            }
-        }
-
-        let now = Instant::now();
-
-        if session.is_none() {
-            if now.saturating_duration_since(last_hello) >= CONTROLLER_HANDSHAKE_RETRY {
-                if pending.is_none() {
-                    let sid = random_sid();
-                    let master = derive_master(&passcode, &sid);
-                    let hello = Handshake {
-                        sid,
-                        screen: local_screen,
-                        timestamp_ms: now_ms(),
-                    };
-                    let packet = build_hello(&master, &hello);
-                    pending = Some(PendingHandshake {
-                        sid,
-                        master,
-                        packet,
-                    });
-                }
-                if let Some(p) = pending.as_ref() {
-                    if let Err(e) = socket.send_to(&p.packet, peer) {
-                        log::warn!("handshake send failed: {e}");
-                    }
-                }
-                last_hello = now;
-
-                if !unreachable_reported && started.elapsed() >= CONTROLLER_UNREACHABLE_HINT_AFTER {
-                    unreachable_reported = true;
-                    status.set_error("NET_NO_RESPONSE", None);
-                }
-            }
-        } else {
-            if now.saturating_duration_since(last_ping) >= CONTROLLER_PING_INTERVAL {
-                if let Some(active) = session.as_mut() {
-                    let id = next_ping_id;
-                    next_ping_id = next_ping_id.wrapping_add(1).max(1);
-                    let packet = active.encrypt_packet(TYPE_PING, &encode_u64(id));
-                    if let Err(e) = socket.send_to(&packet, peer) {
-                        log::warn!("ping send failed: {e}");
-                    } else {
-                        pending_ping = Some((id, Instant::now()));
-                    }
-                }
-                last_ping = now;
-            }
-
-            if now.saturating_duration_since(last_pong) >= CONTROLLER_PONG_TIMEOUT {
-                log::warn!("peer timed out");
-                session = None;
-                pending = None;
-                pending_ping = None;
-                last_hello = now;
-                unreachable_reported = false;
-                capture_shared.clear_peer();
-                status.update(|s| {
-                    s.connected = false;
-                    s.remote_screen = None;
-                    s.latency_ms = None;
-                    s.last_error_code = Some("NET_TIMEOUT".into());
-                    s.last_error_detail = None;
-                });
-                continue;
-            }
-        }
-
-        match socket.recv_from(&mut buf) {
-            Ok((n, from)) => {
-                if from != peer {
-                    continue;
-                }
-                if session.is_none() {
-                    if n == protocol::ACCEPT_LEN {
-                        if let Some(p) = pending.as_ref() {
-                            if let Ok(accept) = parse_accept(&buf[..n], &p.master, &p.sid) {
-                                let master = p.master;
-                                let sid = p.sid;
-                                let agent_screen = accept.screen;
-                                session =
-                                    Some(Session::from_master(&master, sid, Side::Controller));
-                                pending = None;
-                                pending_ping = None;
-                                unreachable_reported = false;
-                                last_pong = Instant::now();
-                                last_ping = Instant::now();
-                                capture_shared.set_peer(agent_screen.width, agent_screen.height);
-                                status.update(|s| {
-                                    s.connected = true;
-                                    s.remote_screen = Some(agent_screen);
-                                    s.last_error_code = None;
-                                    s.last_error_detail = None;
-                                });
-                            }
-                        }
-                    }
-                } else if let Some(active) = session.as_mut() {
-                    match active.decrypt_packet(&buf[..n]) {
-                        Ok((TYPE_PONG, payload)) => {
-                            if let Ok(id) = decode_u64(&payload) {
-                                if let Some((pending_id, sent_at)) = pending_ping {
-                                    if pending_id == id {
-                                        let rtt = sent_at.elapsed().as_secs_f64() * 1000.0;
-                                        status.update(|s| s.latency_ms = Some(rtt));
-                                        pending_ping = None;
-                                    }
-                                }
-                            }
-                            last_pong = Instant::now();
-                        }
-                        Ok((TYPE_BYE, _)) => {
-                            session = None;
-                            pending = None;
-                            capture_shared.clear_peer();
-                            status.update(|s| {
-                                s.connected = false;
-                                s.remote_screen = None;
-                                s.latency_ms = None;
-                            });
-                            last_hello = Instant::now();
-                        }
-                        Ok(_) => {
-                            last_pong = Instant::now();
-                        }
-                        Err(ProtocolError::Replay) => {}
-                        Err(e) => {
-                            log::debug!("dropped packet: {e}");
-                        }
-                    }
-                }
-            }
-            Err(e) if is_benign_recv_error(&e) => {}
-            Err(e) => {
-                log::warn!("UDP receive error: {e}");
-                thread::sleep(Duration::from_millis(5));
-            }
-        }
-    }
-
-    if let Some(active) = session.as_mut() {
-        let bye = active.encrypt_packet(TYPE_BYE, &[]);
-        let _ = socket.send_to(&bye, peer);
-    }
-    capture_shared.clear_peer();
-}
-
-pub fn start_agent(
-    config: &AppConfig,
-    inject_tx: Sender<InjectMsg>,
-    stop: Arc<AtomicBool>,
-    status: Status,
-) -> Result<JoinHandle<()>, String> {
-    let bind_addr = format!("0.0.0.0:{}", config.listen_port);
-    let socket = UdpSocket::bind(&bind_addr)
-        .map_err(|e| error::detail("E_NET_BIND", format!("{bind_addr}: {e}")))?;
-    socket
-        .set_read_timeout(Some(AGENT_READ_TIMEOUT))
-        .map_err(|e| error::detail("E_NET_SOCKET", e))?;
-
-    let local_screen = local_screen_or_zero();
-    let passcode = config.passcode.clone();
-
+fn run_agent(
+    mut link: Link,
+    accept: Handshake,
+    controller: SocketAddr,
+    inject_tx: &crossbeam_channel::Sender<InputMsg>,
+    stop: &AtomicBool,
+    status: &Status,
+) -> NetResult<()> {
+    let _ = inject_tx.send(InputMsg::Reset);
     status.update(|s| {
-        s.running = true;
-        s.connected = false;
+        s.connected = true;
         s.remote_active = false;
-        s.latency_ms = None;
-        s.local_screen = Some(local_screen);
+        s.peer_platform = Some(accept.platform);
+        s.remote_screen = Some(accept.screen);
         s.last_error_code = None;
         s.last_error_detail = None;
-        s.peer = None;
-        s.remote_screen = None;
+        s.devices = vec![PeerStatus {
+            device_id: device_id_to_hex(&accept.device_id),
+            label: peer_label(accept.platform, controller),
+            addr: controller.to_string(),
+            platform: Some(accept.platform),
+            screen: Some(accept.screen),
+            online: true,
+            ..PeerStatus::default()
+        }];
     });
-
-    thread::Builder::new()
-        .name("glidelink-agent-net".into())
-        .spawn(move || {
-            agent_loop(socket, local_screen, passcode, inject_tx, stop, status);
-        })
-        .map_err(|e| error::detail("E_NET_THREAD", e))
-}
-
-struct AgentSession {
-    session: Session,
-    sid: [u8; protocol::SID_LEN],
-    master: [u8; 32],
-    controller: SocketAddr,
-    last_packet: Instant,
-}
-
-fn agent_loop(
-    socket: UdpSocket,
-    local_screen: ScreenInfo,
-    passcode: String,
-    inject_tx: Sender<InjectMsg>,
-    stop: Arc<AtomicBool>,
-    status: Status,
-) {
-    let mut session: Option<AgentSession> = None;
-    let mut last_input = Instant::now();
-    let mut active_reported = false;
-    let mut buf = [0u8; 2048];
-
+    let mut last_status = Instant::now();
     while !stop.load(Ordering::Acquire) {
-        match socket.recv_from(&mut buf) {
-            Ok((n, from)) => {
-                let packet = &buf[..n];
-                let is_hello = packet.len() == protocol::HELLO_LEN && packet[5] == TYPE_HELLO;
-
-                if is_hello {
-                    let Ok(sid) = hello_sid(packet) else {
-                        continue;
-                    };
-
-                    // Retransmitted HELLO for the current session: resend the
-                    // accept without resetting the receive window.
-                    if let Some(current) = session.as_ref() {
-                        if current.sid == sid && current.controller == from {
-                            let accept = Handshake {
-                                sid,
-                                screen: local_screen,
-                                timestamp_ms: now_ms(),
-                            };
-                            let response = build_accept(&current.master, &accept);
-                            let _ = socket.send_to(&response, from);
-                            continue;
-                        }
-                    }
-
-                    let master = derive_master(&passcode, &sid);
-                    let Ok(hello) = parse_hello(packet, &master) else {
-                        log::debug!("rejected HELLO from {from}");
-                        continue;
-                    };
-
-                    let response = build_accept(
-                        &master,
-                        &Handshake {
-                            sid,
-                            screen: local_screen,
-                            timestamp_ms: now_ms(),
-                        },
-                    );
-                    if let Err(e) = socket.send_to(&response, from) {
-                        log::warn!("accept send failed: {e}");
-                        continue;
-                    }
-
-                    let _ = inject_tx.send(InjectMsg::Reset);
-                    let now = Instant::now();
-                    session = Some(AgentSession {
-                        session: Session::from_master(&master, sid, Side::Agent),
-                        sid,
-                        master,
-                        controller: from,
-                        last_packet: now,
-                    });
-                    last_input = now;
-                    active_reported = false;
-                    status.update(|s| {
-                        s.connected = true;
-                        s.remote_active = false;
-                        s.peer = Some(from.to_string());
-                        s.remote_screen = Some(hello.screen);
-                        s.last_error_code = None;
-                        s.last_error_detail = None;
-                    });
-                    continue;
-                }
-
-                let Some(active) = session.as_mut() else {
-                    continue;
-                };
-                if active.controller != from {
-                    continue;
-                }
-
-                let mut close_session = false;
-                match active.session.decrypt_packet(packet) {
-                    Ok((TYPE_INPUT, payload)) => {
-                        if let Ok(input) = decode_input(&payload) {
-                            let _ = inject_tx.send(InjectMsg::State(input));
-                            let now = Instant::now();
-                            active.last_packet = now;
-                            last_input = now;
-                            if !active_reported {
-                                active_reported = true;
-                                status.update(|s| {
-                                    s.remote_active = true;
-                                    s.last_error_code = None;
-                                    s.last_error_detail = None;
-                                });
-                            }
-                        }
-                    }
-                    Ok((TYPE_PING, payload)) => {
-                        active.last_packet = Instant::now();
-                        if payload.len() == 8 {
-                            let response = active.session.encrypt_packet(TYPE_PONG, &payload);
-                            let _ = socket.send_to(&response, from);
-                        }
-                    }
-                    Ok((TYPE_BYE, _)) => {
-                        close_session = true;
-                    }
-                    Ok((TYPE_ACCEPT, _)) | Ok((TYPE_HELLO, _)) => {}
-                    Ok(_) => {}
-                    Err(ProtocolError::Replay) => {}
-                    Err(e) => {
-                        log::debug!("rejected encrypted packet from {from}: {e}");
-                    }
-                }
-
-                if close_session {
-                    let _ = inject_tx.send(InjectMsg::Reset);
-                    session = None;
-                    active_reported = false;
-                    status.update(|s| {
-                        s.connected = false;
-                        s.remote_active = false;
-                        s.peer = None;
-                        s.remote_screen = None;
-                        s.latency_ms = None;
-                    });
-                }
+        for _ in 0..POLL_BUDGET {
+            let Some((kind, payload)) = link.receive()? else {
+                break;
+            };
+            if link.heartbeat(kind, &payload)? {
+                continue;
             }
-            Err(e) if is_benign_recv_error(&e) => {}
-            Err(e) => {
-                log::warn!("UDP receive error: {e}");
-                thread::sleep(Duration::from_millis(10));
+            let input = protocol::decode_command(kind, &payload).map_err(|e| e.to_string())?;
+            if let InputMsg::Reconcile(state) = input {
+                status.update(|s| {
+                    s.remote_active = state.active;
+                    if let Some(peer) = s.devices.first_mut() {
+                        peer.active = state.active;
+                    }
+                });
             }
+            inject_tx
+                .send(input)
+                .map_err(|_| "input injector stopped".to_string())?;
         }
-
         let now = Instant::now();
-
-        if active_reported && now.saturating_duration_since(last_input) >= AGENT_ACTIVE_TIMEOUT {
-            active_reported = false;
-            status.update(|s| s.remote_active = false);
-        }
-
-        let timed_out = session
-            .as_ref()
-            .map(|active| {
-                now.saturating_duration_since(active.last_packet) >= AGENT_SESSION_TIMEOUT
-            })
-            .unwrap_or(false);
-        if timed_out {
-            log::warn!("controller timed out");
-            let _ = inject_tx.send(InjectMsg::Reset);
-            session = None;
-            active_reported = false;
+        link.tick(now, PING_IDLE_INTERVAL)?;
+        if now.saturating_duration_since(last_status) >= Duration::from_millis(100) {
             status.update(|s| {
-                s.connected = false;
-                s.remote_active = false;
-                s.peer = None;
-                s.remote_screen = None;
-                s.latency_ms = None;
-                s.last_error_code = Some("NET_PEER_DISCONNECTED".into());
-                s.last_error_detail = None;
+                s.latency_ms = link.rtt.srtt_ms();
+                s.jitter_ms = link.rtt.srtt_ms().map(|_| link.rtt.jitter_ms());
+                s.packet_loss_percent = None;
+                if let Some(peer) = s.devices.first_mut() {
+                    peer.latency_ms = s.latency_ms;
+                    peer.jitter_ms = s.jitter_ms;
+                    peer.packet_loss_percent = None;
+                }
             });
+            last_status = now;
         }
+        thread::sleep(POLL_INTERVAL);
     }
-
-    let _ = inject_tx.send(InjectMsg::Reset);
+    let _ = link.send(TYPE_BYE, &[]);
+    let _ = link.wire.flush();
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Role;
-    use crate::input::BUTTON_LEFT;
-    use crate::layout::Edge;
-    use crossbeam_channel::unbounded;
+    use crate::input::{keymap::KeyState, BUTTON_LEFT};
+    use crossbeam_channel::{unbounded, Sender};
+    use std::path::PathBuf;
 
-    #[test]
-    fn constants_fit_in_udp_buffers() {
-        assert!(
-            protocol::HEADER_LEN + protocol::INPUT_LEN + protocol::TAG_LEN < 2048
-        );
-        assert_eq!(protocol::HELLO_LEN, 62);
+    fn device(byte: u8) -> DeviceId {
+        [byte; 16]
     }
 
-    #[test]
-    fn pong_payload_is_echoed_verbatim() {
-        let value = 42u64;
-        let payload = encode_u64(value);
-        assert_eq!(decode_u64(&payload).unwrap(), value);
-    }
-
-    #[test]
-    fn loopback_handshake_and_input_forwarding() {
-        let port = {
-            let socket = UdpSocket::bind("127.0.0.1:0").expect("ephemeral port");
-            socket.local_addr().expect("local addr").port()
-        };
-        let passcode = "loopback-test-code".to_string();
-        let agent_config = AppConfig {
-            role: Role::Agent,
-            peer_addr: String::new(),
-            listen_port: port,
-            passcode: passcode.clone(),
-            edge: Edge::Right,
-        };
-        let controller_config = AppConfig {
-            role: Role::Controller,
-            peer_addr: format!("127.0.0.1:{port}"),
-            listen_port: 0,
-            passcode,
-            edge: Edge::Right,
-        };
-
-        let agent_status = Status::new(None);
-        let controller_status = Status::new(None);
-        let (inject_tx, inject_rx) = unbounded::<InjectMsg>();
-        let (capture_tx, capture_rx) = unbounded::<RemoteInput>();
-        let agent_stop = Arc::new(AtomicBool::new(false));
-        let controller_stop = Arc::new(AtomicBool::new(false));
-        let capture_shared = CaptureShared::new(controller_status.clone());
-
-        let agent_handle = start_agent(
-            &agent_config,
-            inject_tx,
-            Arc::clone(&agent_stop),
-            agent_status.clone(),
-        )
-        .expect("start agent");
-        let controller_handle = start_controller(
-            &controller_config,
-            capture_rx,
-            capture_shared,
-            Arc::clone(&controller_stop),
-            controller_status.clone(),
-        )
-        .expect("start controller");
-
+    fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !controller_status.snapshot().connected && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            controller_status.snapshot().connected,
-            "controller did not connect within the deadline"
-        );
-
-        capture_tx
-            .send(RemoteInput {
-                x: 0.25,
-                y: 0.75,
-                buttons: BUTTON_LEFT,
-                wheel: -1,
-            })
-            .expect("send input");
-
-        let received = loop {
-            match inject_rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(InjectMsg::State(input)) => break input,
-                Ok(InjectMsg::Reset) => continue,
-                Err(e) => panic!("agent did not forward input: {e}"),
+        while Instant::now() < deadline {
+            if predicate() {
+                return true;
             }
-        };
-        assert!((received.x - 0.25).abs() < 0.001);
-        assert!((received.y - 0.75).abs() < 0.001);
-        assert_eq!(received.buttons, BUTTON_LEFT);
-        assert_eq!(received.wheel, -1);
-        assert!(agent_status.snapshot().connected);
+            thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
 
-        controller_stop.store(true, Ordering::Release);
-        agent_stop.store(true, Ordering::Release);
-        drop(capture_tx);
-        drop(inject_rx);
-        controller_handle.join().expect("join controller");
-        agent_handle.join().expect("join agent");
+    struct Worker {
+        stop: Arc<AtomicBool>,
+        join: Option<JoinHandle<()>>,
+        status: Status,
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(join) = self.join.take() {
+                join.join().unwrap();
+            }
+        }
+    }
+
+    fn test_agent(code: &str, retry: AgentRetryPolicy) -> (Worker, Receiver<InputMsg>) {
+        let config = AppConfig {
+            role: Role::Agent,
+            device_id: device_id_to_hex(&device(0x71)),
+            ..AppConfig::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let status = Status::new(Some(ScreenInfo::new(1920, 1080)));
+        let (tx, rx) = unbounded();
+        let join = start_agent_with_policy(&config, code, tx, stop.clone(), status.clone(), retry)
+            .unwrap();
+        (
+            Worker {
+                stop,
+                join: Some(join),
+                status,
+            },
+            rx,
+        )
+    }
+
+    fn quick_retry() -> AgentRetryPolicy {
+        AgentRetryPolicy {
+            connect_window: Duration::from_millis(300),
+            reconnect_window: Duration::from_millis(500),
+            retry_delay: Duration::from_millis(30),
+        }
+    }
+
+    fn test_listener() -> TcpListener {
+        (PORT_RANGE_START..=PORT_RANGE_END)
+            .rev()
+            .find_map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok())
+            .expect("no local test port available")
+    }
+
+    struct Controller {
+        worker: Worker,
+        tx: Sender<CaptureMsg>,
+        code: String,
+        path: PathBuf,
+        layout: LayoutStore,
+    }
+
+    impl Controller {
+        fn new() -> Self {
+            Self::with_code("")
+        }
+
+        fn with_code(code: &str) -> Self {
+            let config = AppConfig {
+                role: Role::Controller,
+                local_ip: "127.0.0.1".into(),
+                device_id: device_id_to_hex(&device(0x10)),
+                last_invite: code.to_string(),
+                ..AppConfig::default()
+            };
+            let path =
+                std::env::temp_dir().join(format!("rx-switch-tcp-{}.json", rand::random::<u64>()));
+            let handle = ConfigHandle::new(path.clone(), config.clone());
+            let layout = LayoutStore::new(WorldLayout::new(
+                ScreenInfo {
+                    width: 1920,
+                    height: 1080,
+                },
+                vec![],
+            ));
+            let (tx, rx) = unbounded();
+            let stop = Arc::new(AtomicBool::new(false));
+            let status = Status::new(None);
+            let join = start_controller(
+                &config,
+                handle,
+                layout.clone(),
+                rx,
+                stop.clone(),
+                status.clone(),
+            )
+            .unwrap();
+            let code = status.snapshot().pairing_code.unwrap();
+            Self {
+                worker: Worker {
+                    stop,
+                    join: Some(join),
+                    status,
+                },
+                tx,
+                code,
+                path,
+                layout,
+            }
+        }
+
+        fn agent(&self, byte: u8) -> (Worker, Receiver<InputMsg>) {
+            let config = AppConfig {
+                role: Role::Agent,
+                device_id: device_id_to_hex(&device(byte)),
+                ..AppConfig::default()
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let status = Status::new(None);
+            let (tx, rx) = unbounded();
+            let join = start_agent(&config, &self.code, tx, stop.clone(), status.clone()).unwrap();
+            assert!(
+                wait_until(|| status.snapshot().connected
+                    && self
+                        .layout
+                        .snapshot()
+                        .1
+                        .screen_spec(crate::layout::ScreenId::Device(device(byte)))
+                        .is_some_and(|s| s.online)),
+                "agent did not connect: {:?}",
+                status.snapshot()
+            );
+            (
+                Worker {
+                    stop,
+                    join: Some(join),
+                    status,
+                },
+                rx,
+            )
+        }
+
+        fn send(&self, byte: u8, input: InputMsg) {
+            self.tx
+                .send(CaptureMsg {
+                    device: device(byte),
+                    session: self
+                        .layout
+                        .snapshot()
+                        .1
+                        .screen_spec(crate::layout::ScreenId::Device(device(byte)))
+                        .map_or(0, |screen| screen.session),
+                    input,
+                })
+                .unwrap();
+        }
+    }
+
+    impl Drop for Controller {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn active() -> InputMsg {
+        InputMsg::Reconcile(ReconcileState {
+            active: true,
+            caps_lock: false,
+            buttons: 0,
+            keys: KeyState::EMPTY,
+        })
+    }
+
+    fn pointer(x: f32, y: f32) -> InputMsg {
+        InputMsg::Pointer(PointerPosition { x, y })
+    }
+    fn key(down: bool) -> InputMsg {
+        InputMsg::Event(InputEvent::Key { hid: 0x04, down })
+    }
+
+    fn recv_matching(
+        rx: &Receiver<InputMsg>,
+        mut predicate: impl FnMut(InputMsg) -> bool,
+    ) -> InputMsg {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let message = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("missing input");
+            if predicate(message) {
+                return message;
+            }
+        }
+    }
+
+    fn recv_event(rx: &Receiver<InputMsg>) -> InputEvent {
+        match recv_matching(rx, |m| matches!(m, InputMsg::Event(_))) {
+            InputMsg::Event(e) => e,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn two_agents_route_positions_and_semantics_in_order() {
+        let controller = Controller::new();
+        let (agent1, rx1) = controller.agent(0x21);
+        let (agent2, rx2) = controller.agent(0x22);
+        assert!(wait_until(|| controller
+            .worker
+            .status
+            .snapshot()
+            .devices
+            .len()
+            == 2));
+        assert!(wait_until(|| agent1.status.snapshot().latency_ms.is_some()));
+        assert!(agent1.status.snapshot().packet_loss_percent.is_none());
+
+        controller.send(0x21, pointer(0.25, 0.75));
+        controller.send(0x21, active());
+        let InputMsg::Pointer(pos) = recv_matching(&rx1, |m| matches!(m, InputMsg::Pointer(_)))
+        else {
+            unreachable!()
+        };
+        assert!((pos.x - 0.25).abs() < 0.001 && (pos.y - 0.75).abs() < 0.001);
+        assert!(!rx2
+            .try_iter()
+            .any(|m| matches!(m, InputMsg::Pointer(_) | InputMsg::Event(_))));
+
+        let down = InputEvent::Button {
+            button: BUTTON_LEFT,
+            down: true,
+        };
+        let up = InputEvent::Button {
+            button: BUTTON_LEFT,
+            down: false,
+        };
+        controller.send(0x21, InputMsg::Event(down));
+        controller.send(0x21, pointer(0.9, 0.1));
+        controller.send(0x21, InputMsg::Event(up));
+        assert_eq!(recv_event(&rx1), down);
+        let mut saw_position = false;
+        recv_matching(&rx1, |m| {
+            match m {
+                InputMsg::Pointer(p) => saw_position = (p.x - 0.9).abs() < 0.001,
+                InputMsg::Event(e) if e == up => {
+                    assert!(saw_position);
+                    return true;
+                }
+                _ => {}
+            }
+            false
+        });
+        controller.send(0x21, InputMsg::Reconcile(ReconcileState::INACTIVE));
+        controller.send(0x22, active());
+        controller.send(0x22, key(true));
+        assert_eq!(
+            recv_event(&rx2),
+            InputEvent::Key {
+                hid: 0x04,
+                down: true
+            }
+        );
+        assert!(wait_until(|| agent2.status.snapshot().remote_active));
+        assert!(wait_until(|| !agent1.status.snapshot().remote_active));
+        drop(agent1);
+        assert!(wait_until(|| controller
+            .worker
+            .status
+            .snapshot()
+            .devices
+            .len()
+            == 1));
+        assert!(agent2.status.snapshot().connected);
+    }
+
+    #[test]
+    fn rapid_keys_and_wheel_need_no_pointer_and_hold_survives_idle() {
+        let controller = Controller::new();
+        let (agent, rx) = controller.agent(0x31);
+        controller.send(0x31, active());
+        for _ in 0..100 {
+            controller.send(0x31, key(true));
+            controller.send(0x31, key(false));
+        }
+        for _ in 0..100 {
+            assert_eq!(
+                recv_event(&rx),
+                InputEvent::Key {
+                    hid: 0x04,
+                    down: true
+                }
+            );
+            assert_eq!(
+                recv_event(&rx),
+                InputEvent::Key {
+                    hid: 0x04,
+                    down: false
+                }
+            );
+        }
+        for delta in 1..=20 {
+            controller.send(0x31, InputMsg::Event(InputEvent::Wheel { delta }));
+        }
+        for delta in 1..=20 {
+            assert_eq!(recv_event(&rx), InputEvent::Wheel { delta });
+        }
+        controller.send(0x31, key(true));
+        assert_eq!(
+            recv_event(&rx),
+            InputEvent::Key {
+                hid: 0x04,
+                down: true
+            }
+        );
+        // Multiple idle snapshots: a stationary held key must not be timed out.
+        let deadline = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < deadline {
+            if let Ok(message) = rx.recv_timeout(Duration::from_millis(50)) {
+                match message {
+                    InputMsg::Reset => panic!("held key reset while heartbeat was healthy"),
+                    InputMsg::Reconcile(state) => {
+                        assert!(state.active && state.keys.contains(0x04))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(agent.status.snapshot().remote_active);
+        controller.send(0x31, key(false));
+        assert_eq!(
+            recv_event(&rx),
+            InputEvent::Key {
+                hid: 0x04,
+                down: false
+            }
+        );
+    }
+
+    #[test]
+    fn disconnect_releases_and_reconnect_starts_inactive() {
+        let controller = Controller::new();
+        let (agent1, _rx1) = controller.agent(0x41);
+        controller.send(0x41, active());
+        controller.send(0x41, key(true));
+        assert!(wait_until(|| agent1.status.snapshot().remote_active));
+        let old_session = controller
+            .layout
+            .snapshot()
+            .1
+            .screen_spec(crate::layout::ScreenId::Device(device(0x41)))
+            .unwrap()
+            .session;
+        // Same device opens a fresh connection while the old one is active.
+        let (agent2, rx2) = controller.agent(0x41);
+        recv_matching(
+            &rx2,
+            |m| matches!(m, InputMsg::Reconcile(s) if !s.active && s.keys.is_empty()),
+        );
+        assert!(!agent2.status.snapshot().remote_active);
+        // Stop the old worker before its automatic retry can replace agent2.
+        drop(agent1);
+        assert!(agent2.status.snapshot().connected);
+        // A queued capture from the previous connection must never reactivate
+        // or type into the new connection, even though device identity matches.
+        for input in [active(), key(true)] {
+            controller
+                .tx
+                .send(CaptureMsg {
+                    device: device(0x41),
+                    session: old_session,
+                    input,
+                })
+                .unwrap();
+        }
+        controller.send(0x41, InputMsg::Event(InputEvent::Wheel { delta: 1 }));
+        assert_eq!(recv_event(&rx2), InputEvent::Wheel { delta: 1 });
+        assert!(!agent2.status.snapshot().remote_active);
+        drop(controller);
+        recv_matching(&rx2, |m| matches!(m, InputMsg::Reset));
+        assert!(wait_until(|| !agent2.status.snapshot().connected));
+    }
+
+    #[test]
+    fn stale_pairing_endpoint_ends_session_and_clears_connection_state() {
+        let listener = test_listener();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let code = Invite::generate(Ipv4Addr::LOCALHOST, port).encode();
+        let (agent, rx) = test_agent(&code, quick_retry());
+        let local_screen = agent.status.snapshot().local_screen;
+        assert!(wait_until(|| !agent.status.snapshot().running));
+        let status = agent.status.snapshot();
+        assert!(agent.stop.load(Ordering::Acquire));
+        assert!(!status.connected && !status.remote_active);
+        assert_eq!(
+            status.last_error_code.as_deref(),
+            Some("NET_CONNECTION_EXPIRED")
+        );
+        assert!(status.last_error_detail.is_some());
+        assert!(status.peer.is_none() && status.peer_platform.is_none());
+        assert!(status.remote_screen.is_none() && status.pairing_code.is_none());
+        assert!(status.started_at_ms.is_none() && status.devices.is_empty());
+        assert_eq!(status.local_screen, local_screen);
+        recv_matching(&rx, |message| matches!(message, InputMsg::Reset));
+    }
+
+    #[test]
+    fn stalled_handshake_cannot_extend_the_initial_connect_window() {
+        let listener = test_listener();
+        listener.set_nonblocking(true).unwrap();
+        let code =
+            Invite::generate(Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()).encode();
+        let started = Instant::now();
+        let (agent, _rx) = test_agent(&code, quick_retry());
+        let mut accepted = None;
+        assert!(wait_until(|| {
+            accepted = listener.accept().ok();
+            accepted.is_some()
+        }));
+        // Keep the socket open but never send ACCEPT. This exercises the same
+        // deadline through TCP establishment and the PAKE packet wait.
+        assert!(wait_until(|| !agent.status.snapshot().running));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            agent.status.snapshot().last_error_code.as_deref(),
+            Some("NET_CONNECTION_EXPIRED")
+        );
+        drop(accepted);
+    }
+
+    #[test]
+    fn failed_attempts_retry_multiple_times_without_extending_the_deadline() {
+        let listener = test_listener();
+        listener.set_nonblocking(true).unwrap();
+        let code =
+            Invite::generate(Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()).encode();
+        let (agent, _rx) = test_agent(&code, quick_retry());
+        let mut attempts = 0;
+        assert!(wait_until(|| {
+            if let Ok((socket, _)) = listener.accept() {
+                attempts += 1;
+                drop(socket);
+            }
+            !agent.status.snapshot().running
+        }));
+        assert!(attempts >= 3, "only {attempts} connection attempts");
+        assert_eq!(
+            agent.status.snapshot().last_error_code.as_deref(),
+            Some("NET_CONNECTION_EXPIRED")
+        );
+    }
+
+    #[test]
+    fn disconnected_link_releases_input_before_the_reconnect_window_expires() {
+        let controller = Controller::new();
+        let (agent, rx) = test_agent(
+            &controller.code,
+            AgentRetryPolicy {
+                connect_window: Duration::from_secs(2),
+                ..quick_retry()
+            },
+        );
+        assert!(wait_until(|| agent.status.snapshot().connected
+            && controller
+                .layout
+                .snapshot()
+                .1
+                .screen_spec(crate::layout::ScreenId::Device(device(0x71)))
+                .is_some_and(|screen| screen.online)));
+        controller.send(0x71, active());
+        controller.send(0x71, key(true));
+        controller.send(
+            0x71,
+            InputMsg::Event(InputEvent::Button {
+                button: BUTTON_LEFT,
+                down: true,
+            }),
+        );
+        assert_eq!(
+            recv_event(&rx),
+            InputEvent::Key {
+                hid: 0x04,
+                down: true
+            }
+        );
+        assert_eq!(
+            recv_event(&rx),
+            InputEvent::Button {
+                button: BUTTON_LEFT,
+                down: true
+            }
+        );
+        drop(controller);
+        recv_matching(&rx, |message| matches!(message, InputMsg::Reset));
+        let status = agent.status.snapshot();
+        assert!(status.running && !status.connected && !status.remote_active);
+        assert!(wait_until(|| !agent.status.snapshot().running));
+        assert_eq!(
+            agent.status.snapshot().last_error_code.as_deref(),
+            Some("NET_CONNECTION_EXPIRED")
+        );
+    }
+
+    #[test]
+    fn temporary_outage_reconnects_within_grace_period_without_held_keys() {
+        let controller = Controller::new();
+        let code = controller.code.clone();
+        let (agent, rx) = controller.agent(0x72);
+        controller.send(0x72, active());
+        controller.send(0x72, key(true));
+        assert_eq!(
+            recv_event(&rx),
+            InputEvent::Key {
+                hid: 0x04,
+                down: true
+            }
+        );
+        drop(controller);
+        recv_matching(&rx, |message| matches!(message, InputMsg::Reset));
+        assert!(agent.status.snapshot().running);
+        let replacement = Controller::with_code(&code);
+        assert_eq!(replacement.code, code);
+        assert!(wait_until(|| agent.status.snapshot().connected));
+        recv_matching(
+            &rx,
+            |message| matches!(message, InputMsg::Reconcile(state) if !state.active && state.keys.is_empty()),
+        );
+        assert!(!agent.status.snapshot().remote_active);
+        assert!(agent.status.snapshot().last_error_code.is_none());
+    }
+
+    #[test]
+    fn manual_stop_interrupts_reconnect_backoff_without_waiting_for_the_window() {
+        let controller = Controller::new();
+        let (mut agent, rx) = test_agent(
+            &controller.code,
+            AgentRetryPolicy {
+                connect_window: Duration::from_secs(5),
+                reconnect_window: Duration::from_secs(30),
+                retry_delay: Duration::from_secs(30),
+            },
+        );
+        assert!(wait_until(|| agent.status.snapshot().connected));
+        drop(controller);
+        recv_matching(&rx, |message| matches!(message, InputMsg::Reset));
+        assert!(wait_until(|| !agent.status.snapshot().connected));
+        let started = Instant::now();
+        agent.stop.store(true, Ordering::Release);
+        agent.join.take().unwrap().join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!agent.status.snapshot().running);
+        assert!(agent.status.snapshot().last_error_code.is_none());
+    }
+
+    #[test]
+    fn manual_stop_interrupts_an_incomplete_handshake() {
+        let listener = test_listener();
+        listener.set_nonblocking(true).unwrap();
+        let code =
+            Invite::generate(Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()).encode();
+        let (mut agent, _rx) = test_agent(
+            &code,
+            AgentRetryPolicy {
+                connect_window: Duration::from_secs(30),
+                ..AgentRetryPolicy::default()
+            },
+        );
+        let mut accepted = None;
+        assert!(wait_until(|| {
+            accepted = listener.accept().ok();
+            accepted.is_some()
+        }));
+        let started = Instant::now();
+        agent.stop.store(true, Ordering::Release);
+        agent.join.take().unwrap().join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!agent.status.snapshot().running);
+        assert!(agent.status.snapshot().last_error_code.is_none());
+        drop(accepted);
+    }
+
+    #[test]
+    fn wrong_version_and_pairing_code_never_become_online() {
+        let controller = Controller::new();
+        let invite = Invite::decode(&controller.code).unwrap();
+        let address = SocketAddr::from((invite.ip, invite.port));
+        let socket = TcpStream::connect(address).unwrap();
+        let mut wire = FramedStream::new(socket, Status::default()).unwrap();
+        let mut packet = vec![0; protocol::HELLO_LEN];
+        packet[..4].copy_from_slice(protocol::MAGIC);
+        packet[4] = protocol::VERSION + 1;
+        wire.queue(packet).unwrap();
+        wire.flush().unwrap();
+        assert!(wait_until(|| wire.read_packet().is_err()));
+        assert!(controller.worker.status.snapshot().devices.is_empty());
+
+        let wrong = Invite::generate(invite.ip, invite.port).encode();
+        let stop = AtomicBool::new(false);
+        assert!(connect_agent(
+            address,
+            &wrong,
+            ScreenInfo {
+                width: 1920,
+                height: 1080
+            },
+            device(0x51),
+            &stop,
+            &Status::default(),
+            Instant::now() + HANDSHAKE_TIMEOUT
+        )
+        .is_err());
+        assert!(controller.worker.status.snapshot().devices.is_empty());
+    }
+
+    #[test]
+    fn pairing_code_reuses_tcp_port_and_pacing_stays_bounded() {
+        let (listener, code) = bind_listener(Ipv4Addr::LOCALHOST, "").unwrap();
+        drop(listener);
+        let (_listener, reused) = bind_listener(Ipv4Addr::LOCALHOST, &code).unwrap();
+        assert_eq!(code, reused);
+        let mut rtt = RttEstimator::new();
+        assert_eq!(pointer_interval(&rtt), INPUT_INTERVAL);
+        rtt.observe(100.0);
+        assert_eq!(pointer_interval(&rtt), SLOW_INPUT_INTERVAL);
+        for _ in 0..100 {
+            rtt.observe(1.0);
+        }
+        assert_eq!(pointer_interval(&rtt), INPUT_INTERVAL);
     }
 }

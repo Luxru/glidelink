@@ -1,154 +1,37 @@
-# GlideLink Architecture
+# rx-switch Architecture
 
-English | [Chinese](ARCHITECTURE.md)
+[Chinese](ARCHITECTURE.md) | [Features](README.en.md)
 
-See [README](README.en.md) for installation and usage.
+Application 0.1.0, protocol v1, unreleased. The controller captures and routes input; agents receive and inject it. Device identity and layout persist, while each connection gets a fresh session.
 
-## 1. Overview
+## Input
 
-GlideLink uses a controller / agent model:
+- Both world axes use the controller's screen width as their unit. Each screen is 1 unit wide, with height determined by its aspect ratio.
+- Pointer messages carry normalized absolute positions at 250 Hz, falling back to 125 Hz under high RTT or RTT variation.
+- Positions, semantic events, and state snapshots share one input model. Adjacent positions may merge; every other message first commits preceding movement, preserving click, drag, and key order.
+- State snapshots run every 500 ms. Switching releases the old target and transfers mouse buttons and Caps state; held keyboard keys must be pressed again.
+- Disconnects and session errors release input and return control locally. Reconnect starts inactive, and old session commands cannot reach its replacement.
+- Windows uses low-level capture hooks and absolute `SendInput`; Raw Input only detects outward motion at the host edge. Tauri uses the `Always` device event filter so the capture thread owns Raw Input registration and window focus does not interfere with keyboard hooks. macOS uses `CGEventTap` and `CGEventPost`, requesting and checking Accessibility and event posting together. The UI continually refreshes permission status and clears resolved permission errors.
+- Intentional Caps Lock presses are distinct from lock-state repair. When Caps Lock input-source switching is enabled on macOS, TIS selects the remembered ASCII / non-ASCII source on the main thread. The injector waits for completion with cancellation on shutdown. Reconciliation only repairs lock state; ordinary lock changes post native `FlagsChanged` events.
+- macOS keyboard, mouse, and wheel injection share a private event source and explicit modifier flags. Modifier releases are constructed as key-up before conversion to `FlagsChanged`, preventing mouse clicks from inheriting stale Command state after the keyboard has released it.
 
-- **Controller**: connected to the physical mouse, captures input, and decides when to forward it based on screen edges.
-- **Agent**: receives input and injects it into the local system.
-- **Tauri UI**: handles configuration and status only; it is not part of the input hot path.
+## Transport
 
-The same application supports both roles.
+Each agent uses one TCP connection with `TCP_NODELAY`. SPAKE2 derives keys, ChaCha20-Poly1305 encrypts messages, and contiguous sequence numbers verify order.
 
-## 2. Components and threads
+Frames contain a big-endian `u16` length followed by a protocol packet, limited to 1024 bytes. The handshake is `HELLO → ACCEPT → CONFIRM → CONFIRM_ACK`; input is processed only after authentication.
 
-```
-┌──────────────────────────── Tauri process ────────────────────────────┐
-│                                                                       │
-│  Desktop UI ──commands──► Engine                                      │
-│                            │                                          │
-│              ┌─────────────┴─────────────┐                            │
-│              │                           │                            │
-│       Controller role             Agent role                          │
-│       ┌──────────────┐            ┌──────────────┐                    │
-│       │ Input capture│            │ Input inject │                    │
-│       └──────┬───────┘            └──────▲───────┘                    │
-│              │ channel                    │ channel                   │
-│       ┌──────▼───────┐            ┌──────┴───────┐                    │
-│       │ Controller   │◄── UDP ───►│ Agent        │                    │
-│       │ network      │            │ network      │                    │
-│       └──────────────┘            └──────────────┘                    │
-└───────────────────────────────────────────────────────────────────────┘
-```
+The controller sends heartbeats every 100 ms to the active target and every 500 ms to other agents. Agents send every 500 ms; 3 seconds without messages ends the connection. Send queues have capacity and timeout limits. Logs report queue state and injection timing; the UI shows RTT and RTT variation, without estimating IP packet loss.
 
-Thread responsibilities:
+Initial agent connection attempts share a 5-second window. After an authenticated link disconnects, input is released on detection and recovery lasts up to 30 seconds, with a 1-second delay after each failed attempt. TCP connection and handshake waits share the same deadline; failed attempts never extend it. The user can stop from the window at any time. Expiry ends the session, preserves an actionable error, and reaps old workers so a new pairing code can be used.
 
-- **Capture thread**: installs the system mouse hook and maintains edge state and peer coordinates.
-- **Network thread**: handles handshakes, encrypted sending, heartbeats, reconnection, and status updates.
-- **Injection thread**: runs only on the agent and turns network state into system mouse events.
-- **Status object**: written only on state transitions to keep the hot path lock-free.
+TCP loss can delay input during retransmission; position merging only reduces application backlog. Listening ports are chosen from 45890–45999. Both endpoints use the same build.
 
-## 3. Data path
+## Code
 
-Controller:
-
-1. The system-level hook receives mouse events.
-2. When the pointer reaches the configured edge, forwarding mode starts.
-3. Mouse movement is converted to normalized coordinates for the peer.
-4. State is handed to the network thread through a lock-free channel.
-5. The network thread encrypts and sends one UDP packet.
-
-Agent:
-
-1. The network thread receives and decrypts the packet.
-2. It validates the session and replay sequence.
-3. Coordinates and button state are passed to the injection thread.
-4. The injection thread moves the pointer, clicks, or scrolls using OS APIs.
-
-UDP is used instead of TCP/QUIC because pointer position is replaceable state: a newer position can discard an older one, and it should not be delayed by retransmission or head-of-line blocking. Button state is included in every input packet and reset on reconnect.
-
-## 4. Coordinates and screen edges
-
-Each machine's virtual desktop is mapped to `[0,1] × [0,1]`. The controller normalizes against its own virtual desktop; the agent maps the result to its own desktop. This keeps movement proportional across different resolutions.
-
-Four directions are currently supported: the peer may be placed to the left, right, above, or below the controller.
-
-- The pointer enters the peer after reaching an edge and continuing outward.
-- The remote pointer starts just inside the edge to avoid jitter causing an immediate return.
-- The remote pointer returns to the controller after crossing the return threshold.
-- A short cooldown prevents rapid re-entry.
-
-Injection uses absolute coordinates to avoid accumulated acceleration, DPI scaling, and packet-loss errors.
-
-## 5. Input backends
-
-### Windows
-
-- A `WH_MOUSE_LL` low-level hook observes all mouse events.
-- In forwarding mode, local events are consumed so both computers do not react at once.
-- Raw Input provides relative movement.
-- `mouse_event` performs absolute moves, button actions, and wheel injection.
-- Controlling elevated windows requires the app to run elevated as well.
-
-### macOS
-
-- `CGEventTap` captures and suppresses mouse events at the HID layer.
-- `CGEventPost` injects mouse events.
-- Accessibility and Input Monitoring permissions are required.
-- When permission is missing, the backend returns an error and the UI directs the user to System Settings.
-
-## 6. Transport protocol
-
-### Handshake
-
-1. The controller generates a random session ID and sends HELLO.
-2. Both sides derive a master key from the pairing code and session ID.
-3. The agent verifies the HELLO HMAC and replies with ACCEPT.
-4. Both sides derive directional data keys.
-
-### Encryption
-
-- Key derivation: PBKDF2-HMAC-SHA256, 100,000 rounds.
-- Data encryption: ChaCha20-Poly1305.
-- Separate keys are used for controller → agent and agent → controller.
-- Every packet carries a sequence number and authentication tag; the receiver uses a sliding replay window.
-
-### Packet contents
-
-Each input packet contains:
-
-- Normalized X/Y.
-- Button bitmask.
-- Wheel delta.
-
-The controller sends a heartbeat every 250ms and measures RTT. On timeout it stops forwarding and re-handshakes. The agent releases held buttons and returns to the waiting state when its session times out.
-
-## 7. Security model
-
-- Traffic is encrypted with keys derived from the pairing code.
-- No accounts, cloud services, or internet access are involved.
-- The pairing code is the only authentication secret and must be sufficiently random.
-- The UDP port should only be reachable on a trusted LAN.
-- The current version has no pinned device public keys, key rotation, or independent security audit.
-
-## 8. Performance design
-
-- The input hot path avoids the WebView and Tauri IPC.
-- The status lock is written only on state transitions.
-- Input packets are small and use unicast UDP without congestion control or retransmission overhead.
-- The agent injects movement only when coordinates change, avoiding idle event noise.
-- The target is 3–8ms end-to-end on a healthy LAN. Actual results depend on the mouse, Wi-Fi, OS scheduling, and power settings.
-
-## 9. Known limitations
-
-- Mouse only; keyboard forwarding is not implemented.
-- One agent is supported.
-- Four edge directions only; arbitrary display layouts are not implemented yet.
-- Peer addresses are entered manually; there is no automatic discovery.
-- The Windows secure desktop (UAC) cannot be captured.
-- The macOS backend still needs validation on macOS hardware.
-- No signed installers, tray integration, or launch-at-login.
-- The protocol has not undergone an independent security audit.
-
-## 10. Future work
-
-- Keyboard forwarding.
-- Multiple agents and arbitrary rectangular display layouts.
-- LAN discovery and pairing.
-- Batched `SendInput` injection on Windows.
-- macOS hardware validation, signing, and notarization.
-- Tray support, launch-at-login, and installers.
+- `input/`: platform capture, shared input messages, and injection.
+- `net/`: sessions, handshake, TCP framing, encryption, and heartbeat.
+- `layout.rs`: world coordinates, routing, and layout.
+- `config.rs`, `state.rs`: settings and runtime lifecycle.
+- `tray.rs`: left-click restores the main window; the right-click menu offers About and Quit, with labels following the UI language. macOS uses an SF Symbol template image; closing the main window switches to Accessory activation policy to hide its Dock icon, and restoring it switches back to Regular. About preloads in a hidden Webview at startup, displays only after content is ready, and hides on close. A separate lightweight command supplies version, build, and system information.
+- `ui/`: HTML, CSS, and JavaScript interface.
